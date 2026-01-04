@@ -1,6 +1,21 @@
 const { Octokit } = require('@octokit/rest');
 
 const githubToken = process.env.GITHUB_TOKEN;
+// Helper: make a branch-safe name from arbitrary text
+function makeBranchSlug(input) {
+  return String(input)
+    .normalize('NFKD')
+    // فقط حروف، اعداد، خط‌تیره، آندرلاین، نقطه و slash را نگه می‌داریم
+    .replace(/[^\w\-\/.]+/g, '-')
+    // چند تا - پشت سر هم را یکی می‌کنیم
+    .replace(/-+/g, '-')
+    // چند تا / پشت سر هم را یکی می‌کنیم
+    .replace(/\/+/g, '/')
+    // حذف - های ابتدا و انتها
+    .replace(/^-+|-+$/g, '')
+    .toLowerCase()
+    .slice(0, 80); // خیلی بلند هم نشه
+}
 
 function getOctokit() {
   if (!githubToken) {
