@@ -402,7 +402,9 @@ async function handlePatchApplication(ctx, state) {
     await ctx.reply('Updating repository…');
     const { git, repoDir } = await prepareRepository(project, effectiveBaseBranch);
 
-    const branchName = `patch/${project.id}/${formatTimestamp(new Date())}`;
+    const safeProjectName = slugify(project.name);
+    const branchName = `patch/${safeProjectName}/${timestamp}`;
+
     await ctx.reply('Creating branch…');
     await createWorkingBranch(git, effectiveBaseBranch, branchName);
 
