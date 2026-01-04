@@ -13,10 +13,10 @@ async function ensureWorkdir() {
   await fs.mkdir(WORKDIR, { recursive: true });
 }
 
-async function prepareRepository(project) {
+async function prepareRepository(project, effectiveBaseBranch) {
   await ensureWorkdir();
   const repoDir = getRepoPath(project);
-  const baseBranch = project.baseBranch || DEFAULT_BASE_BRANCH;
+  const baseBranch = effectiveBaseBranch || project.baseBranch || DEFAULT_BASE_BRANCH;
 
   let repoExists = true;
   try {
@@ -71,8 +71,8 @@ async function commitAndPush(git, branchName) {
   return true;
 }
 
-async function fetchDryRun(project) {
-  const { git } = await prepareRepository(project);
+async function fetchDryRun(project, effectiveBaseBranch) {
+  const { git } = await prepareRepository(project, effectiveBaseBranch);
   await git.fetch(['--dry-run']);
 }
 

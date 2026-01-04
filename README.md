@@ -24,8 +24,14 @@ node bot.js
 
 ## Usage
 1. Start the bot with `/start` from the admin Telegram account.
-2. Use **Projects** → **Add project** to register repositories.
-3. Choose **Projects** → **List projects** and tap **Apply patch** for a project.
-4. Send a git patch as text or a `.patch`/`.diff` file.
-5. The bot updates the repo, creates a branch, applies the patch, pushes it, and opens a PR. A link to the PR is sent back.
-6. Use **Ping test** to check GitHub API and git fetch latency.
+2. Use **Projects** → **Add project** to register repositories (owner/repo/base branch).
+3. Manage settings per project from **Projects** → **List projects** → **Settings**:
+   - Rename project or change base branch.
+   - Add/edit/clear start, test, and diagnostic commands.
+   - Add/edit/clear Render service and deploy hook URLs.
+   - Add/edit/clear Supabase binding.
+   - Mark a project as the default project.
+4. Use **Projects** → **Global settings** to override default base branch or clear defaults.
+5. Choose **Projects** → **List projects** and tap **Apply patch** for a project, then send a git patch as text or a `.patch`/`.diff` file.
+6. The bot updates the repo, creates a branch, applies the patch, pushes it, and opens a PR. A link to the PR is sent back.
+7. Use **Ping test** to check GitHub API and git fetch latency.
