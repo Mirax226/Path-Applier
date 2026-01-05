@@ -1,88 +1,60 @@
-const fs = require('fs/promises');
-const path = require('path');
-const { Pool } = require('pg');
+// supabaseConnectionsStore.js
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
 
-const CONNECTIONS_FILE = path.join(__dirname, 'supabaseConnections.json');
-const CONFIG_DSN = process.env.PATH_APPLIER_CONFIG_DSN;
-let cachedConnections;
-let pool;
-let isReady = false;
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
-async function getPool() {
-  if (!CONFIG_DSN) {
-    return null;
-  }
-  if (!pool) {
-    pool = new Pool({ connectionString: CONFIG_DSN });
-  }
-  if (!isReady) {
-    await pool.query(
-      `CREATE TABLE IF NOT EXISTS path_config (
-        id          SERIAL PRIMARY KEY,
-        key         TEXT UNIQUE NOT NULL,
-        data        JSONB NOT NULL,
-        updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      );`,
-    );
-    isReady = true;
-  }
-  return pool;
-}
+let cachedConnections = null;
+let loaded = false;
 
-async function saveSupabaseConnections(connections) {
-  const db = await getPool();
-  if (!db) {
-    return;
-  }
-  await db.query(
-    `INSERT INTO path_config (key, data)
-     VALUES ($1, $2)
-     ON CONFLICT (key) DO UPDATE
-     SET data = EXCLUDED.data, updated_at = NOW()`,
-    ['supabaseConnections', connections],
-  );
-}
+/**
+ * نوع کانکشن:
+ * {
+ *   id: string;
+ *   name: string;
+ *   envKey: string;
+ * }
+ */
 
-async function loadSupabaseConnections() {
-  if (cachedConnections) {
+export async function loadSupabaseConnections() {
+  if (loaded && Array.isArray(cachedConnections)) {
     return cachedConnections;
   }
+
+  const filePath = path.join(__dirname, "..", "supabaseConnections.json");
+
   try {
-    const db = await getPool();
-    if (db) {
-      const result = await db.query('SELECT data FROM path_config WHERE key = $1', ['supabaseConnections']);
-      if (result.rows.length) {
-        cachedConnections = result.rows[0].data || [];
-        return cachedConnections;
-      }
+    const raw = await fs.promises.readFile(filePath, "utf8");
+    const parsed = JSON.parse(raw);
+
+    if (!Array.isArray(parsed)) {
+      throw new Error("supabaseConnections.json must contain a JSON array");
     }
-  } catch (error) {
-    console.error('Failed to load supabase connections', error);
-  }
-  try {
-    const raw = await fs.readFile(CONNECTIONS_FILE, 'utf-8');
-    cachedConnections = JSON.parse(raw);
-    try {
-      if (cachedConnections.length) {
-        await saveSupabaseConnections(cachedConnections);
-      }
-    } catch (error) {
-      console.error('Failed to save supabase connections', error);
-    }
-    return cachedConnections;
-  } catch (error) {
-    console.error('Failed to load supabaseConnections.json', error);
+
+    cachedConnections = parsed;
+    loaded = true;
+  } catch (err) {
+    console.error("Failed to load supabaseConnections.json:", err);
     cachedConnections = [];
-    return cachedConnections;
+    loaded = true;
   }
+
+  return cachedConnections;
 }
 
-async function findSupabaseConnection(id) {
-  const connections = await loadSupabaseConnections();
-  return connections.find((conn) => conn.id === id);
+export function findSupabaseConnection(id) {
+  if (!Array.isArray(cachedConnections)) return undefined;
+  return cachedConnections.find((c) => c.id === id);
 }
 
-module.exports = {
-  loadSupabaseConnections,
-  findSupabaseConnection,
-};
+// برای سازگاری با کد موجود، این تابع فقط کش را آپدیت می‌کند
+// و فعلاً چیزی در DB ذخیره نمی‌کند.
+export async function saveSupabaseConnections(connections) {
+  if (Array.isArray(connections)) {
+    cachedConnections = connections;
+    loaded = true;
+  }
+  // اگر بعداً خواستی به DB هم ذخیره کنی، اینجا می‌شود اضافه کرد.
+}
