@@ -1507,7 +1507,7 @@ async function handleProjectCronScheduleMessage(ctx, state) {
       return;
     }
     const baseUrl = getPublicBaseUrl();
-    targetUrl = `${baseUrl.replace(/\\/$/, '')}/keep-alive/${project.id}`;
+    targetUrl = `${baseUrl.replace(/\/+$/, '')}/keep-alive/${project.id}`;
   } else {
     if (!project.renderDeployHookUrl) {
       clearUserState(ctx.from.id);
