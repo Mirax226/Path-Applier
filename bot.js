@@ -3,6 +3,7 @@ require('dotenv').config();
 const http = require('http');
 const https = require('https');
 const fs = require('fs/promises');
+const path = require('path');
 const { Bot, InlineKeyboard, Keyboard } = require('grammy');
 const { Pool } = require('pg');
 
@@ -208,6 +209,11 @@ function isButtonDataInvalidError(error) {
   return message.includes('BUTTON_DATA_INVALID');
 }
 
+function isMessageNotModifiedError(error) {
+  const message = error?.description || error?.response?.description || error?.message || '';
+  return message.includes('message is not modified');
+}
+
 async function handleTelegramUiError(ctx, error, fallbackText) {
   if (!isButtonDataInvalidError(error)) {
     throw error;
@@ -223,37 +229,87 @@ async function handleTelegramUiError(ctx, error, fallbackText) {
   }
 }
 
-async function renderOrEdit(ctx, text, extra) {
-  const safeExtra = normalizeTelegramExtra(extra);
-  if (ctx.callbackQuery) {
+async function ensureAnswerCallback(ctx, options) {
+  if (!ctx?.callbackQuery || typeof ctx.answerCallbackQuery !== 'function') {
+    return;
+  }
+  try {
+    await ctx.answerCallbackQuery(options);
+  } catch (error) {
+    console.error('[UI] Failed to answer callback query', error);
+  }
+}
+
+function normalizeTelegramExtraForRespond(extra) {
+  if (!extra) return extra;
+  const payload = normalizeTelegramExtra(extra);
+  if (payload?.entities && payload?.parse_mode) {
+    delete payload.parse_mode;
+  }
+  if (payload?.parse_mode == null) {
+    delete payload.parse_mode;
+  }
+  return payload;
+}
+
+function getChatIdFromCtx(ctx) {
+  return ctx?.chat?.id || ctx?.callbackQuery?.message?.chat?.id || null;
+}
+
+async function replySafely(ctx, text, extra) {
+  if (ctx?.reply) {
+    try {
+      return await ctx.reply(text, extra);
+    } catch (error) {
+      if (isButtonDataInvalidError(error)) {
+        await handleTelegramUiError(ctx, error);
+        return;
+      }
+      throw error;
+    }
+  }
+  const chatId = getChatIdFromCtx(ctx);
+  if (!chatId) {
+    console.error('[UI] Unable to reply: missing chat id.');
+    return;
+  }
+  try {
+    return await bot.api.sendMessage(chatId, text, extra);
+  } catch (error) {
+    if (isButtonDataInvalidError(error)) {
+      await handleTelegramUiError({ reply: (...args) => bot.api.sendMessage(chatId, ...args) }, error);
+      return;
+    }
+    throw error;
+  }
+}
+
+async function respond(ctx, text, extra) {
+  if (!ctx) {
+    console.error('[UI] respond called without ctx');
+    return;
+  }
+  const safeExtra = normalizeTelegramExtraForRespond(extra);
+  if (ctx.callbackQuery && ctx.callbackQuery.message && ctx.editMessageText) {
     try {
       return await ctx.editMessageText(text, safeExtra);
     } catch (err) {
+      if (isMessageNotModifiedError(err)) {
+        await ensureAnswerCallback(ctx);
+        return;
+      }
       if (isButtonDataInvalidError(err)) {
         await handleTelegramUiError(ctx, err);
         return;
       }
       console.error('[UI] editMessageText failed, fallback to reply', err);
-      try {
-        return await ctx.reply(text, safeExtra);
-      } catch (replyError) {
-        if (isButtonDataInvalidError(replyError)) {
-          await handleTelegramUiError(ctx, replyError);
-          return;
-        }
-        throw replyError;
-      }
     }
   }
-  try {
-    return await ctx.reply(text, safeExtra);
-  } catch (err) {
-    if (isButtonDataInvalidError(err)) {
-      await handleTelegramUiError(ctx, err);
-      return;
-    }
-    throw err;
-  }
+  return replySafely(ctx, text, safeExtra);
+}
+
+async function renderOrEdit(ctx, text, extra) {
+  return respond(ctx, text, extra);
 }
 
 function buildCronCorrelationId() {
@@ -663,6 +719,22 @@ function getMessageTargetFromCtx(ctx) {
   return { chatId: message.chat.id, messageId: message.message_id };
 }
 
+function wrapCallbackHandler(handler, label) {
+  return async (ctx) => {
+    try {
+      await handler(ctx);
+    } catch (error) {
+      console.error(`[callback] ${label || 'handler'} failed`, error);
+      await ensureAnswerCallback(ctx);
+      try {
+        await respond(ctx, '⚠️ Something went wrong. Please try again.');
+      } catch (replyError) {
+        console.error('[callback] Failed to notify user', replyError);
+      }
+    }
+  };
+}
+
 async function checkConfigDbStatus() {
   const dsn = process.env.PATH_APPLIER_CONFIG_DSN;
   if (!dsn) {
@@ -814,7 +886,7 @@ bot.hears('⚙️ Settings', async (ctx) => {
   await renderGlobalSettings(ctx);
 });
 
-bot.callbackQuery('cancel_input', async (ctx) => {
+bot.callbackQuery('cancel_input', wrapCallbackHandler(async (ctx) => {
   const state = getUserState(ctx.from.id);
   const wizardState = userState.get(ctx.from.id);
   let backTarget = 'main:back';
@@ -835,7 +907,7 @@ bot.callbackQuery('cancel_input', async (ctx) => {
 
   resetUserState(ctx);
   clearPatchSession(ctx.from.id);
-  await ctx.answerCallbackQuery();
+  await ensureAnswerCallback(ctx);
   try {
     await ctx.editMessageText('Operation cancelled.', {
       reply_markup: buildBackKeyboard(backTarget),
@@ -843,31 +915,31 @@ bot.callbackQuery('cancel_input', async (ctx) => {
   } catch (error) {
     // Ignore edit failures (old message, etc.)
   }
-});
+}, 'cancel_input'));
 
-bot.callbackQuery('patch:cancel', async (ctx) => {
+bot.callbackQuery('patch:cancel', wrapCallbackHandler(async (ctx) => {
   clearPatchSession(ctx.from.id);
-  await ctx.answerCallbackQuery();
+  await ensureAnswerCallback(ctx);
   try {
     await ctx.editMessageText('Patch input cancelled.');
   } catch (error) {
     // Ignore edit failures
   }
   await renderMainMenu(ctx);
-});
+}, 'patch_cancel'));
 
-bot.callbackQuery('patch:finish', async (ctx) => {
+bot.callbackQuery('patch:finish', wrapCallbackHandler(async (ctx) => {
   const session = getPatchSession(ctx.from.id);
   if (!session || !session.buffer.trim()) {
     await ctx.answerCallbackQuery({ text: 'No patch text received yet.', show_alert: true });
     return;
   }
   clearPatchSession(ctx.from.id);
-  await ctx.answerCallbackQuery();
+  await ensureAnswerCallback(ctx);
   await handlePatchApplication(ctx, session.projectId, session.buffer);
-});
+}, 'patch_finish'));
 
-bot.on('callback_query:data', async (ctx) => {
+bot.on('callback_query:data', wrapCallbackHandler(async (ctx) => {
   const resolved = await resolveCallbackData(ctx.callbackQuery.data);
   if (resolved.expired || !resolved.data) {
     await ctx.answerCallbackQuery({ text: 'Expired, please reopen the menu.', show_alert: true });
@@ -922,7 +994,7 @@ bot.on('callback_query:data', async (ctx) => {
     await handleTelegramBotCallback(ctx, data);
     return;
   }
-});
+}, 'callback_query:data'));
 
 async function handleStatefulMessage(ctx, state) {
   switch (state.type) {
@@ -1037,7 +1109,7 @@ async function renderProjectsList(ctx) {
 }
 
 async function handleMainCallback(ctx, data) {
-  await ctx.answerCallbackQuery();
+  await ensureAnswerCallback(ctx);
   const [, action] = data.split(':');
   if (action === 'back') {
     await renderMainMenu(ctx);
@@ -1045,7 +1117,7 @@ async function handleMainCallback(ctx, data) {
 }
 
 async function handleProjectCallback(ctx, data) {
-  await ctx.answerCallbackQuery();
+  await ensureAnswerCallback(ctx);
   const [, action, projectId, extra] = data.split(':');
 
   if (action === 'add') {
@@ -1078,6 +1150,7 @@ async function handleProjectCallback(ctx, data) {
     case 'apply_patch':
       startPatchSession(ctx.from.id, projectId);
       await renderOrEdit(
+        ctx,
         'Send the git patch as text (you can use multiple messages)\n' +
           'or attach a .patch / .diff file.\n' +
           'When you are done, press ‘✅ Patch completed’.\n' +
@@ -1124,7 +1197,7 @@ async function handleProjectCallback(ctx, data) {
         messageContext: getMessageTargetFromCtx(ctx),
       });
       await renderOrEdit(
-        'Send new working directory path. Or send "-" to reset to default based on repo.\n(Or press Cancel)',
+        'Send new working directory (absolute path). Or send "-" to reset to default based on repo.\n(Or press Cancel)',
         { reply_markup: buildCancelKeyboard() },
       );
       break;
@@ -1239,7 +1312,7 @@ async function handleProjectCallback(ctx, data) {
 }
 
 async function handleProjectLogCallback(ctx, data) {
-  await ctx.answerCallbackQuery();
+  await ensureAnswerCallback(ctx);
   const parts = data.split(':');
   const action = parts[1];
   const level = action === 'level' ? parts[2] : null;
@@ -1338,7 +1411,7 @@ async function handleProjectLogCallback(ctx, data) {
 }
 
 async function handleGlobalSettingsCallback(ctx, data) {
-  await ctx.answerCallbackQuery();
+  await ensureAnswerCallback(ctx);
   const parts = data.split(':');
   const action = parts[1];
   switch (action) {
@@ -1436,7 +1509,7 @@ async function handleGlobalSettingsCallback(ctx, data) {
 }
 
 async function handleSupabaseCallback(ctx, data) {
-  await ctx.answerCallbackQuery();
+  await ensureAnswerCallback(ctx);
   const [, action, connectionId, tableToken, extra] = data.split(':');
   switch (action) {
     case 'add':
@@ -1495,7 +1568,7 @@ async function handleSupabaseCallback(ctx, data) {
 }
 
 async function handleCronCallback(ctx, data) {
-  await ctx.answerCallbackQuery();
+  await ensureAnswerCallback(ctx);
   const [, action, jobId] = data.split(':');
 
   switch (action) {
@@ -1632,7 +1705,7 @@ async function handleCronWizardCancel(ctx, state) {
 }
 
 async function handleCronWizardCallback(ctx, data) {
-  await ctx.answerCallbackQuery();
+  await ensureAnswerCallback(ctx);
   const state = getUserState(ctx.from.id);
   if (!state) {
     return;
@@ -2260,7 +2333,7 @@ async function handleCronWizardInput(ctx, state) {
 }
 
 async function handleProjectCronCallback(ctx, data) {
-  await ctx.answerCallbackQuery();
+  await ensureAnswerCallback(ctx);
   const parts = data.split(':');
   const action = parts[1];
   const projectId = parts[2];
@@ -2317,7 +2390,7 @@ async function handleProjectCronCallback(ctx, data) {
 }
 
 async function handleEnvVaultCallback(ctx, data) {
-  await ctx.answerCallbackQuery();
+  await ensureAnswerCallback(ctx);
   const parts = data.split(':');
   const action = parts[1];
   const projectId = parts[2];
@@ -2426,7 +2499,7 @@ async function handleEnvVaultCallback(ctx, data) {
 }
 
 async function handleCronLinkCallback(ctx, data) {
-  await ctx.answerCallbackQuery();
+  await ensureAnswerCallback(ctx);
   const parts = data.split(':');
   const action = parts[1];
   const jobId = parts[2];
@@ -2471,7 +2544,7 @@ async function handleCronLinkCallback(ctx, data) {
 }
 
 async function handleTelegramBotCallback(ctx, data) {
-  await ctx.answerCallbackQuery();
+  await ensureAnswerCallback(ctx);
   const parts = data.split(':');
   const action = parts[1];
   const projectId = parts[2];
@@ -5382,7 +5455,7 @@ async function startProjectWizard(ctx) {
 }
 
 async function handleProjectWizardCallback(ctx, data) {
-  await ctx.answerCallbackQuery();
+  await ensureAnswerCallback(ctx);
   const [, action] = data.split(':');
   const state = userState.get(ctx.from.id);
   if (!state || state.mode !== 'create-project') {
@@ -5464,11 +5537,12 @@ async function handleProjectWizardInput(ctx, state) {
   }
 
   if (state.step === 'workingDirCustom') {
-    if (!value) {
-      await ctx.reply('Please send a valid working directory path.');
+    const validation = validateWorkingDirInput(ctx.message.text);
+    if (!validation.ok) {
+      await ctx.reply(validation.error);
       return;
     }
-    state.draft.workingDir = value;
+    state.draft.workingDir = validation.value;
     state.draft.isWorkingDirCustom = true;
     state.step = 'githubTokenEnvKey';
     await promptNextProjectField(ctx, state);
@@ -5533,7 +5607,7 @@ async function promptNextProjectField(ctx, state) {
     repoSlug:
       'Send GitHub repo as `owner/repo` (for example: Mirax226/daily-system-bot-v2).\n(Or press Cancel)',
     workingDirConfirm: null,
-    workingDirCustom: 'Send working directory path.\n(Or press Cancel)',
+    workingDirCustom: 'Send working directory path (absolute).\n(Or press Cancel)',
     githubTokenEnvKey:
       'GitHub token env key:\nDefault: GITHUB_TOKEN\nSend a custom env key or type `-` to use the default.',
     startCommand: 'Send *startCommand* (or Skip).\n(Or press Cancel)',
@@ -5836,14 +5910,15 @@ async function handleEditRepoStep(ctx, state) {
 }
 
 async function handleEditWorkingDirStep(ctx, state) {
-  const text = ctx.message.text?.trim();
-  if (!text) {
-    await ctx.reply('Please send text.');
+  const rawText = ctx.message.text;
+  if (!rawText) {
+    await respond(ctx, 'Please send text.');
     return;
   }
-  if (text.toLowerCase() === 'cancel') {
+  const trimmed = rawText.trim();
+  if (trimmed.toLowerCase() === 'cancel') {
     resetUserState(ctx);
-    await ctx.reply('Operation cancelled.');
+    await respond(ctx, 'Operation cancelled.');
     await renderMainMenu(ctx);
     return;
   }
@@ -5851,28 +5926,34 @@ async function handleEditWorkingDirStep(ctx, state) {
   const projects = await loadProjects();
   const idx = projects.findIndex((project) => project.id === state.projectId);
   if (idx === -1) {
-    await ctx.reply('Project not found.');
+    await respond(ctx, 'Project not found.');
     clearUserState(ctx.from.id);
     return;
   }
 
   const project = projects[idx];
-  const trimmed = text.trim();
   let nextWorkingDir = trimmed;
   let isWorkingDirCustom = true;
 
   if (trimmed === '-') {
     if (!project.repoSlug) {
-      await ctx.reply('Cannot auto-set workingDir without repoSlug.');
+      await respond(ctx, 'Cannot auto-set workingDir without repoSlug.');
       return;
     }
     const defaultDir = getDefaultWorkingDir(project.repoSlug);
     if (!defaultDir) {
-      await ctx.reply('Cannot derive workingDir from repoSlug.');
+      await respond(ctx, 'Cannot derive workingDir from repoSlug.');
       return;
     }
     nextWorkingDir = defaultDir;
     isWorkingDirCustom = false;
+  } else {
+    const validation = validateWorkingDirInput(rawText);
+    if (!validation.ok) {
+      await respond(ctx, validation.error);
+      return;
+    }
+    nextWorkingDir = validation.value;
   }
 
   projects[idx] = {
@@ -5888,9 +5969,19 @@ async function handleEditWorkingDirStep(ctx, state) {
   }
 
   clearUserState(ctx.from.id);
-  await renderProjectSettingsForMessage(state.messageContext, state.projectId, '✅ Updated');
+  const validation = await validateWorkingDir({ ...project, workingDir: nextWorkingDir });
+  const notice = formatWorkingDirValidationNotice(validation);
+  if (!validation.ok) {
+    console.warn('[workingDir] Validation failed after save', {
+      projectId: state.projectId,
+      code: validation.code,
+      workingDir: nextWorkingDir,
+      expectedCheckoutDir: validation.expectedCheckoutDir,
+    });
+  }
+  await renderProjectSettingsForMessage(state.messageContext, state.projectId, notice);
   if (!state.messageContext) {
-    await renderProjectSettings(ctx, state.projectId, '✅ Updated');
+    await renderProjectSettings(ctx, state.projectId, notice);
   }
 }
 
@@ -6042,13 +6133,13 @@ async function runProjectDiagnostics(ctx, projectId) {
   const projects = await loadProjects();
   const project = findProjectById(projects, projectId);
   if (!project) {
-    await ctx.reply('Project not found.');
+    await respond(ctx, 'Project not found.');
     return;
   }
 
   const command = project.diagnosticCommand || project.testCommand;
   if (!command) {
-    await ctx.reply('No diagnostic/test command configured for this project.');
+    await respond(ctx, 'No diagnostic/test command configured for this project.');
     return;
   }
 
@@ -6061,7 +6152,8 @@ async function runProjectDiagnostics(ctx, projectId) {
     await prepareRepository(project, effectiveBaseBranch);
   } catch (error) {
     if (error.message === 'Project is missing repoSlug') {
-      await ctx.reply(
+      await respond(
+        ctx,
         'This project is not fully configured: repoSlug is missing. Use "📝 Edit repo" to set it.',
       );
       return;
@@ -6071,7 +6163,7 @@ async function runProjectDiagnostics(ctx, projectId) {
 
   const workingDir = project.workingDir || repoInfo?.workingDir;
   if (!workingDir) {
-    await ctx.reply('No working directory configured for this project.');
+    await respond(ctx, 'No working directory configured for this project.');
     return;
   }
 
@@ -6079,16 +6171,36 @@ async function runProjectDiagnostics(ctx, projectId) {
     await updateProjectField(projectId, 'workingDir', workingDir);
   }
 
+  const validation = await validateWorkingDir({ ...project, workingDir });
+  if (!validation.ok) {
+    console.warn('[diagnostics] Working dir validation failed', {
+      projectId,
+      code: validation.code,
+      workingDir,
+      expectedCheckoutDir: validation.expectedCheckoutDir,
+    });
+    await respond(ctx, formatWorkingDirValidationMessage(validation));
+    return;
+  }
+
   const result = await runCommandInProject({ ...project, workingDir }, command);
   if (result.exitCode === 0) {
-    await ctx.reply(
+    await respond(
+      ctx,
       `🧪 Diagnostics finished successfully.\nProject: ${project.name || project.id}\nDuration: ${result.durationMs} ms\n\nLast output:\n${result.stdout || '(no output)'}`,
     );
     return;
   }
 
+  const classification = classifyDiagnosticsError({ result, project, workingDir, validation });
+  if (classification?.reason === 'WORKING_DIR_INVALID') {
+    await respond(ctx, classification.message);
+    return;
+  }
+
   const errorExcerpt = result.stderr || result.stdout || '(no output)';
-  await ctx.reply(
+  await respond(
+    ctx,
     `🧪 Diagnostics FAILED (exit code ${result.exitCode}).\nProject: ${project.name || project.id}\nDuration: ${result.durationMs} ms\n\nError excerpt:\n${errorExcerpt}`,
   );
 }
@@ -7338,7 +7450,7 @@ async function runPingTest(ctx) {
     const apiCheck = await checkGithubApi(repoInfo, tokenInfo.token);
     addCheck(apiCheck.status, 'GitHub API', apiCheck.detail, apiCheck.hint);
 
-    const workingDirCheck = await checkWorkingDir(repoInfo.workingDir);
+    const workingDirCheck = await checkWorkingDir(defaultProject, repoInfo.workingDir);
     addCheck(workingDirCheck.status, 'Working dir', workingDirCheck.detail, workingDirCheck.hint);
 
     const baseBranch = defaultProject?.baseBranch || globalSettings.defaultBaseBranch || DEFAULT_BASE_BRANCH;
@@ -7421,6 +7533,230 @@ async function resolveGithubToken(project) {
   return { token: null, source: null, key, error: 'missing' };
 }
 
+function isNodeProject(project) {
+  const type = resolveProjectType(project);
+  return ['node-api', 'node-bot', 'node'].includes(type);
+}
+
+async function resolvePackageJsonPath(baseDir) {
+  const candidate = path.join(baseDir, 'package.json');
+  try {
+    await fs.stat(candidate);
+    return candidate;
+  } catch (error) {
+    return null;
+  }
+}
+
+async function suggestWorkingDirFromPackageJson(checkoutDir) {
+  if (!checkoutDir) return null;
+  const rootPackage = await resolvePackageJsonPath(checkoutDir);
+  if (rootPackage) {
+    return checkoutDir;
+  }
+  try {
+    const entries = await fs.readdir(checkoutDir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const candidateDir = path.join(checkoutDir, entry.name);
+      const nestedPackage = await resolvePackageJsonPath(candidateDir);
+      if (nestedPackage) {
+        return candidateDir;
+      }
+    }
+  } catch (error) {
+    return null;
+  }
+  return null;
+}
+
+async function validateWorkingDir(project) {
+  const workingDir = project?.workingDir;
+  const repoSlug = project?.repoSlug;
+  const checkoutDir = repoSlug ? getDefaultWorkingDir(repoSlug) : null;
+  const expectedCheckoutDir = checkoutDir ? path.resolve(checkoutDir) : null;
+
+  if (!workingDir) {
+    return {
+      ok: false,
+      code: 'DIR_MISSING',
+      details: 'workingDir missing',
+      expectedCheckoutDir,
+      suggestedWorkingDir: checkoutDir || null,
+    };
+  }
+
+  if (!path.isAbsolute(workingDir)) {
+    return {
+      ok: false,
+      code: 'NOT_ABSOLUTE',
+      details: 'workingDir must be an absolute path',
+      expectedCheckoutDir,
+      suggestedWorkingDir: checkoutDir || null,
+    };
+  }
+
+  const resolvedWorkingDir = path.resolve(workingDir);
+  if (expectedCheckoutDir && !resolvedWorkingDir.startsWith(expectedCheckoutDir)) {
+    return {
+      ok: false,
+      code: 'OUTSIDE_REPO',
+      details: `workingDir is outside repo checkout (${expectedCheckoutDir})`,
+      expectedCheckoutDir,
+      suggestedWorkingDir: checkoutDir || null,
+    };
+  }
+
+  try {
+    await fs.stat(resolvedWorkingDir);
+  } catch (error) {
+    if (error?.code === 'ENOENT') {
+      return {
+        ok: false,
+        code: 'DIR_MISSING',
+        details: 'workingDir does not exist',
+        expectedCheckoutDir,
+        suggestedWorkingDir: checkoutDir || null,
+      };
+    }
+    return {
+      ok: false,
+      code: 'UNKNOWN',
+      details: truncateText(error.message || 'unknown error', 120),
+      expectedCheckoutDir,
+      suggestedWorkingDir: checkoutDir || null,
+    };
+  }
+
+  if (isNodeProject(project)) {
+    const packagePath = await resolvePackageJsonPath(resolvedWorkingDir);
+    if (!packagePath) {
+      const suggestedWorkingDir = await suggestWorkingDirFromPackageJson(checkoutDir);
+      return {
+        ok: false,
+        code: 'PACKAGE_JSON_MISSING',
+        details: 'package.json not found under workingDir',
+        expectedCheckoutDir,
+        suggestedWorkingDir: suggestedWorkingDir || checkoutDir || null,
+      };
+    }
+  }
+
+  return {
+    ok: true,
+    code: 'OK',
+    details: resolvedWorkingDir,
+    expectedCheckoutDir,
+    suggestedWorkingDir: checkoutDir || null,
+  };
+}
+
+function formatWorkingDirValidationNotice(result) {
+  if (result.ok) {
+    return '✅ Working dir saved and validated.';
+  }
+  const lines = [`⚠️ Working dir saved but invalid (${result.code}).`];
+  if (result.details) {
+    lines.push(`Reason: ${result.details}`);
+  }
+  if (result.expectedCheckoutDir) {
+    lines.push(`Expected repo root: ${result.expectedCheckoutDir}`);
+  }
+  if (result.suggestedWorkingDir) {
+    lines.push(`Suggested workingDir: ${result.suggestedWorkingDir}`);
+  }
+  return lines.join('\n');
+}
+
+function formatWorkingDirValidationMessage(result) {
+  if (result.ok) {
+    return null;
+  }
+  const lines = ['Diagnostics blocked: workingDir is invalid.'];
+  if (result.details) {
+    lines.push(`Reason: ${result.details}`);
+  }
+  if (result.expectedCheckoutDir) {
+    lines.push(`Expected repo root: ${result.expectedCheckoutDir}`);
+  }
+  if (result.suggestedWorkingDir) {
+    lines.push(`Suggested workingDir: ${result.suggestedWorkingDir}`);
+  }
+  return lines.join('\n');
+}
+
+function formatWorkingDirHint(result) {
+  if (result.ok) {
+    return null;
+  }
+  const lines = ['Working dir invalid.'];
+  if (result.details) {
+    lines.push(`Reason: ${result.details}`);
+  }
+  if (result.expectedCheckoutDir) {
+    lines.push(`Expected repo root: ${result.expectedCheckoutDir}`);
+  }
+  if (result.suggestedWorkingDir) {
+    lines.push(`Suggested workingDir: ${result.suggestedWorkingDir}`);
+  }
+  return lines.join('\n');
+}
+
+function validateWorkingDirInput(rawValue) {
+  if (rawValue == null) {
+    return { ok: false, error: 'Please send a working directory path.' };
+  }
+  const value = String(rawValue);
+  if (!value.trim()) {
+    return { ok: false, error: 'Please send a working directory path.' };
+  }
+  if (value.length > 300) {
+    return { ok: false, error: 'Working directory path is too long (max 300 chars).' };
+  }
+  if (value.includes('\u0000')) {
+    return { ok: false, error: 'Working directory path contains invalid characters.' };
+  }
+  if (value !== value.trimEnd()) {
+    return { ok: false, error: 'Working directory path cannot include trailing spaces.' };
+  }
+  const trimmed = value.trim();
+  if (!path.isAbsolute(trimmed)) {
+    return { ok: false, error: 'Working directory must be an absolute path.' };
+  }
+  return { ok: true, value: trimmed };
+}
+
+function classifyDiagnosticsError({ result, project, workingDir, validation }) {
+  const combined = `${result?.stderr || ''}\n${result?.stdout || ''}`;
+  const hasPackageJson =
+    /package\.json/i.test(combined) && /(ENOENT|no such file|not found)/i.test(combined);
+  if (!hasPackageJson) {
+    return null;
+  }
+
+  const suggestedWorkingDir =
+    validation?.suggestedWorkingDir ||
+    (project?.repoSlug ? getDefaultWorkingDir(project.repoSlug) : null);
+  const expectedCheckoutDir =
+    validation?.expectedCheckoutDir ||
+    (project?.repoSlug ? path.resolve(getDefaultWorkingDir(project.repoSlug)) : null);
+
+  const lines = [
+    'Diagnostics failed: package.json not found; workingDir likely wrong.',
+    `Working dir: ${workingDir || '-'}`,
+  ];
+  if (expectedCheckoutDir) {
+    lines.push(`Expected repo root: ${expectedCheckoutDir}`);
+  }
+  if (suggestedWorkingDir) {
+    lines.push(`Suggested workingDir: ${suggestedWorkingDir}`);
+  }
+  return {
+    reason: 'WORKING_DIR_INVALID',
+    message: lines.join('\n'),
+  };
+}
+
 async function checkGithubApi(repoInfo, token) {
   const url = `https://api.github.com/repos/${repoInfo.repoSlug}`;
   try {
@@ -7450,16 +7786,16 @@ async function checkGithubApi(repoInfo, token) {
   }
 }
 
-async function checkWorkingDir(workingDir) {
-  if (!workingDir) {
-    return { status: 'fail', detail: 'missing', hint: 'Set a working directory in project settings.' };
+async function checkWorkingDir(project, workingDir) {
+  const validation = await validateWorkingDir({ ...(project || {}), workingDir });
+  if (validation.ok) {
+    return { status: 'ok', detail: validation.details || workingDir };
   }
-  try {
-    await fs.mkdir(workingDir, { recursive: true });
-    return { status: 'ok', detail: workingDir };
-  } catch (error) {
-    return { status: 'fail', detail: 'invalid', hint: truncateText(error.message, 80) };
-  }
+  return {
+    status: 'fail',
+    detail: validation.details || 'invalid',
+    hint: formatWorkingDirHint(validation),
+  };
 }
 
 async function checkRemoteBranch(repoUrl, token, branch) {
@@ -8187,6 +8523,10 @@ async function startBot() {
   await startBotPolling();
 }
 
-startBot().catch((error) => {
-  console.error('Failed to start bot', error?.stack || error);
-});
+module.exports = {
+  startBot,
+  respond,
+  ensureAnswerCallback,
+  validateWorkingDir,
+  classifyDiagnosticsError,
+};
