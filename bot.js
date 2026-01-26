@@ -86,6 +86,7 @@ const { buildCb, resolveCallbackData, sanitizeReplyMarkup } = require('./callbac
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const ADMIN_TELEGRAM_ID = process.env.ADMIN_TELEGRAM_ID;
+const PORT = Number(process.env.PORT || 3000);
 const SUPABASE_ENV_VAULT_PROJECT_ID = 'supabase_connections';
 const SUPABASE_MESSAGE_LIMIT = 3500;
 const SUPABASE_ROWS_PAGE_SIZE = 20;
@@ -8192,8 +8193,6 @@ bot.catch(async (err) => {
   });
 });
 
-const port = process.env.PORT || 3000;
-
 async function initializeConfig() {
   try {
     await loadProjects();
@@ -8206,263 +8205,268 @@ async function initializeConfig() {
 
 function startHttpServer() {
   return new Promise((resolve) => {
-    http
-      .createServer(async (req, res) => {
-        const url = new URL(req.url, `http://${req.headers.host}`);
-        if (req.method === 'GET' && url.pathname.startsWith('/keep-alive/')) {
+    const server = http.createServer(async (req, res) => {
+      const url = new URL(req.url, `http://${req.headers.host}`);
+      if (req.method === 'GET' && url.pathname.startsWith('/keep-alive/')) {
+        const projectId = decodeURIComponent(url.pathname.split('/')[2] || '');
+        const project = projectId ? await getProjectById(projectId) : null;
+        if (!project) {
+          res.writeHead(404, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'Project not found.' }));
+          return;
+        }
+        if (!project.renderServiceUrl) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'renderServiceUrl not configured.' }));
+          return;
+        }
+        const start = Date.now();
+        try {
+          const response = await requestUrl('GET', project.renderServiceUrl);
+          const durationMs = Date.now() - start;
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, status: response.status, durationMs }));
+        } catch (error) {
+          const durationMs = Date.now() - start;
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, status: null, durationMs, error: error.message }));
+          await bot.api.sendMessage(
+            ADMIN_TELEGRAM_ID,
+            `Render keep-alive FAILED for project ${project.name || project.id}.`,
+          );
+        }
+        return;
+      }
+
+      if (req.method === 'POST' && url.pathname.startsWith('/render-error-hook/')) {
+        const projectId = decodeURIComponent(url.pathname.split('/')[2] || '');
+        const body = await readRequestBody(req);
+        const { message, level } = parseRenderErrorPayload(body);
+        const timestamp = new Date().toISOString();
+        const text = `⚠️ Render error for project ${projectId} at ${timestamp}.\nLevel: ${
+          level || '-'
+        }\nMessage: ${message || '-'}`;
+        await bot.api.sendMessage(ADMIN_TELEGRAM_ID, text);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
+        return;
+      }
+
+      if (req.method === 'POST' && url.pathname === '/ingest/logs') {
+        const expectedKey = process.env.LOG_INGEST_KEY || process.env.PATH_APPLIER_LOG_INGEST_KEY;
+        if (!expectedKey) {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'LOG_INGEST_KEY is not configured.' }));
+          return;
+        }
+
+        const providedKey = url.searchParams.get('key');
+        if (!providedKey || providedKey !== expectedKey) {
+          res.writeHead(403, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'Invalid key.' }));
+          return;
+        }
+
+        let payload;
+        try {
+          const rawBody = await readRequestBody(req);
+          payload = rawBody ? JSON.parse(rawBody) : null;
+        } catch (error) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'Invalid JSON body.' }));
+          return;
+        }
+
+        try {
+          const result = await logIngestService.ingestLog(payload);
+          if (!result.ok) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: result.error || 'Invalid payload.' }));
+            return;
+          }
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true }));
+        } catch (error) {
+          console.error('[log-ingest] failed to handle request', error);
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'internal error' }));
+        }
+        return;
+      }
+
+      if (req.method === 'POST' && url.pathname.startsWith('/project-log/')) {
+        try {
           const projectId = decodeURIComponent(url.pathname.split('/')[2] || '');
-          const project = projectId ? await getProjectById(projectId) : null;
+          const projects = await loadProjects();
+          const project = findProjectById(projects, projectId);
           if (!project) {
             res.writeHead(404, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ ok: false, error: 'Project not found.' }));
-            return;
-          }
-          if (!project.renderServiceUrl) {
-            res.writeHead(400, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ ok: false, error: 'renderServiceUrl not configured.' }));
-            return;
-          }
-          const start = Date.now();
-          try {
-            const response = await requestUrl('GET', project.renderServiceUrl);
-            const durationMs = Date.now() - start;
-            res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ ok: true, status: response.status, durationMs }));
-          } catch (error) {
-            const durationMs = Date.now() - start;
-            res.writeHead(500, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ ok: false, status: null, durationMs, error: error.message }));
-            await bot.api.sendMessage(
-              ADMIN_TELEGRAM_ID,
-              `Render keep-alive FAILED for project ${project.name || project.id}.`,
-            );
-          }
-          return;
-        }
-
-        if (req.method === 'POST' && url.pathname.startsWith('/render-error-hook/')) {
-          const projectId = decodeURIComponent(url.pathname.split('/')[2] || '');
-          const body = await readRequestBody(req);
-          const { message, level } = parseRenderErrorPayload(body);
-          const timestamp = new Date().toISOString();
-          const text = `⚠️ Render error for project ${projectId} at ${timestamp}.\nLevel: ${
-            level || '-'
-          }\nMessage: ${message || '-'}`;
-          await bot.api.sendMessage(ADMIN_TELEGRAM_ID, text);
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ ok: true }));
-          return;
-        }
-
-        if (req.method === 'POST' && url.pathname === '/ingest/logs') {
-          const expectedKey =
-            process.env.LOG_INGEST_KEY || process.env.PATH_APPLIER_LOG_INGEST_KEY;
-          if (!expectedKey) {
-            res.writeHead(500, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ ok: false, error: 'LOG_INGEST_KEY is not configured.' }));
+            res.end(JSON.stringify({ ok: false, error: 'Unknown projectId' }));
             return;
           }
 
-          const providedKey = url.searchParams.get('key');
-          if (!providedKey || providedKey !== expectedKey) {
-            res.writeHead(403, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ ok: false, error: 'Invalid key.' }));
-            return;
-          }
-
-          let payload;
-          try {
-            const rawBody = await readRequestBody(req);
-            payload = rawBody ? JSON.parse(rawBody) : null;
-          } catch (error) {
-            res.writeHead(400, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ ok: false, error: 'Invalid JSON body.' }));
-            return;
-          }
-
-          try {
-            const result = await logIngestService.ingestLog(payload);
-            if (!result.ok) {
-              res.writeHead(400, { 'Content-Type': 'application/json' });
-              res.end(JSON.stringify({ ok: false, error: result.error || 'Invalid payload.' }));
-              return;
-            }
-            res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ ok: true }));
-          } catch (error) {
-            console.error('[log-ingest] failed to handle request', error);
-            res.writeHead(500, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ ok: false, error: 'internal error' }));
-          }
-          return;
-        }
-
-        if (req.method === 'POST' && url.pathname.startsWith('/project-log/')) {
-          try {
-            const projectId = decodeURIComponent(url.pathname.split('/')[2] || '');
-            const projects = await loadProjects();
-            const project = findProjectById(projects, projectId);
-            if (!project) {
-              res.writeHead(404, { 'Content-Type': 'application/json' });
-              res.end(JSON.stringify({ ok: false, error: 'Unknown projectId' }));
-              return;
-            }
-
-            const rawBody = await readRequestBody(req);
-            const event = parseProjectLogPayload(rawBody);
-            const forwarding = await getProjectLogSettingsWithDefaults(projectId);
-
-            if (forwarding.enabled !== true) {
-              res.writeHead(200, { 'Content-Type': 'application/json' });
-              res.end(JSON.stringify({ ok: true, forwarded: false, reason: 'disabled' }));
-              return;
-            }
-
-            let allowedLevels = normalizeLogLevels(forwarding.levels).filter((level) =>
-              LOG_LEVELS.includes(level),
-            );
-            if (!allowedLevels.length) {
-              allowedLevels = ['error'];
-            }
-
-            if (!allowedLevels.includes(event.level)) {
-              res.writeHead(200, { 'Content-Type': 'application/json' });
-              res.end(JSON.stringify({ ok: true, forwarded: false, reason: 'level filtered' }));
-              return;
-            }
-
-            const targetChatId = forwarding.destinationChatId;
-            if (!targetChatId) {
-              res.writeHead(200, { 'Content-Type': 'application/json' });
-              res.end(JSON.stringify({ ok: true, forwarded: false, reason: 'no destination' }));
-              return;
-            }
-            const message = formatProjectLogMessage(project, event);
-            await sendSafeMessage(BOT_TOKEN, targetChatId, message);
-            res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ ok: true, forwarded: true }));
-          } catch (error) {
-            console.error('[project-log] Failed to process log event', error);
-            res.writeHead(500, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ ok: false, error: 'internal error' }));
-          }
-          return;
-        }
-
-        if (req.method === 'POST' && url.pathname.startsWith('/cron-alert/')) {
-          try {
-            const projectId = decodeURIComponent(url.pathname.split('/')[2] || '');
-            const projects = await loadProjects();
-            const project = findProjectById(projects, projectId);
-            if (!project) {
-              res.writeHead(404, { 'Content-Type': 'application/json' });
-              res.end(JSON.stringify({ ok: false, error: 'Unknown project' }));
-              return;
-            }
-
-            const rawBody = await readRequestBody(req);
-            const event = parseCronAlertPayload(rawBody);
-
-            if (project.cronNotificationsEnabled !== true) {
-              res.writeHead(200, { 'Content-Type': 'application/json' });
-              res.end(JSON.stringify({ ok: true, skipped: true }));
-              return;
-            }
-
-            if (
-              Array.isArray(project.cronNotificationsLevels) &&
-              !project.cronNotificationsLevels
-                .map((level) => String(level).toLowerCase())
-                .includes(event.level)
-            ) {
-              res.writeHead(200, { 'Content-Type': 'application/json' });
-              res.end(JSON.stringify({ ok: true, skipped: true }));
-              return;
-            }
-
-            const messageLines = [
-              `⏱ Cron alert for project ${project.name || project.id} (id: ${project.id})`,
-              `Level: ${event.level}`,
-            ];
-            if (event.jobId) {
-              messageLines.push(`Job: ${event.jobId}`);
-            }
-            if (event.time) {
-              messageLines.push(`Time: ${event.time}`);
-            }
-            messageLines.push('', truncateText(event.message, 1000));
-
-            await bot.api.sendMessage(ADMIN_TELEGRAM_ID, messageLines.join('\n'), {
-              disable_web_page_preview: true,
-            });
-
-            res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ ok: true }));
-          } catch (error) {
-            console.error('[cron-alert] Failed to process alert', error);
-            res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ ok: true, error: 'processing failed' }));
-          }
-          return;
-        }
-
-        // Example:
-        // POST https://path-applier.onrender.com/project-error/daily-system
-        // Body (JSON):
-        // { "level": "error", "message": "Failed to apply XP change", "stack": "Error: ...", "meta": { "userId": 123 } }
-        if (req.method === 'POST' && url.pathname.startsWith('/project-error/')) {
-          const projectId = decodeURIComponent(url.pathname.split('/')[2] || '');
           const rawBody = await readRequestBody(req);
-          let body = null;
-          if (rawBody) {
-            try {
-              body = JSON.parse(rawBody);
-            } catch (error) {
-              body = rawBody;
-            }
+          const event = parseProjectLogPayload(rawBody);
+          const forwarding = await getProjectLogSettingsWithDefaults(projectId);
+
+          if (forwarding.enabled !== true) {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: true, forwarded: false, reason: 'disabled' }));
+            return;
           }
 
-          const now = new Date().toISOString();
-          let summary = `⚠️ Project error\nProject: ${projectId}\nTime: ${now}\n`;
-
-          if (body && typeof body === 'object') {
-            const level = body.level || body.severity || 'error';
-            const message = body.message || body.error || '(no message)';
-            const stack = body.stack || body.trace || '';
-
-            summary += `Level: ${level}\nMessage: ${message}\n`;
-
-            if (stack) {
-              const lines = String(stack).split('\n').slice(0, 10).join('\n');
-              summary += `Stack (first lines):\n${lines}\n`;
-            }
-
-            if (body.meta) {
-              const metaStr = JSON.stringify(body.meta).slice(0, 500);
-              summary += `Meta: ${metaStr}\n`;
-            }
-          } else if (typeof body === 'string') {
-            summary += `Body: ${body.slice(0, 1000)}\n`;
-          } else {
-            summary += 'Body: (no JSON / text body)\n';
+          let allowedLevels = normalizeLogLevels(forwarding.levels).filter((level) =>
+            LOG_LEVELS.includes(level),
+          );
+          if (!allowedLevels.length) {
+            allowedLevels = ['error'];
           }
 
-          try {
-            await bot.api.sendMessage(ADMIN_TELEGRAM_ID, summary);
-          } catch (error) {
-            console.error('[project-error] Failed to send Telegram notification', error);
+          if (!allowedLevels.includes(event.level)) {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: true, forwarded: false, reason: 'level filtered' }));
+            return;
           }
+
+          const targetChatId = forwarding.destinationChatId;
+          if (!targetChatId) {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: true, forwarded: false, reason: 'no destination' }));
+            return;
+          }
+          const message = formatProjectLogMessage(project, event);
+          await sendSafeMessage(BOT_TOKEN, targetChatId, message);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, forwarded: true }));
+        } catch (error) {
+          console.error('[project-log] Failed to process log event', error);
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'internal error' }));
+        }
+        return;
+      }
+
+      if (req.method === 'POST' && url.pathname.startsWith('/cron-alert/')) {
+        try {
+          const projectId = decodeURIComponent(url.pathname.split('/')[2] || '');
+          const projects = await loadProjects();
+          const project = findProjectById(projects, projectId);
+          if (!project) {
+            res.writeHead(404, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'Unknown project' }));
+            return;
+          }
+
+          const rawBody = await readRequestBody(req);
+          const event = parseCronAlertPayload(rawBody);
+
+          if (project.cronNotificationsEnabled !== true) {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: true, skipped: true }));
+            return;
+          }
+
+          if (
+            Array.isArray(project.cronNotificationsLevels) &&
+            !project.cronNotificationsLevels
+              .map((level) => String(level).toLowerCase())
+              .includes(event.level)
+          ) {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: true, skipped: true }));
+            return;
+          }
+
+          const messageLines = [
+            `⏱ Cron alert for project ${project.name || project.id} (id: ${project.id})`,
+            `Level: ${event.level}`,
+          ];
+          if (event.jobId) {
+            messageLines.push(`Job: ${event.jobId}`);
+          }
+          if (event.time) {
+            messageLines.push(`Time: ${event.time}`);
+          }
+          messageLines.push('', truncateText(event.message, 1000));
+
+          await bot.api.sendMessage(ADMIN_TELEGRAM_ID, messageLines.join('\n'), {
+            disable_web_page_preview: true,
+          });
 
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: true }));
-          return;
+        } catch (error) {
+          console.error('[cron-alert] Failed to process alert', error);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, error: 'processing failed' }));
+        }
+        return;
+      }
+
+      // Example:
+      // POST https://path-applier.onrender.com/project-error/daily-system
+      // Body (JSON):
+      // { "level": "error", "message": "Failed to apply XP change", "stack": "Error: ...", "meta": { "userId": 123 } }
+      if (req.method === 'POST' && url.pathname.startsWith('/project-error/')) {
+        const projectId = decodeURIComponent(url.pathname.split('/')[2] || '');
+        const rawBody = await readRequestBody(req);
+        let body = null;
+        if (rawBody) {
+          try {
+            body = JSON.parse(rawBody);
+          } catch (error) {
+            body = rawBody;
+          }
         }
 
-        res.writeHead(200, { 'Content-Type': 'text/plain' });
-        res.end('Path Applier is running.\n');
+        const now = new Date().toISOString();
+        let summary = `⚠️ Project error\nProject: ${projectId}\nTime: ${now}\n`;
+
+        if (body && typeof body === 'object') {
+          const level = body.level || body.severity || 'error';
+          const message = body.message || body.error || '(no message)';
+          const stack = body.stack || body.trace || '';
+
+          summary += `Level: ${level}\nMessage: ${message}\n`;
+
+          if (stack) {
+            const lines = String(stack).split('\n').slice(0, 10).join('\n');
+            summary += `Stack (first lines):\n${lines}\n`;
+          }
+
+          if (body.meta) {
+            const metaStr = JSON.stringify(body.meta).slice(0, 500);
+            summary += `Meta: ${metaStr}\n`;
+          }
+        } else if (typeof body === 'string') {
+          summary += `Body: ${body.slice(0, 1000)}\n`;
+        } else {
+          summary += 'Body: (no JSON / text body)\n';
+        }
+
+        try {
+          await bot.api.sendMessage(ADMIN_TELEGRAM_ID, summary);
+        } catch (error) {
+          console.error('[project-error] Failed to send Telegram notification', error);
+        }
+
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
+        return;
+      }
+
+      res.statusCode = 200;
+      res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+      res.end('OK');
+    });
+
+    server
+      .listen(PORT, () => {
+        console.log(`[http] listening on ${PORT}`);
+        resolve();
       })
-      .listen(port, () => {
-        console.log(`HTTP health server listening on port ${port}`);
+      .on('error', (err) => {
+        console.error('[http] server error', err);
         resolve();
       });
   });
