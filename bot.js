@@ -157,6 +157,7 @@ const userState = new Map();
 let configStatusPool = null;
 const patchSessions = new Map();
 const changePreviewSessions = new Map();
+const structuredPatchSessions = new Map();
 let httpServerPromise = null;
 
 configureSelfLogger({
@@ -1178,6 +1179,24 @@ bot.callbackQuery('patch:finish', wrapCallbackHandler(async (ctx) => {
   await handlePatchApplication(ctx, session.projectId, session.buffer, inputTypes);
 }, 'patch_finish'));
 
+bot.callbackQuery('structured:fix_block', wrapCallbackHandler(async (ctx) => {
+  const session = structuredPatchSessions.get(ctx.from.id);
+  if (!session) {
+    await ctx.answerCallbackQuery({ text: 'No structured patch to fix.', show_alert: true });
+    return;
+  }
+  await ensureAnswerCallback(ctx);
+  setUserState(ctx.from.id, { type: 'structured_fix_block' });
+  await ctx.reply(`Send the corrected version of block ${session.failureIndex + 1}.`);
+}, 'structured_fix_block'));
+
+bot.callbackQuery('structured:cancel', wrapCallbackHandler(async (ctx) => {
+  structuredPatchSessions.delete(ctx.from.id);
+  clearUserState(ctx.from.id);
+  await ensureAnswerCallback(ctx);
+  await safeRespond(ctx, 'Patch cancelled.');
+}, 'structured_cancel'));
+
 bot.callbackQuery('change:cancel', wrapCallbackHandler(async (ctx) => {
   changePreviewSessions.delete(ctx.from.id);
   await ensureAnswerCallback(ctx);
@@ -1325,6 +1344,9 @@ async function handleStatefulMessage(ctx, state) {
       break;
     case 'proj_log_chat_input':
       await handleProjectLogChatInput(ctx, state);
+      break;
+    case 'structured_fix_block':
+      await handleStructuredFixBlockInput(ctx, state);
       break;
     default:
       clearUserState(ctx.from.id);
@@ -5963,7 +5985,7 @@ function parseChangeSpecBlocks(text) {
     .map((block) => block.trim())
     .filter(Boolean);
   if (!blocks.length) {
-    return { ok: false, errors: ['No change blocks found.'] };
+    return { ok: false, errors: [{ index: 0, message: 'No change blocks found.' }] };
   }
   const parsed = [];
   const errors = [];
@@ -5971,24 +5993,38 @@ function parseChangeSpecBlocks(text) {
   blocks.forEach((block, index) => {
     const data = {};
     let currentKey = null;
+    let hasField = false;
     block.split('\n').forEach((line) => {
-      const match = line.match(/^([A-Z_]+):\s*(.*)$/);
+      const trimmed = line.trim();
+      if (!trimmed) {
+        return;
+      }
+      const match = trimmed.match(/^([A-Z_]+):\s*(.*)$/);
       if (match) {
         currentKey = match[1].toUpperCase();
         data[currentKey] = match[2] || '';
+        hasField = true;
       } else if (currentKey) {
         data[currentKey] += `\n${line}`;
       }
+      if (!match && !currentKey) {
+        errors.push({ index: index + 1, message: `Invalid syntax: "${trimmed}"` });
+      }
     });
+    if (!hasField) {
+      errors.push({ index: index + 1, message: 'No valid fields found.' });
+      return;
+    }
 
     const filePath = data.FILE?.trim();
     const op = data.OP?.trim().toLowerCase();
     if (!filePath || !op) {
-      errors.push(`Block ${index + 1}: Missing FILE or OP.`);
+      errors.push({ index: index + 1, message: 'Missing FILE or OP.' });
       return;
     }
 
     const entry = {
+      blockIndex: index + 1,
       filePath,
       op,
       find: data.FIND?.trim(),
@@ -6017,37 +6053,37 @@ function validateStructuredSpec(blocks) {
   blocks.forEach((entry, index) => {
     const label = `Block ${index + 1}`;
     if (!entry.filePath) {
-      errors.push(`${label}: FILE is required.`);
+      errors.push({ index: index + 1, message: 'FILE is required.' });
       return;
     }
     if (!entry.op) {
-      errors.push(`${label}: OP is required.`);
+      errors.push({ index: index + 1, message: 'OP is required.' });
       return;
     }
     switch (entry.op) {
       case 'replace':
         if (!entry.find || entry.replace == null) {
-          errors.push(`${label}: FIND and REPLACE are required for replace.`);
+          errors.push({ index: index + 1, message: 'FIND and REPLACE are required for replace.' });
         }
         break;
       case 'insert_after':
       case 'insert_before':
         if (!entry.anchor || (!entry.insert && !entry.append)) {
-          errors.push(`${label}: ANCHOR and INSERT are required for insert.`);
+          errors.push({ index: index + 1, message: 'ANCHOR and INSERT are required for insert.' });
         }
         break;
       case 'append':
         if (!entry.append && !entry.insert) {
-          errors.push(`${label}: APPEND or INSERT is required for append.`);
+          errors.push({ index: index + 1, message: 'APPEND or INSERT is required for append.' });
         }
         break;
       case 'delete_range':
         if (!entry.start || !entry.end) {
-          errors.push(`${label}: START and END are required for delete_range.`);
+          errors.push({ index: index + 1, message: 'START and END are required for delete_range.' });
         }
         break;
       default:
-        errors.push(`${label}: Unsupported OP "${entry.op}".`);
+        errors.push({ index: index + 1, message: `Unsupported OP "${entry.op}".` });
         break;
     }
   });
@@ -6293,14 +6329,55 @@ function applyStructuredOperation(content, entry) {
   return { ok: false, reason: 'unsupported op' };
 }
 
-async function applyStructuredChangePlan(repoDir, plan) {
-  const results = [];
+function formatInvalidChangeSpecMessage(error, blockIndex) {
+  return `Invalid PM Change Spec\nError: ${error}\nBlock index: ${blockIndex}`;
+}
 
-  for (const entry of plan) {
+function validateStructuredFilePaths(repoDir, plan) {
+  const errors = [];
+  plan.forEach((entry, index) => {
+    const resolved = resolveRepoFilePath(repoDir, entry.filePath);
+    if (!resolved) {
+      errors.push({ index: index + 1, message: 'Invalid file path.' });
+    }
+  });
+  return errors;
+}
+
+function buildStructuredFailureMessage(failure) {
+  return [
+    `Block ${failure.index + 1} FAILED`,
+    `File: ${failure.entry?.filePath || ''}`,
+    `Operation: ${failure.entry?.op || ''}`,
+    `Reason: ${failure.reason || 'Unknown error'}`,
+  ].join('\n');
+}
+
+function buildStructuredSuccessMessage(totalBlocks, modifiedFiles, diffPreview) {
+  const lines = [
+    'Applied successfully',
+    `Total blocks: ${totalBlocks}`,
+    'Modified files:',
+    ...modifiedFiles.map((file) => `- ${file}`),
+  ];
+  if (diffPreview) {
+    lines.push('', 'Diff preview:', diffPreview);
+  }
+  return lines.join('\n');
+}
+
+async function applyStructuredChangePlan(repoDir, plan, options = {}) {
+  const results = [];
+  const startIndex = Number.isInteger(options.startIndex) ? options.startIndex : 0;
+
+  for (let index = startIndex; index < plan.length; index += 1) {
+    const entry = plan[index];
     const fullPath = resolveRepoFilePath(repoDir, entry.filePath);
     if (!fullPath) {
-      results.push({ entry, status: 'failed', reason: 'invalid file path' });
-      continue;
+      return {
+        results,
+        failure: { index, entry, reason: 'invalid file path' },
+      };
     }
     let content = '';
     let exists = true;
@@ -6310,25 +6387,31 @@ async function applyStructuredChangePlan(repoDir, plan) {
       exists = false;
     }
     if (!exists && !entry.createIfMissing) {
-      results.push({ entry, status: 'failed', reason: 'file not found' });
-      continue;
+      return {
+        results,
+        failure: { index, entry, reason: 'file not found' },
+      };
     }
 
     const operation = applyStructuredOperation(content, entry);
     if (!operation.ok) {
-      results.push({ entry, status: 'failed', reason: operation.reason });
-      continue;
+      return {
+        results,
+        failure: { index, entry, reason: operation.reason },
+      };
     }
     if (operation.content === content) {
-      results.push({ entry, status: 'skipped', reason: 'no changes' });
-      continue;
+      return {
+        results,
+        failure: { index, entry, reason: 'no changes' },
+      };
     }
     await fs.mkdir(path.dirname(fullPath), { recursive: true });
     await fs.writeFile(fullPath, operation.content, 'utf8');
     results.push({ entry, status: 'applied', warnings: operation.warnings });
   }
 
-  return results;
+  return { results, failure: null };
 }
 
 async function applyUnstructuredPlan(repoDir, plan) {
@@ -6408,6 +6491,7 @@ async function applyChangesInRepo(ctx, projectId, change) {
 
   const startTime = Date.now();
   const globalSettings = await loadGlobalSettings();
+  let shouldClearUserState = true;
 
   try {
     const effectiveBaseBranch = project.baseBranch || globalSettings.defaultBaseBranch || DEFAULT_BASE_BRANCH;
@@ -6428,16 +6512,28 @@ async function applyChangesInRepo(ctx, projectId, change) {
     const { git, repoDir } = await prepareRepository(project, effectiveBaseBranch);
     const branchName = makePatchBranchName(project.id);
 
+    if (change.mode === 'structured') {
+      const pathErrors = validateStructuredFilePaths(repoDir, change.plan || []);
+      if (pathErrors.length) {
+        const firstError = pathErrors[0];
+        await ctx.reply(formatInvalidChangeSpecMessage(firstError.message, firstError.index));
+        return;
+      }
+    }
+
     await createWorkingBranch(git, effectiveBaseBranch, branchName);
 
     let results = [];
+    let structuredFailure = null;
     if (change.mode === 'patch') {
       await ctx.reply('Applying patch…');
       await applyPatchToRepo(git, repoDir, change.patchText);
       results = [{ entry: { filePath: '(patch)' }, status: 'applied' }];
     } else if (change.mode === 'structured') {
       await ctx.reply('Applying structured changes…');
-      results = await applyStructuredChangePlan(repoDir, change.plan);
+      const structuredResult = await applyStructuredChangePlan(repoDir, change.plan);
+      results = structuredResult.results;
+      structuredFailure = structuredResult.failure;
     } else {
       await ctx.reply('Applying inferred changes…');
       results = await applyUnstructuredPlan(repoDir, change.plan);
@@ -6452,6 +6548,28 @@ async function applyChangesInRepo(ctx, projectId, change) {
         warnings: result.warnings,
       })),
     });
+
+    if (change.mode === 'structured' && structuredFailure) {
+      const failureMessage = buildStructuredFailureMessage(structuredFailure);
+      const inline = new InlineKeyboard()
+        .text('Fix this block', 'structured:fix_block')
+        .text('Cancel patch', 'structured:cancel');
+      structuredPatchSessions.set(ctx.from.id, {
+        projectId,
+        repoDir,
+        git,
+        branchName,
+        baseBranch: effectiveBaseBranch,
+        plan: change.plan,
+        results,
+        failureIndex: structuredFailure.index,
+        startTime,
+      });
+      setUserState(ctx.from.id, { type: 'structured_fix_block' });
+      shouldClearUserState = false;
+      await ctx.reply(failureMessage, { reply_markup: inline });
+      return;
+    }
 
     const summary = summarizeChangeResults(results);
     const failureLines = formatChangeFailures(results);
@@ -6488,16 +6606,151 @@ async function applyChangesInRepo(ctx, projectId, change) {
 
     const elapsed = Math.round((Date.now() - startTime) / 1000);
     const inline = new InlineKeyboard().url('View PR', pr.html_url);
-    const message = buildChangeSummaryMessage(summary, failureLines, diffPreview);
-    await ctx.reply(`Changes applied successfully.\nElapsed: ~${elapsed}s\n\n${message}`, {
-      reply_markup: inline,
-    });
+    if (change.mode === 'structured') {
+      const modifiedFiles = Array.from(
+        new Set(results.map((result) => result.entry?.filePath).filter(Boolean)),
+      );
+      const message = buildStructuredSuccessMessage(change.plan.length, modifiedFiles, diffPreview);
+      await ctx.reply(`Elapsed: ~${elapsed}s\n\n${message}`, { reply_markup: inline });
+    } else {
+      const message = buildChangeSummaryMessage(summary, failureLines, diffPreview);
+      await ctx.reply(`Changes applied successfully.\nElapsed: ~${elapsed}s\n\n${message}`, {
+        reply_markup: inline,
+      });
+    }
   } catch (error) {
     console.error('Failed to apply changes', error);
     await ctx.reply(`Failed to apply changes: ${error.message}`);
   } finally {
-    clearUserState(ctx.from.id);
+    if (shouldClearUserState) {
+      clearUserState(ctx.from.id);
+    }
   }
+}
+
+async function finalizeStructuredChangeSession(ctx, session, results) {
+  const projects = await loadProjects();
+  const project = findProjectById(projects, session.projectId);
+  if (!project) {
+    await ctx.reply('Project not found.');
+    return;
+  }
+
+  let repoInfo;
+  try {
+    repoInfo = getRepoInfo(project);
+  } catch (error) {
+    if (error.message === 'Project is missing repoSlug') {
+      await ctx.reply(
+        'This project is not fully configured: repoSlug is missing. Use "📝 Edit repo" to set it.',
+      );
+      return;
+    }
+    throw error;
+  }
+
+  const diffPreview = await buildDiffPreview(session.git);
+  await ctx.reply('Committing and pushing…');
+  const identityResult = await configureGitIdentity(session.git);
+  if (!identityResult.ok) {
+    const stderr = identityResult.error?.stderr || identityResult.error?.message || 'Unknown error';
+    console.error(`[gitIdentity] Failed to set ${identityResult.step}: ${stderr}`);
+    await ctx.reply('Failed to configure git author identity for this project. Please check logs.');
+    throw new Error('Failed to configure git author identity for this project.');
+  }
+  const hasChanges = await commitAndPush(session.git, session.branchName);
+  if (!hasChanges) {
+    await ctx.reply('No changes detected.');
+    return;
+  }
+
+  await ctx.reply('Creating Pull Request…');
+  const prBody = buildPrBody(diffPreview || '');
+  const [owner, repo] = repoInfo.repoSlug.split('/');
+  const githubToken = getGithubToken(project);
+  const pr = await createPullRequest({
+    owner,
+    repo,
+    baseBranch: session.baseBranch || DEFAULT_BASE_BRANCH,
+    headBranch: session.branchName,
+    title: `Automated patch: ${project.id}`,
+    body: prBody,
+    token: githubToken,
+  });
+
+  const elapsed = Math.round((Date.now() - session.startTime) / 1000);
+  const modifiedFiles = Array.from(
+    new Set(results.map((result) => result.entry?.filePath).filter(Boolean)),
+  );
+  const message = buildStructuredSuccessMessage(session.plan.length, modifiedFiles, diffPreview);
+  const inline = new InlineKeyboard().url('View PR', pr.html_url);
+  await ctx.reply(`Elapsed: ~${elapsed}s\n\n${message}`, { reply_markup: inline });
+}
+
+async function handleStructuredFixBlockInput(ctx, state) {
+  const text = ctx.message?.text?.trim();
+  if (!text) {
+    await ctx.reply('Please send the corrected block text.');
+    return;
+  }
+  const session = structuredPatchSessions.get(ctx.from.id);
+  if (!session) {
+    clearUserState(ctx.from.id);
+    await ctx.reply('No structured patch session found.');
+    return;
+  }
+
+  const parsed = parseChangeSpecBlocks(text);
+  if (!parsed.ok) {
+    const firstError = parsed.errors[0];
+    await ctx.reply(formatInvalidChangeSpecMessage(firstError.message, firstError.index));
+    return;
+  }
+  if (parsed.blocks.length !== 1) {
+    await ctx.reply(formatInvalidChangeSpecMessage('Expected exactly one block.', 1));
+    return;
+  }
+
+  const block = parsed.blocks[0];
+  const validationErrors = validateStructuredSpec([block]);
+  if (validationErrors.length) {
+    const firstError = validationErrors[0];
+    await ctx.reply(formatInvalidChangeSpecMessage(firstError.message, firstError.index));
+    return;
+  }
+  const pathErrors = validateStructuredFilePaths(session.repoDir, [block]);
+  if (pathErrors.length) {
+    const firstError = pathErrors[0];
+    await ctx.reply(formatInvalidChangeSpecMessage(firstError.message, firstError.index));
+    return;
+  }
+
+  session.plan[session.failureIndex] = {
+    ...block,
+    blockIndex: session.failureIndex + 1,
+  };
+
+  await ctx.reply('Retrying failed block…');
+  const structuredResult = await applyStructuredChangePlan(session.repoDir, session.plan, {
+    startIndex: session.failureIndex,
+  });
+  const combinedResults = [...session.results, ...structuredResult.results];
+
+  if (structuredResult.failure) {
+    session.results = combinedResults;
+    session.failureIndex = structuredResult.failure.index;
+    structuredPatchSessions.set(ctx.from.id, session);
+    const failureMessage = buildStructuredFailureMessage(structuredResult.failure);
+    const inline = new InlineKeyboard()
+      .text('Fix this block', 'structured:fix_block')
+      .text('Cancel patch', 'structured:cancel');
+    await ctx.reply(failureMessage, { reply_markup: inline });
+    return;
+  }
+
+  structuredPatchSessions.delete(ctx.from.id);
+  clearUserState(ctx.from.id);
+  await finalizeStructuredChangeSession(ctx, session, combinedResults);
 }
 
 async function handlePatchApplication(ctx, projectId, patchText, inputTypes = []) {
@@ -6515,12 +6768,14 @@ async function handlePatchApplication(ctx, projectId, patchText, inputTypes = []
   if (/FILE:\s*/i.test(patchText)) {
     const parsed = parseChangeSpecBlocks(patchText);
     if (!parsed.ok) {
-      await ctx.reply(`Failed to parse structured change spec:\n${parsed.errors.join('\n')}`);
+      const firstError = parsed.errors[0];
+      await ctx.reply(formatInvalidChangeSpecMessage(firstError.message, firstError.index));
       return;
     }
     const validationErrors = validateStructuredSpec(parsed.blocks);
     if (validationErrors.length) {
-      await ctx.reply(`Structured change spec errors:\n${validationErrors.join('\n')}`);
+      const firstError = validationErrors[0];
+      await ctx.reply(formatInvalidChangeSpecMessage(firstError.message, firstError.index));
       return;
     }
     console.info('[change-input] structured_plan', {
