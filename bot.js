@@ -1297,6 +1297,9 @@ async function handleStatefulMessage(ctx, state) {
     case 'edit_supabase':
       await handleEditSupabase(ctx, state);
       break;
+    case 'edit_service_health':
+      await handleEditServiceHealthInput(ctx, state);
+      break;
     case 'global_change_base':
       await handleGlobalBaseChange(ctx, state);
       break;
@@ -1357,7 +1360,9 @@ async function handleStatefulMessage(ctx, state) {
 function buildProjectsKeyboard(projects, globalSettings) {
   const defaultId = globalSettings?.defaultProjectId;
   const rows = projects.map((project) => {
-    const label = `${project.id === defaultId ? '⭐ ' : ''}${project.name || project.id}`;
+    const missingCount = getMissingRequirements(project).length;
+    const badge = missingCount ? ` INCOMPLETE (${missingCount} missing)` : '';
+    const label = `${project.id === defaultId ? '⭐ ' : ''}${project.name || project.id}${badge}`;
     return [
       {
         text: label,
@@ -1428,6 +1433,9 @@ async function handleProjectCallback(ctx, data) {
       break;
     case 'missing_setup':
       await renderProjectMissingSetup(ctx, projectId);
+      break;
+    case 'missing_fix':
+      await handleProjectMissingFix(ctx, projectId, extra);
       break;
     case 'apply_patch':
       startPatchSession(ctx.from.id, projectId);
@@ -1511,6 +1519,12 @@ async function handleProjectCallback(ctx, data) {
       break;
     case 'project_type':
       await renderProjectTypeMenu(ctx, projectId);
+      break;
+    case 'run_mode':
+      await renderProjectRunModeMenu(ctx, projectId);
+      break;
+    case 'run_mode_set':
+      await updateProjectRunMode(ctx, projectId, extra, source);
       break;
     case 'project_type_set':
       await updateProjectType(ctx, projectId, extra);
@@ -7177,6 +7191,56 @@ async function handleEditSupabase(ctx, state) {
   }
 }
 
+async function handleEditServiceHealthInput(ctx, state) {
+  const text = ctx.message.text?.trim();
+  if (!text) {
+    await ctx.reply('Please send text.');
+    return;
+  }
+  if (text.toLowerCase() === 'cancel') {
+    resetUserState(ctx);
+    await renderProjectMissingSetup(ctx, state.projectId, 'Operation cancelled.');
+    return;
+  }
+
+  if (state.step === 'healthPath') {
+    const healthPath = text.trim() === '-' ? undefined : text.trim();
+    setUserState(ctx.from.id, {
+      ...state,
+      step: 'servicePort',
+      healthPath,
+      messageContext: state.messageContext || getMessageTargetFromCtx(ctx),
+    });
+    await renderOrEdit(
+      ctx,
+      'Send expected service port (for example: 3000). Or send "-" to clear.\n(Or press Cancel)',
+      { reply_markup: buildCancelKeyboard() },
+    );
+    return;
+  }
+
+  const servicePort = text.trim() === '-' ? undefined : text.trim();
+  const projects = await loadProjects();
+  const idx = projects.findIndex((p) => p.id === state.projectId);
+  if (idx === -1) {
+    await ctx.reply('Project not found.');
+    clearUserState(ctx.from.id);
+    return;
+  }
+  projects[idx] = {
+    ...projects[idx],
+    healthPath: state.healthPath,
+    servicePort,
+  };
+  const saved = await saveProjectsWithFeedback(ctx, projects);
+  if (!saved) {
+    clearUserState(ctx.from.id);
+    return;
+  }
+  clearUserState(ctx.from.id);
+  await renderProjectMissingSetup(ctx, state.projectId, '✅ Updated');
+}
+
 async function handleGlobalBaseChange(ctx, state) {
   const text = ctx.message.text?.trim();
   if (!text) {
@@ -7368,6 +7432,136 @@ function getProjectSetupRules(globalSettings) {
   };
 }
 
+function isMissingRequirementValue(value) {
+  const trimmed = String(value ?? '').trim();
+  return !trimmed || trimmed === '-';
+}
+
+function resolveProjectFeatureFlag(project, key) {
+  const feature = project?.feature || project?.features || {};
+  if (Object.prototype.hasOwnProperty.call(feature, key)) {
+    return feature[key];
+  }
+  if (Object.prototype.hasOwnProperty.call(project || {}, key)) {
+    return project[key];
+  }
+  return undefined;
+}
+
+function getMissingRequirements(project) {
+  const missing = [];
+  const runModeRaw = project?.runMode || project?.run_mode || '';
+  const runMode = String(runModeRaw).trim();
+  const runModeNormalized = runMode.toLowerCase();
+  const logAlertsEnabled =
+    resolveProjectFeatureFlag(project, 'logAlertsEnabled') === true ||
+    project?.logAlertsEnabled === true ||
+    getEffectiveProjectLogForwarding(project).enabled === true;
+  const databaseEnabled =
+    resolveProjectFeatureFlag(project, 'databaseEnabled') === true ||
+    project?.databaseEnabled === true ||
+    project?.dbEnabled === true;
+  const supabaseEnabled =
+    resolveProjectFeatureFlag(project, 'supabaseEnabled') === true || project?.supabaseEnabled === true;
+  const healthPath = project?.healthPath || project?.health_path;
+  const servicePort =
+    project?.servicePort || project?.expectedPort || project?.port || project?.healthPort;
+
+  if (!runModeNormalized) {
+    missing.push({
+      key: 'runMode',
+      title: 'Run mode not set',
+      description: 'Select Service / Worker / Job so PM knows what is required.',
+      severity: 'required',
+      fixAction: 'FIX_RUNMODE',
+    });
+  }
+
+  if (
+    ['service', 'worker'].includes(runModeNormalized) &&
+    isMissingRequirementValue(project?.startCommand)
+  ) {
+    missing.push({
+      key: 'startCommand',
+      title: 'Start command missing',
+      description: 'Start command is required for Service/Worker.',
+      severity: 'required',
+      fixAction: 'FIX_START_COMMAND',
+    });
+  }
+
+  if (isMissingRequirementValue(project?.testCommand)) {
+    missing.push({
+      key: 'testCommand',
+      title: 'Test command not set',
+      description: 'Set a test command to enable readable project tests.',
+      severity: 'recommended',
+      fixAction: 'FIX_TEST_COMMAND',
+    });
+  }
+
+  if (isMissingRequirementValue(project?.diagnosticCommand)) {
+    missing.push({
+      key: 'diagnosticCommand',
+      title: 'Diagnostic command not set',
+      description: 'Set a diagnostic command for debugging/health checks.',
+      severity: 'recommended',
+      fixAction: 'FIX_DIAGNOSTIC_COMMAND',
+    });
+  }
+
+  if (logAlertsEnabled) {
+    const missingEnv = ['PATH_APPLIER_URL', 'PATH_APPLIER_TOKEN', 'PROJECT_NAME'].filter(
+      (key) => !process.env[key],
+    );
+    if (missingEnv.length) {
+      missing.push({
+        key: 'logForwardingEnv',
+        title: 'Log forwarding env missing',
+        description: 'PATH_APPLIER_URL, PATH_APPLIER_TOKEN, PROJECT_NAME must be set.',
+        severity: 'required',
+        fixAction: 'FIX_LOG_FORWARDING_ENV',
+      });
+    }
+  }
+
+  if (databaseEnabled && isMissingRequirementValue(project?.databaseUrl)) {
+    missing.push({
+      key: 'databaseUrl',
+      title: 'Database URL missing',
+      description: 'Add DB connection to use Database UI/SQL runner.',
+      severity: 'required',
+      fixAction: 'FIX_DATABASE_URL',
+    });
+  }
+
+  if (supabaseEnabled && isMissingRequirementValue(project?.supabaseConnectionId)) {
+    missing.push({
+      key: 'supabaseConnection',
+      title: 'Supabase binding missing',
+      description: 'Bind Supabase connection to enable DB features for this project.',
+      severity: 'required',
+      fixAction: 'FIX_SUPABASE_BINDING',
+    });
+  }
+
+  if (runModeNormalized === 'service') {
+    const healthMissing = isMissingRequirementValue(healthPath);
+    const portMissing = isMissingRequirementValue(servicePort);
+    if (healthMissing || portMissing) {
+      missing.push({
+        key: 'serviceHealth',
+        title: 'Service health/port not configured',
+        description: 'Set healthPath and confirm port behavior for Render-friendly checks.',
+        severity: 'recommended',
+        fixAction: 'FIX_SERVICE_HEALTH',
+      });
+    }
+  }
+
+  return missing;
+}
+
 function getProjectMissingSetup(project, globalSettings) {
   const rules = getProjectSetupRules(globalSettings);
   const missing = [];
@@ -7435,7 +7629,7 @@ function buildProjectSettingsView(project, globalSettings, notice) {
   const tokenKey = project.githubTokenEnvKey || 'GITHUB_TOKEN';
   const tokenLabel = tokenKey === 'GITHUB_TOKEN' ? 'GITHUB_TOKEN (default)' : tokenKey;
   const projectTypeLabel = getProjectTypeLabel(project);
-  const missingSetup = getProjectMissingSetup(project, globalSettings);
+  const missingSetup = getMissingRequirements(project);
 
   const lines = [
     `📦 Project: ${isDefault ? '⭐ ' : ''}${name} (🆔 ${project.id})`,
@@ -7501,7 +7695,7 @@ function buildProjectSettingsView(project, globalSettings, notice) {
 }
 
 function buildProjectMissingSetupView(project, globalSettings, notice) {
-  const missing = getProjectMissingSetup(project, globalSettings);
+  const missing = getMissingRequirements(project);
   const lines = [
     `🧩 Missing setup — ${project.name || project.id}`,
     notice || null,
@@ -7519,11 +7713,25 @@ function buildProjectMissingSetupView(project, globalSettings, notice) {
     return { text: lines.join('\n'), keyboard: inline };
   }
 
-  lines.push('Missing items:');
-  missing.forEach((item) => {
-    lines.push(`- ${item.emoji} ${item.label}`);
-    inline.text(`${item.emoji} ${item.label}`, item.action).row();
-  });
+  const required = missing.filter((item) => item.severity === 'required');
+  const recommended = missing.filter((item) => item.severity === 'recommended');
+
+  if (required.length) {
+    lines.push('Required:');
+    required.forEach((item) => {
+      lines.push(`- 🔴 ${item.title} — ${item.description}`);
+      inline.text(`Fix ${item.title}`, `proj:missing_fix:${project.id}:${item.fixAction}`).row();
+    });
+    lines.push('');
+  }
+
+  if (recommended.length) {
+    lines.push('Recommended:');
+    recommended.forEach((item) => {
+      lines.push(`- 🟡 ${item.title} — ${item.description}`);
+      inline.text(`Fix ${item.title}`, `proj:missing_fix:${project.id}:${item.fixAction}`).row();
+    });
+  }
 
   inline.text('⬅️ Back', `proj:open:${project.id}`);
   return { text: lines.join('\n'), keyboard: inline };
@@ -7542,6 +7750,110 @@ async function renderProjectMissingSetup(ctx, projectId, notice) {
   await safeRespond(ctx, view.text, { reply_markup: view.keyboard }, { action: 'missing_setup' });
 }
 
+function getMissingFixTarget(projectId, fixAction) {
+  switch (fixAction) {
+    case 'FIX_RUNMODE':
+      return { type: 'run_mode' };
+    case 'FIX_START_COMMAND':
+      return { type: 'command_edit', field: 'startCommand' };
+    case 'FIX_TEST_COMMAND':
+      return { type: 'command_edit', field: 'testCommand' };
+    case 'FIX_DIAGNOSTIC_COMMAND':
+      return { type: 'command_edit', field: 'diagnosticCommand' };
+    case 'FIX_LOG_FORWARDING_ENV':
+      return { type: 'env_vault' };
+    case 'FIX_DATABASE_URL':
+      return { type: 'env_vault' };
+    case 'FIX_SUPABASE_BINDING':
+      return { type: 'supabase' };
+    case 'FIX_SERVICE_HEALTH':
+      return { type: 'service_health' };
+    default:
+      return null;
+  }
+}
+
+async function handleProjectMissingFix(ctx, projectId, fixAction) {
+  resetUserState(ctx);
+  const projects = await loadProjects();
+  const project = findProjectById(projects, projectId);
+  if (!project) {
+    const message = `❌ Missing setup error.\n- Rule: project not found\n- Fix action: ${fixAction}`;
+    console.warn('[missing_setup] project not found', { projectId, fixAction });
+    await safeRespond(ctx, message, null, { action: 'missing_setup' });
+    return;
+  }
+
+  const missing = getMissingRequirements(project);
+  const targetItem = missing.find((item) => item.fixAction === fixAction);
+  if (!targetItem) {
+    const known = missing.map((item) => item.key).join(', ') || 'none';
+    const message =
+      `❌ Missing setup error.\n- Rule: not found\n- Fix action: ${fixAction}\n- Known missing: ${known}`;
+    console.warn('[missing_setup] fix action not found', {
+      projectId,
+      fixAction,
+      knownMissing: known,
+    });
+    await safeRespond(ctx, message, null, { action: 'missing_setup' });
+    return;
+  }
+
+  const target = getMissingFixTarget(projectId, fixAction);
+  if (!target) {
+    const message =
+      `❌ Missing setup error.\n- Rule: ${targetItem.key}\n- Fix action: ${fixAction}`;
+    console.warn('[missing_setup] unsupported fix action', {
+      projectId,
+      fixAction,
+      missingKey: targetItem.key,
+    });
+    await safeRespond(ctx, message, null, { action: 'missing_setup' });
+    return;
+  }
+
+  if (target.type === 'run_mode') {
+    await renderProjectRunModeMenu(ctx, projectId, { source: 'missing_setup' });
+    return;
+  }
+  if (target.type === 'command_edit') {
+    setUserState(ctx.from.id, {
+      type: 'edit_command_input',
+      projectId,
+      field: target.field,
+      backCallback: `proj:missing_setup:${projectId}`,
+      messageContext: getMessageTargetFromCtx(ctx),
+    });
+    await renderOrEdit(ctx, `Send new value for ${target.field}.\n(Or press Cancel)`, {
+      reply_markup: buildCancelKeyboard(),
+    });
+    return;
+  }
+  if (target.type === 'env_vault') {
+    await renderEnvVaultMenu(ctx, projectId);
+    return;
+  }
+  if (target.type === 'supabase') {
+    await renderSupabaseScreen(ctx, projectId);
+    return;
+  }
+  if (target.type === 'service_health') {
+    setUserState(ctx.from.id, {
+      type: 'edit_service_health',
+      step: 'healthPath',
+      projectId,
+      backCallback: `proj:missing_setup:${projectId}`,
+      messageContext: getMessageTargetFromCtx(ctx),
+    });
+    await renderOrEdit(
+      ctx,
+      'Send healthPath (for example: /healthz). Or send "-" to clear.\n(Or press Cancel)',
+      { reply_markup: buildCancelKeyboard() },
+    );
+    return;
+  }
+}
+
 async function renderProjectTypeMenu(ctx, projectId) {
   const project = await getProjectById(projectId, ctx);
   if (!project) return;
@@ -7556,6 +7868,48 @@ async function renderProjectTypeMenu(ctx, projectId) {
   await renderOrEdit(ctx, `Select project type for ${project.name || project.id}:`, {
     reply_markup: inline,
   });
+}
+
+async function renderProjectRunModeMenu(ctx, projectId, options = {}) {
+  const project = await getProjectById(projectId, ctx);
+  if (!project) return;
+  const current = String(project.runMode || project.run_mode || '').toLowerCase();
+  const source = options?.source === 'missing_setup' ? 'missing_setup' : null;
+  const suffix = source ? `:${source}` : '';
+  const inline = new InlineKeyboard();
+  const runModes = [
+    { id: 'service', label: 'Service' },
+    { id: 'worker', label: 'Worker' },
+    { id: 'job', label: 'Job' },
+  ];
+  runModes.forEach((mode) => {
+    const label = mode.id === current ? `✅ ${mode.label}` : mode.label;
+    inline.text(label, `proj:run_mode_set:${projectId}:${mode.id}${suffix}`).row();
+  });
+  const backTarget = source ? `proj:missing_setup:${projectId}` : `proj:open:${projectId}`;
+  inline.text('⬅️ Back', backTarget);
+  await renderOrEdit(ctx, `Select run mode for ${project.name || project.id}:`, {
+    reply_markup: inline,
+  });
+}
+
+async function updateProjectRunMode(ctx, projectId, runMode, source = null) {
+  const normalized = String(runMode || '').toLowerCase();
+  const allowed = ['service', 'worker', 'job'];
+  if (!allowed.includes(normalized)) {
+    await renderProjectRunModeMenu(ctx, projectId, { source });
+    return;
+  }
+  const updated = await updateProjectField(projectId, 'runMode', normalized);
+  if (!updated) {
+    await renderOrEdit(ctx, 'Project not found.');
+    return;
+  }
+  if (source === 'missing_setup') {
+    await renderProjectMissingSetup(ctx, projectId, '✅ Updated');
+    return;
+  }
+  await renderProjectSettings(ctx, projectId, '✅ Updated');
 }
 
 async function updateProjectType(ctx, projectId, typeId) {
