@@ -36,7 +36,7 @@ const { execFile } = require('child_process');
 const { promisify } = require('util');
 
 const execFileAsync = promisify(execFile);
-const { Bot, InlineKeyboard, Keyboard } = require('grammy');
+const { Bot, InlineKeyboard, Keyboard, InputFile } = require('grammy');
 const { Pool } = require('pg');
 
 const { loadProjects, saveProjects, findProjectById } = require('./projectsStore');
@@ -158,6 +158,7 @@ let configStatusPool = null;
 const patchSessions = new Map();
 const changePreviewSessions = new Map();
 const structuredPatchSessions = new Map();
+const envScanCache = new Map();
 let httpServerPromise = null;
 
 configureSelfLogger({
@@ -504,6 +505,28 @@ function validateCronExpression(raw) {
 function maskSecretValue(value) {
   if (!value) return '********';
   return '********';
+}
+
+function maskEnvValue(value) {
+  if (value == null) return '****';
+  const raw = String(value);
+  if (raw.length <= 4) return '****';
+  const maskedLength = Math.max(0, raw.length - 4);
+  return `${raw.slice(0, 2)}${'*'.repeat(maskedLength)}${raw.slice(-2)}`;
+}
+
+function evaluateEnvValueStatus(value) {
+  if (value === undefined || value === null) {
+    return { status: 'MISSING', reason: 'Value is undefined or null.' };
+  }
+  const trimmed = String(value).trim();
+  if (!trimmed) {
+    return { status: 'EMPTY', reason: 'Value is empty.' };
+  }
+  if (['-', 'undefined', 'null'].includes(trimmed)) {
+    return { status: 'INVALID', reason: 'Value is invalid.' };
+  }
+  return { status: 'SET', reason: 'Value is set.' };
 }
 
 function normalizeEnvKeyInput(value) {
@@ -1351,6 +1374,9 @@ async function handleStatefulMessage(ctx, state) {
     case 'structured_fix_block':
       await handleStructuredFixBlockInput(ctx, state);
       break;
+    case 'env_scan_fix_key':
+      await handleEnvScanFixKeyInput(ctx, state);
+      break;
     default:
       clearUserState(ctx.from.id);
       break;
@@ -1547,6 +1573,30 @@ async function handleProjectCallback(ctx, data) {
       break;
     case 'diagnostics':
       await runProjectDiagnostics(ctx, projectId);
+      break;
+    case 'diagnostics_menu':
+      await renderProjectDiagnosticsMenu(ctx, projectId);
+      break;
+    case 'diagnostics_light':
+      await runProjectLightDiagnostics(ctx, projectId);
+      break;
+    case 'diagnostics_full':
+      await runProjectFullDiagnostics(ctx, projectId);
+      break;
+    case 'env_export':
+      await exportProjectEnv(ctx, projectId);
+      break;
+    case 'env_scan':
+      await scanEnvRequirements(ctx, projectId);
+      break;
+    case 'env_scan_fix_missing':
+      await handleEnvScanFixMissing(ctx, projectId);
+      break;
+    case 'env_scan_fix_specific':
+      await handleEnvScanFixSpecific(ctx, projectId);
+      break;
+    case 'log_env_fix':
+      await handleLogForwardingEnvFix(ctx, projectId, extra);
       break;
     case 'render_menu':
       await renderRenderUrlsScreen(ctx, projectId);
@@ -5681,6 +5731,46 @@ function truncateMessage(text, limit) {
   return `${text.slice(0, limit)}\n... (truncated)`;
 }
 
+function chunkTextLines(lines, limit = 3500) {
+  const chunks = [];
+  let buffer = '';
+  lines.forEach((line) => {
+    const next = buffer ? `${buffer}\n${line}` : line;
+    if (next.length > limit) {
+      if (buffer) {
+        chunks.push(buffer);
+        buffer = line;
+      } else {
+        chunks.push(line.slice(0, limit));
+        buffer = '';
+      }
+      return;
+    }
+    buffer = next;
+  });
+  if (buffer) {
+    chunks.push(buffer);
+  }
+  return chunks;
+}
+
+async function sendChunkedMessages(ctx, lines, options = {}) {
+  const chunks = chunkTextLines(lines, options.limit || 3500);
+  for (const chunk of chunks) {
+    await replySafely(ctx, chunk, options.extra);
+  }
+}
+
+async function sendTextFile(ctx, filename, content, caption) {
+  const chatId = getChatIdFromCtx(ctx);
+  if (!chatId) {
+    console.error('[file] Unable to send file: missing chat id.');
+    return;
+  }
+  const file = new InputFile(Buffer.from(content, 'utf8'), filename);
+  await bot.api.sendDocument(chatId, file, { caption });
+}
+
 function getWizardSteps() {
   return [
     'name',
@@ -7264,80 +7354,856 @@ async function handleGlobalBaseChange(ctx, state) {
   }
 }
 
-async function runProjectDiagnostics(ctx, projectId) {
+function formatDiagnosticsCheckLine(status, label, detail) {
+  const icon = status === 'ok' ? '✅' : '❌';
+  const detailText = detail ? ` — ${detail}` : '';
+  return `${icon} ${label}${detailText}`;
+}
+
+async function resolveEnvValueSources(project, key) {
+  const sources = [];
+  if (isEnvVaultAvailable()) {
+    try {
+      const envSetId = await ensureProjectEnvSet(project.id);
+      const value = await getEnvVarValue(project.id, key, envSetId);
+      sources.push({ source: 'project_env_vault', value });
+    } catch (error) {
+      sources.push({ source: 'project_env_vault', value: null, error: 'Env Vault read failed.' });
+    }
+  } else {
+    sources.push({ source: 'project_env_vault', value: null, error: MASTER_KEY_ERROR_MESSAGE });
+  }
+
+  sources.push({ source: 'process_env', value: process.env[key] });
+
+  if (key === 'DATABASE_URL' && project?.databaseUrl) {
+    sources.push({ source: 'project_db_config', value: project.databaseUrl });
+  }
+
+  if (key === 'PROJECT_NAME') {
+    const computed = project?.name || project?.id || null;
+    if (computed) {
+      sources.push({ source: 'computed_default', value: computed });
+    }
+  }
+
+  return sources;
+}
+
+function selectEffectiveEnvValue(sources) {
+  for (const entry of sources) {
+    const status = evaluateEnvValueStatus(entry.value);
+    if (status.status === 'SET') {
+      return { source: entry.source, value: entry.value, status };
+    }
+  }
+  const fallback = sources[0] || { source: null, value: null };
+  return { source: fallback.source || null, value: fallback.value, status: evaluateEnvValueStatus(null) };
+}
+
+async function buildLogForwardingDiagnostics(project) {
+  const requiredKeys = ['PATH_APPLIER_URL', 'PATH_APPLIER_TOKEN', 'PROJECT_NAME'];
+  const details = [];
+  const missing = [];
+  const missingSet = new Set();
+  const sourcesTried = ['project_env_vault', 'process_env', 'computed_default'];
+
+  for (const key of requiredKeys) {
+    const sources = await resolveEnvValueSources(project, key);
+    const effective = selectEffectiveEnvValue(sources);
+    const baseStatus = evaluateEnvValueStatus(effective.value);
+    const computedOnly = effective.source === 'computed_default';
+    const status = computedOnly
+      ? { status: 'MISSING', reason: 'Value derived from computed default; env key not set.' }
+      : baseStatus;
+    const masked = effective.value ? maskEnvValue(effective.value) : '(missing)';
+    if (status.status !== 'SET') {
+      if (!missingSet.has(key)) {
+        missingSet.add(key);
+        missing.push({ key, status: status.status, reason: status.reason });
+      }
+    }
+    details.push(
+      `- ${key} = ${masked} (source: ${effective.source || '-'}) (status: ${status.status}) (reason: ${status.reason}) (sources: ${sourcesTried.join(', ')})`,
+    );
+  }
+
+  const urlSources = await resolveEnvValueSources(project, 'PATH_APPLIER_URL');
+  const urlEffective = selectEffectiveEnvValue(urlSources);
+  const urlValue = String(urlEffective.value || '').trim();
+  if (urlValue && !/^https?:\/\//i.test(urlValue)) {
+    if (!missingSet.has('PATH_APPLIER_URL')) {
+      missingSet.add('PATH_APPLIER_URL');
+      missing.push({ key: 'PATH_APPLIER_URL', status: 'INVALID', reason: 'URL must start with http:// or https://' });
+    }
+    details.push('  ↳ PATH_APPLIER_URL must start with http:// or https://.');
+  }
+
+  const status = missing.length ? 'fail' : 'ok';
+  const summary = missing.length
+    ? `missing/invalid: ${missing.map((entry) => entry.key).join(', ')}`
+    : 'all required keys set';
+
+  return {
+    status,
+    summary,
+    details,
+    missingKeys: missing.map((entry) => entry.key),
+  };
+}
+
+async function buildLightDiagnosticsReport(project, options = {}) {
+  const includeHeader = options.includeHeader !== false;
+  const lines = [];
+  if (includeHeader) {
+    lines.push(`🩺 Light Diagnostics — ${project.name || project.id}`, '');
+  }
+
+  const checks = [];
+  const logForwardingEnabled = getEffectiveProjectLogForwarding(project).enabled === true;
+  const logForwardingCheck = await buildLogForwardingDiagnostics(project);
+  const logForwardingDetail = logForwardingEnabled
+    ? logForwardingCheck.summary
+    : `log forwarding disabled (${logForwardingCheck.summary})`;
+  checks.push({
+    status: logForwardingCheck.status,
+    label: 'Log forwarding env',
+    detail: logForwardingDetail,
+    details: logForwardingCheck.details,
+    missingKeys: logForwardingEnabled ? logForwardingCheck.missingKeys : [],
+  });
+
+  const envCount = Object.keys(process.env || {}).length;
+  checks.push({
+    status: envCount > 0 ? 'ok' : 'fail',
+    label: 'Runtime env visible',
+    detail: envCount > 0 ? `${envCount} vars` : 'no env vars visible',
+  });
+
+  const envVaultAvailable = isEnvVaultAvailable();
+  if (!envVaultAvailable) {
+    checks.push({
+      status: 'fail',
+      label: 'Project Env Vault keys',
+      detail: MASTER_KEY_ERROR_MESSAGE,
+    });
+  } else {
+    const envSetId = await ensureProjectEnvSet(project.id);
+    const keys = await listEnvVarKeys(project.id, envSetId);
+    checks.push({
+      status: keys.length ? 'ok' : 'fail',
+      label: 'Project Env Vault keys',
+      detail: keys.length ? `${keys.length} keys stored` : 'no keys stored',
+    });
+  }
+
+  const telegramCheck = await checkTelegramSetup(project);
+  checks.push({
+    status: telegramCheck.status === 'ok' ? 'ok' : 'fail',
+    label: 'Telegram setup',
+    detail: telegramCheck.detail || 'unknown',
+  });
+
+  const supabaseEnabled =
+    resolveProjectFeatureFlag(project, 'supabaseEnabled') === true || project?.supabaseEnabled === true;
+  if (!supabaseEnabled) {
+    checks.push({ status: 'ok', label: 'Supabase binding', detail: 'not enabled' });
+  } else if (!project.supabaseConnectionId) {
+    checks.push({ status: 'fail', label: 'Supabase binding', detail: 'connectionId missing' });
+  } else {
+    checks.push({ status: 'ok', label: 'Supabase binding', detail: project.supabaseConnectionId });
+  }
+
+  const runModeNormalized = String(project?.runMode || project?.run_mode || '').toLowerCase();
+  if (runModeNormalized === 'service') {
+    const healthPath = project?.healthPath || project?.health_path;
+    const servicePort = project?.servicePort || project?.expectedPort || project?.port || project?.healthPort;
+    const healthMissing = isMissingRequirementValue(healthPath);
+    const portMissing = isMissingRequirementValue(servicePort);
+    checks.push({
+      status: healthMissing || portMissing ? 'fail' : 'ok',
+      label: 'Service health/port config',
+      detail:
+        healthMissing || portMissing
+          ? `healthPath: ${healthMissing ? 'missing' : 'set'}, port: ${portMissing ? 'missing' : 'set'}`
+          : 'configured',
+    });
+  } else {
+    checks.push({ status: 'ok', label: 'Service health/port config', detail: 'not service runMode' });
+  }
+
+  checks.forEach((check) => {
+    lines.push(formatDiagnosticsCheckLine(check.status, check.label, check.detail));
+    if (check.details && check.details.length) {
+      check.details.forEach((line) => lines.push(`  ${line}`));
+    }
+  });
+
+  return { lines, checks };
+}
+
+async function runProjectLightDiagnostics(ctx, projectId) {
   const projects = await loadProjects();
   const project = findProjectById(projects, projectId);
   if (!project) {
-    await respond(ctx, 'Project not found.');
+    await safeRespond(ctx, 'Project not found.', null, { action: 'light_diagnostics' });
     return;
   }
 
-  const command = project.diagnosticCommand || project.testCommand;
-  if (!command) {
-    await respond(ctx, 'No diagnostic/test command configured for this project.');
-    return;
-  }
+  const report = await buildLightDiagnosticsReport(project);
+  const missingLogKeys = report.checks.find((entry) => entry.label === 'Log forwarding env')?.missingKeys || [];
+  const inline = new InlineKeyboard();
+  missingLogKeys.forEach((key) => {
+    inline.text(`Fix ${key}`, `proj:log_env_fix:${project.id}:${key}`).row();
+  });
+  inline.text('⬅️ Back', `proj:diagnostics_menu:${project.id}`);
 
+  await safeRespond(ctx, report.lines.join('\n'), { reply_markup: inline }, { action: 'light_diagnostics' });
+}
+
+async function buildHeavyDiagnosticsReport(project) {
+  const checks = [];
+  const lines = [];
+  let repoInfo = null;
+  let blockedReason = null;
   const globalSettings = await loadGlobalSettings();
-  const effectiveBaseBranch = project.baseBranch || globalSettings.defaultBaseBranch || DEFAULT_BASE_BRANCH;
+  const baseBranch = project.baseBranch || globalSettings.defaultBaseBranch || DEFAULT_BASE_BRANCH;
 
-  let repoInfo;
   try {
     repoInfo = getRepoInfo(project);
-    await prepareRepository(project, effectiveBaseBranch);
+    await prepareRepository(project, baseBranch);
   } catch (error) {
     if (error.message === 'Project is missing repoSlug') {
-      await respond(
-        ctx,
-        'This project is not fully configured: repoSlug is missing. Use "📝 Edit repo" to set it.',
-      );
-      return;
+      blockedReason = 'repoSlug missing';
+    } else {
+      blockedReason = error.message || 'repo preparation failed';
     }
-    console.error('Failed to prepare repository for diagnostics', error);
   }
 
   const workingDir = project.workingDir || repoInfo?.workingDir;
   if (!workingDir) {
-    await respond(ctx, 'No working directory configured for this project.');
+    blockedReason = blockedReason || 'workingDir missing';
+  }
+
+  if (workingDir && !project.workingDir) {
+    await updateProjectField(project.id, 'workingDir', workingDir);
+  }
+
+  const validation = workingDir ? await validateWorkingDir({ ...project, workingDir }) : null;
+  if (validation && !validation.ok) {
+    blockedReason = blockedReason || validation.details || 'workingDir invalid';
+  }
+
+  if (blockedReason) {
+    lines.push(`❌ Heavy diagnostics blocked — ${blockedReason}`);
+    if (validation && !validation.ok) {
+      lines.push(`Reason: ${validation.details || 'workingDir invalid'}`);
+      if (validation.expectedCheckoutDir) {
+        lines.push(`Expected repo root: ${validation.expectedCheckoutDir}`);
+      }
+      if (validation.suggestedWorkingDir) {
+        lines.push(`Suggested workingDir: ${validation.suggestedWorkingDir}`);
+      }
+    }
+    return {
+      blocked: true,
+      lines,
+      workingDirInvalid: validation && !validation.ok,
+    };
+  }
+
+  checks.push({
+    status: 'ok',
+    label: 'Working dir validation',
+    detail: validation?.details || workingDir,
+  });
+
+  const tokenInfo = await resolveGithubToken(project);
+  const fetchCheck = repoInfo
+    ? await checkGitFetch(repoInfo.repoUrl, tokenInfo.token, baseBranch)
+    : { status: 'fail', detail: 'repo info missing', hint: 'Check repo settings.' };
+  checks.push({
+    status: fetchCheck.status === 'ok' ? 'ok' : 'fail',
+    label: 'Git fetch',
+    detail: fetchCheck.detail,
+  });
+
+  if (project.testCommand) {
+    const testResult = await runCommandInProject({ ...project, workingDir }, project.testCommand);
+    checks.push({
+      status: testResult.exitCode === 0 ? 'ok' : 'fail',
+      label: 'Test command',
+      detail: `exit ${testResult.exitCode} (${testResult.durationMs} ms)`,
+      details:
+        testResult.exitCode === 0
+          ? []
+          : [`Last output: ${truncateText(testResult.stderr || testResult.stdout || '', 200)}`],
+    });
+  } else {
+    checks.push({ status: 'fail', label: 'Test command', detail: 'not configured' });
+  }
+
+  if (project.diagnosticCommand) {
+    const diagResult = await runCommandInProject({ ...project, workingDir }, project.diagnosticCommand);
+    checks.push({
+      status: diagResult.exitCode === 0 ? 'ok' : 'fail',
+      label: 'Diagnostic command',
+      detail: `exit ${diagResult.exitCode} (${diagResult.durationMs} ms)`,
+      details:
+        diagResult.exitCode === 0
+          ? []
+          : [`Last output: ${truncateText(diagResult.stderr || diagResult.stdout || '', 200)}`],
+    });
+  } else {
+    checks.push({ status: 'fail', label: 'Diagnostic command', detail: 'not configured' });
+  }
+
+  checks.forEach((check) => {
+    lines.push(formatDiagnosticsCheckLine(check.status, check.label, check.detail));
+    if (check.details && check.details.length) {
+      check.details.forEach((line) => lines.push(`  ${line}`));
+    }
+  });
+
+  return { blocked: false, lines, workingDirInvalid: false };
+}
+
+async function runProjectFullDiagnostics(ctx, projectId) {
+  const projects = await loadProjects();
+  const project = findProjectById(projects, projectId);
+  if (!project) {
+    await safeRespond(ctx, 'Project not found.', null, { action: 'full_diagnostics' });
     return;
   }
 
-  if (!project.workingDir) {
-    await updateProjectField(projectId, 'workingDir', workingDir);
+  const lightReport = await buildLightDiagnosticsReport(project, { includeHeader: false });
+  const heavyReport = await buildHeavyDiagnosticsReport(project);
+
+  const lines = [
+    `🧪 Full Diagnostics — ${project.name || project.id}`,
+    '',
+    'Light diagnostics:',
+    ...lightReport.lines,
+    '',
+    'Heavy diagnostics:',
+    ...heavyReport.lines,
+  ];
+
+  const inline = new InlineKeyboard();
+  const missingLogKeys = lightReport.checks.find((entry) => entry.label === 'Log forwarding env')?.missingKeys || [];
+  missingLogKeys.forEach((key) => {
+    inline.text(`Fix ${key}`, `proj:log_env_fix:${project.id}:${key}`).row();
+  });
+  if (heavyReport.workingDirInvalid) {
+    inline.text('Fix WorkingDir', `proj:edit_workdir:${project.id}`).row();
+  }
+  inline.text('⬅️ Back', `proj:diagnostics_menu:${project.id}`);
+
+  await safeRespond(ctx, lines.join('\n'), { reply_markup: inline }, { action: 'full_diagnostics' });
+}
+
+async function runProjectDiagnostics(ctx, projectId) {
+  await runProjectFullDiagnostics(ctx, projectId);
+}
+
+async function handleLogForwardingEnvFix(ctx, projectId, key) {
+  const project = await getProjectById(projectId, ctx);
+  if (!project) return;
+  if (!key) {
+    await safeRespond(ctx, 'Env key missing.', null, { action: 'log_env_fix' });
+    return;
+  }
+  if (!isEnvVaultAvailable()) {
+    await safeRespond(
+      ctx,
+      `Env Vault unavailable. Set ${key} in the runtime environment.`,
+      { reply_markup: buildBackKeyboard(`proj:diagnostics_menu:${projectId}`) },
+      { action: 'log_env_fix' },
+    );
+    return;
+  }
+  await promptEnvVaultValue(ctx, projectId, key, { messageContext: getMessageTargetFromCtx(ctx) });
+}
+
+function formatMaskedEnvExportLine(entry) {
+  const status = evaluateEnvValueStatus(entry.value);
+  const masked = maskEnvValue(entry.value);
+  const display = status.status === 'SET' ? masked : '(missing)';
+  return `${entry.key} = ${display}  (source: ${entry.source})  (status: ${status.status})`;
+}
+
+function formatEnvExportFileSection(title, entries) {
+  const lines = [`# ${title}`];
+  entries.forEach((entry) => {
+    lines.push(`# source: ${entry.source}`);
+    lines.push(`${entry.key}=${entry.value == null ? '' : String(entry.value)}`);
+  });
+  return lines;
+}
+
+async function exportProjectEnv(ctx, projectId) {
+  const project = await getProjectById(projectId, ctx);
+  if (!project) return;
+
+  const envVaultEntries = [];
+  if (isEnvVaultAvailable()) {
+    try {
+      const envSetId = await ensureProjectEnvSet(projectId);
+      const envVars = await listEnvVars(projectId, envSetId);
+      for (const entry of envVars) {
+        const value = await getEnvVarValue(projectId, entry.key, envSetId);
+        envVaultEntries.push({ key: entry.key, value, source: 'project_env_vault' });
+      }
+    } catch (error) {
+      console.error('[env export] Failed to read env vault', error);
+    }
+  }
+
+  const processEntries = Object.entries(process.env || {}).map(([key, value]) => ({
+    key,
+    value,
+    source: 'process_env',
+  }));
+
+  const projectDbEntries = project.databaseUrl
+    ? [{ key: 'DATABASE_URL', value: project.databaseUrl, source: 'project_db_config' }]
+    : [];
+
+  const computedDefaults = project.name || project.id
+    ? [{ key: 'PROJECT_NAME', value: project.name || project.id, source: 'computed_default' }]
+    : [];
+
+  const effectiveEntries = [];
+  const allKeys = new Set([
+    ...envVaultEntries.map((entry) => entry.key),
+    ...processEntries.map((entry) => entry.key),
+    ...projectDbEntries.map((entry) => entry.key),
+    ...computedDefaults.map((entry) => entry.key),
+  ]);
+
+  const findEntry = (list, key) => list.find((entry) => entry.key === key);
+  allKeys.forEach((key) => {
+    const candidates = [
+      findEntry(envVaultEntries, key),
+      findEntry(processEntries, key),
+      findEntry(projectDbEntries, key),
+      findEntry(computedDefaults, key),
+    ].filter(Boolean);
+    let selected = candidates.find((entry) => evaluateEnvValueStatus(entry.value).status === 'SET');
+    if (!selected) {
+      selected = candidates[0] || { key, value: null, source: 'computed_default' };
+    }
+    effectiveEntries.push({ key, value: selected.value, source: selected.source });
+  });
+
+  const sortedEnvVault = [...envVaultEntries].sort((a, b) => a.key.localeCompare(b.key));
+  const sortedProcess = [...processEntries].sort((a, b) => a.key.localeCompare(b.key));
+  const sortedEffective = [...effectiveEntries].sort((a, b) => a.key.localeCompare(b.key));
+
+  const lines = [`🔐 Env export — ${project.name || project.id}`, ''];
+  if (sortedEnvVault.length) {
+    lines.push('Project Env Vault:', ...sortedEnvVault.map(formatMaskedEnvExportLine), '');
+  } else {
+    lines.push('Project Env Vault: no keys found.', '');
+  }
+  lines.push('Process/runtime env:', ...sortedProcess.map(formatMaskedEnvExportLine), '');
+  lines.push('Effective resolved env:', ...sortedEffective.map(formatMaskedEnvExportLine));
+
+  await sendChunkedMessages(ctx, lines);
+
+  const header = [
+    '# WARNING: This file contains sensitive values. Handle securely.',
+    `# Project: ${project.name || project.id}`,
+    `# Generated: ${new Date().toISOString()}`,
+    '',
+  ];
+  const fileLines = [
+    ...header,
+    ...formatEnvExportFileSection('Project Env Vault (unmasked)', sortedEnvVault),
+    '',
+    ...formatEnvExportFileSection('Process/runtime env (unmasked)', sortedProcess),
+    '',
+    ...formatEnvExportFileSection('Effective resolved env (unmasked)', sortedEffective),
+    '',
+  ];
+
+  const filename = `${projectId}-env-export.txt`;
+  await sendTextFile(ctx, filename, fileLines.join('\n'));
+}
+
+const ENV_SCAN_EXCLUDE_DIRS = new Set([
+  'node_modules',
+  '.git',
+  'dist',
+  'build',
+  'coverage',
+  'vendor',
+  '.next',
+  '.cache',
+]);
+const ENV_SCAN_MAX_FILE_SIZE = 512 * 1024;
+
+async function collectEnvScanFiles(rootDir) {
+  const files = [];
+  const queue = [rootDir];
+  while (queue.length) {
+    const current = queue.pop();
+    let entries = [];
+    try {
+      entries = await fs.readdir(current, { withFileTypes: true });
+    } catch (error) {
+      continue;
+    }
+    for (const entry of entries) {
+      const fullPath = path.join(current, entry.name);
+      if (entry.isDirectory()) {
+        if (ENV_SCAN_EXCLUDE_DIRS.has(entry.name)) {
+          continue;
+        }
+        queue.push(fullPath);
+      } else if (entry.isFile()) {
+        files.push(fullPath);
+      }
+    }
+  }
+  return files;
+}
+
+function recordEnvUsage(envMap, name, info) {
+  if (!envMap.has(name)) {
+    envMap.set(name, {
+      name,
+      firstSeen: info.firstSeen,
+      seenInCode: false,
+      seenInExample: false,
+      usage: { required: false, optional: false },
+    });
+  }
+  const entry = envMap.get(name);
+  if (!entry.firstSeen) {
+    entry.firstSeen = info.firstSeen;
+  }
+  if (info.isExample) {
+    entry.seenInExample = true;
+  } else {
+    entry.seenInCode = true;
+    if (info.required) {
+      entry.usage.required = true;
+    } else {
+      entry.usage.optional = true;
+    }
+  }
+}
+
+function isEnvNameValid(name) {
+  return /^[A-Z0-9_]{2,}$/.test(name);
+}
+
+function classifyNodeUsage(line, name) {
+  const requiredRegex = new RegExp(`process\\.env(?:\\.${name}|\\[['"]${name}['"]\\])\\s*!`);
+  return requiredRegex.test(line) ? 'required' : 'optional';
+}
+
+function scanLineForEnv(line, lineNumber, relativePath, envMap, isExample) {
+  const patterns = [
+    { regex: /process\.env\.([A-Z0-9_]+)/g, type: 'node' },
+    { regex: /process\.env\[['"]([A-Z0-9_]+)['"]\]/g, type: 'node' },
+    { regex: /os\.environ\[['"]([A-Z0-9_]+)['"]\]/g, type: 'python_required' },
+    { regex: /os\.getenv\(\s*['"]([A-Z0-9_]+)['"](?:\s*,\s*[^)]+)?\)/g, type: 'python_optional' },
+    { regex: /\$\{([A-Z0-9_]+)\}/g, type: 'generic' },
+    { regex: /\bENV\s+([A-Z0-9_]+)=/g, type: 'generic' },
+    { regex: /\bexport\s+([A-Z0-9_]+)=/g, type: 'generic' },
+    { regex: /\bname:\s*([A-Z0-9_]+)\b/g, type: 'generic' },
+  ];
+
+  patterns.forEach((pattern) => {
+    let match;
+    while ((match = pattern.regex.exec(line))) {
+      const name = match[1];
+      if (!isEnvNameValid(name)) continue;
+      let required = false;
+      if (pattern.type === 'python_required') {
+        required = true;
+      } else if (pattern.type === 'node') {
+        required = classifyNodeUsage(line, name) === 'required';
+      }
+      recordEnvUsage(envMap, name, {
+        firstSeen: { path: relativePath, line: lineNumber },
+        isExample,
+        required,
+      });
+    }
+  });
+}
+
+async function scanEnvRequirements(ctx, projectId) {
+  const project = await getProjectById(projectId, ctx);
+  if (!project) return;
+
+  console.log('[env scan] start', { projectId });
+  const globalSettings = await loadGlobalSettings();
+  const baseBranch = project.baseBranch || globalSettings.defaultBaseBranch || DEFAULT_BASE_BRANCH;
+  let repoInfo = null;
+  try {
+    repoInfo = getRepoInfo(project);
+    await prepareRepository(project, baseBranch);
+  } catch (error) {
+    const message =
+      error.message === 'Project is missing repoSlug'
+        ? 'Repo slug missing. Set repoSlug before scanning env requirements.'
+        : `Repo preparation failed: ${error.message}`;
+    await safeRespond(ctx, message, { reply_markup: buildBackKeyboard(`proj:diagnostics_menu:${projectId}`) }, { action: 'env_scan' });
+    return;
+  }
+
+  const workingDir = project.workingDir || repoInfo?.workingDir;
+  if (!workingDir) {
+    await safeRespond(ctx, 'workingDir missing. Set a working directory before scanning.', {
+      reply_markup: buildBackKeyboard(`proj:diagnostics_menu:${projectId}`),
+    }, { action: 'env_scan' });
+    return;
   }
 
   const validation = await validateWorkingDir({ ...project, workingDir });
   if (!validation.ok) {
-    console.warn('[diagnostics] Working dir validation failed', {
-      projectId,
-      code: validation.code,
-      workingDir,
-      expectedCheckoutDir: validation.expectedCheckoutDir,
-    });
-    await respond(ctx, formatWorkingDirValidationMessage(validation));
+    const lines = ['Env scan blocked: workingDir is invalid.', `Reason: ${validation.details}`];
+    if (validation.expectedCheckoutDir) {
+      lines.push(`Expected repo root: ${validation.expectedCheckoutDir}`);
+    }
+    if (validation.suggestedWorkingDir) {
+      lines.push(`Suggested workingDir: ${validation.suggestedWorkingDir}`);
+    }
+    const inline = new InlineKeyboard()
+      .text('Fix WorkingDir', `proj:edit_workdir:${projectId}`)
+      .row()
+      .text('⬅️ Back', `proj:diagnostics_menu:${projectId}`);
+    await safeRespond(ctx, lines.join('\n'), { reply_markup: inline }, { action: 'env_scan' });
     return;
   }
 
-  const result = await runCommandInProject({ ...project, workingDir }, command);
-  if (result.exitCode === 0) {
-    await respond(
+  const envMap = new Map();
+  const files = await collectEnvScanFiles(workingDir);
+  for (const file of files) {
+    let stat;
+    try {
+      stat = await fs.stat(file);
+    } catch (error) {
+      continue;
+    }
+    if (stat.size > ENV_SCAN_MAX_FILE_SIZE) {
+      continue;
+    }
+    let content = '';
+    try {
+      content = await fs.readFile(file, 'utf8');
+    } catch (error) {
+      continue;
+    }
+    const relativePath = path.relative(workingDir, file);
+    const isExample = relativePath.endsWith('.env.example');
+    const lines = content.split(/\r?\n/);
+    lines.forEach((line, index) => {
+      scanLineForEnv(line, index + 1, relativePath, envMap, isExample);
+    });
+  }
+
+  const entries = [...envMap.values()];
+  const required = [];
+  const optional = [];
+  const suggested = [];
+  entries.forEach((entry) => {
+    if (entry.seenInCode) {
+      if (entry.usage.required) {
+        required.push(entry);
+      } else {
+        optional.push(entry);
+      }
+    } else if (entry.seenInExample) {
+      suggested.push(entry);
+    }
+  });
+
+  const allKeys = entries.map((entry) => entry.name);
+  const envVaultValues = new Map();
+  if (isEnvVaultAvailable()) {
+    const envSetId = await ensureProjectEnvSet(projectId);
+    for (const key of allKeys) {
+      try {
+        const value = await getEnvVarValue(projectId, key, envSetId);
+        if (value !== null && value !== undefined) {
+          envVaultValues.set(key, value);
+        }
+      } catch (error) {
+        continue;
+      }
+    }
+  }
+
+  const resolveEnvStatus = (name) => {
+    const vaultValue = envVaultValues.get(name);
+    const processValue = process.env[name];
+    const candidates = [
+      { source: 'project_env_vault', value: vaultValue },
+      { source: 'process_env', value: processValue },
+    ];
+    const effective = selectEffectiveEnvValue(candidates);
+    const status = evaluateEnvValueStatus(effective.value);
+    return {
+      status: status.status,
+      source: effective.source,
+      maskedValue: status.status === 'SET' ? maskEnvValue(effective.value) : '(missing)',
+    };
+  };
+
+  const buildSectionLines = (label, list, includeSet) => {
+    if (!list.length) return [`${label}: none`];
+    const sorted = [...list].sort((a, b) => a.name.localeCompare(b.name));
+    const items = [];
+    const missing = [];
+    const present = [];
+    sorted.forEach((entry) => {
+      const resolved = resolveEnvStatus(entry.name);
+      const payload = {
+        entry,
+        resolved,
+      };
+      if (resolved.status === 'SET') {
+        present.push(payload);
+      } else {
+        missing.push(payload);
+      }
+    });
+    const combined = [...missing, ...(includeSet ? present : [])];
+    const lines = [`${label}:`];
+    combined.forEach(({ entry, resolved }) => {
+      const sourceText = resolved.source ? ` [source: ${resolved.source}]` : '';
+      lines.push(
+        `${entry.name} = ${resolved.maskedValue} [${resolved.status}]${sourceText} [firstSeenIn: ${entry.firstSeen?.path || '-'}:${entry.firstSeen?.line || '-'}]`,
+      );
+    });
+    return lines;
+  };
+
+  const missingRequired = [];
+  required.forEach((entry) => {
+    const resolved = resolveEnvStatus(entry.name);
+    if (resolved.status !== 'SET') {
+      missingRequired.push(entry.name);
+    }
+  });
+  envScanCache.set(projectId, { missingRequired, updatedAt: Date.now() });
+
+  const summary = `Summary: required=${required.length}, optional=${optional.length}, suggested=${suggested.length}; required missing=${missingRequired.length}`;
+  const reportLines = [
+    `🔎 Env scan — ${project.name || project.id}`,
+    summary,
+    '',
+    ...buildSectionLines('REQUIRED', required, true),
+    '',
+    ...buildSectionLines('OPTIONAL', optional, true),
+    '',
+    ...buildSectionLines('SUGGESTED', suggested, false),
+  ];
+
+  const maxLines = 120;
+  const maxChars = 3500;
+  let truncated = false;
+  let outputLines = reportLines;
+  if (outputLines.length > maxLines) {
+    outputLines = outputLines.slice(0, maxLines);
+    truncated = true;
+  }
+  let outputText = outputLines.join('\n');
+  if (outputText.length > maxChars) {
+    outputText = `${outputText.slice(0, maxChars)}\n... (truncated)`;
+    truncated = true;
+  }
+
+  const inline = new InlineKeyboard()
+    .text('Fix missing required envs', `proj:env_scan_fix_missing:${projectId}`)
+    .row()
+    .text('Fix a specific env', `proj:env_scan_fix_specific:${projectId}`)
+    .row()
+    .text('Export env (masked + full file)', `proj:env_export:${projectId}`)
+    .row()
+    .text('⬅️ Back', `proj:diagnostics_menu:${projectId}`);
+
+  await safeRespond(ctx, outputText, { reply_markup: inline }, { action: 'env_scan' });
+
+  if (truncated) {
+    const filename = `${projectId}-env-scan-report.txt`;
+    await sendTextFile(ctx, filename, reportLines.join('\n'));
+  }
+
+  console.log('[env scan] end', { projectId, entries: entries.length });
+}
+
+async function handleEnvScanFixMissing(ctx, projectId) {
+  const cached = envScanCache.get(projectId);
+  if (!cached || !cached.missingRequired || !cached.missingRequired.length) {
+    await safeRespond(
       ctx,
-      `🧪 Diagnostics finished successfully.\nProject: ${project.name || project.id}\nDuration: ${result.durationMs} ms\n\nLast output:\n${result.stdout || '(no output)'}`,
+      'No missing required envs found. Run "Scan env requirements" first.',
+      { reply_markup: buildBackKeyboard(`proj:diagnostics_menu:${projectId}`) },
+      { action: 'env_scan_fix_missing' },
     );
     return;
   }
-
-  const classification = classifyDiagnosticsError({ result, project, workingDir, validation });
-  if (classification?.reason === 'WORKING_DIR_INVALID') {
-    await respond(ctx, classification.message);
+  if (!isEnvVaultAvailable()) {
+    await safeRespond(
+      ctx,
+      buildEnvVaultUnavailableMessage('Env Vault unavailable.'),
+      { reply_markup: buildBackKeyboard(`proj:diagnostics_menu:${projectId}`) },
+      { action: 'env_scan_fix_missing' },
+    );
     return;
   }
+  const keys = cached.missingRequired;
+  await promptEnvVaultValue(ctx, projectId, keys[0], {
+    queue: keys,
+    allowSkip: true,
+    skipExisting: true,
+    requiredKeys: keys,
+    messageContext: getMessageTargetFromCtx(ctx),
+  });
+}
 
-  const errorExcerpt = result.stderr || result.stdout || '(no output)';
-  await respond(
-    ctx,
-    `🧪 Diagnostics FAILED (exit code ${result.exitCode}).\nProject: ${project.name || project.id}\nDuration: ${result.durationMs} ms\n\nError excerpt:\n${errorExcerpt}`,
-  );
+async function handleEnvScanFixSpecific(ctx, projectId) {
+  if (!isEnvVaultAvailable()) {
+    await safeRespond(
+      ctx,
+      buildEnvVaultUnavailableMessage('Env Vault unavailable.'),
+      { reply_markup: buildBackKeyboard(`proj:diagnostics_menu:${projectId}`) },
+      { action: 'env_scan_fix_specific' },
+    );
+    return;
+  }
+  setUserState(ctx.from.id, {
+    type: 'env_scan_fix_key',
+    projectId,
+    messageContext: getMessageTargetFromCtx(ctx),
+  });
+  await renderOrEdit(ctx, 'Send the env key to set.\n(Or press Cancel)', {
+    reply_markup: buildCancelKeyboard(),
+  });
+}
+
+async function handleEnvScanFixKeyInput(ctx, state) {
+  const text = ctx.message.text?.trim();
+  if (!text) {
+    await ctx.reply('Please send an env key.');
+    return;
+  }
+  if (text.toLowerCase() === 'cancel') {
+    resetUserState(ctx);
+    await renderOrEdit(ctx, 'Operation cancelled.', {
+      reply_markup: buildBackKeyboard(`proj:diagnostics_menu:${state.projectId}`),
+    });
+    return;
+  }
+  const key = normalizeEnvKeyInput(text);
+  clearUserState(ctx.from.id);
+  await promptEnvVaultValue(ctx, state.projectId, key, { messageContext: state.messageContext });
 }
 
 async function pingRenderService(ctx, projectId) {
@@ -7669,6 +8535,8 @@ function buildProjectSettingsView(project, globalSettings, notice) {
     .text('🔑 Edit GitHub token', `proj:edit_github_token:${project.id}`)
     .row()
     .text('🧰 Edit commands', `proj:commands:${project.id}`)
+    .row()
+    .text('🧪 Diagnostics', `proj:diagnostics_menu:${project.id}`)
     .row()
     .text('📡 Server', `proj:server_menu:${project.id}`)
     .text('🗄️ Supabase binding', `proj:supabase:${project.id}`)
@@ -8187,13 +9055,38 @@ async function renderProjectMenu(ctx, projectId) {
     .row()
     .text('📡 Edit Render URLs', `proj:render_menu:${projectId}`)
     .row()
-    .text('🧪 Run diagnostics', `proj:diagnostics:${projectId}`)
+    .text('🧪 Diagnostics', `proj:diagnostics_menu:${projectId}`)
     .row()
     .text('⬅️ Back', `proj:open:${projectId}`);
 
   await renderOrEdit(ctx, `📂 Project menu: ${project.name || project.id}`, {
     reply_markup: inline,
   });
+}
+
+async function renderProjectDiagnosticsMenu(ctx, projectId, notice) {
+  const project = await getProjectById(projectId, ctx);
+  if (!project) return;
+
+  const lines = [
+    `🧪 Diagnostics — ${project.name || project.id}`,
+    notice || null,
+    '',
+    'Choose an action:',
+  ].filter(Boolean);
+
+  const inline = new InlineKeyboard()
+    .text('🩺 Run Light Diagnostics', `proj:diagnostics_light:${projectId}`)
+    .row()
+    .text('🧪 Run Full Diagnostics', `proj:diagnostics_full:${projectId}`)
+    .row()
+    .text('📤 Export env (masked + file)', `proj:env_export:${projectId}`)
+    .row()
+    .text('🔎 Scan env requirements', `proj:env_scan:${projectId}`)
+    .row()
+    .text('⬅️ Back', `proj:open:${projectId}`);
+
+  await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
 }
 
 async function renderProjectSqlMenu(ctx, projectId) {
@@ -10186,6 +11079,8 @@ module.exports = {
   ensureAnswerCallback,
   validateWorkingDir,
   classifyDiagnosticsError,
+  maskEnvValue,
+  evaluateEnvValueStatus,
 };
 
 async function main() {
