@@ -256,6 +256,42 @@ async function getRecentLogById(projectId, logId) {
   };
 }
 
+async function renameLogIngestProjectId(oldProjectId, newProjectId) {
+  const db = await getDb();
+  if (!db) {
+    if (memory.settings.has(oldProjectId)) {
+      memory.settings.set(newProjectId, memory.settings.get(oldProjectId));
+      memory.settings.delete(oldProjectId);
+    }
+    if (memory.logs.has(oldProjectId)) {
+      memory.logs.set(newProjectId, memory.logs.get(oldProjectId));
+      memory.logs.delete(oldProjectId);
+    }
+    return true;
+  }
+  try {
+    await db.query('BEGIN');
+    await db.query('UPDATE project_log_settings SET project_id = $1 WHERE project_id = $2', [
+      newProjectId,
+      oldProjectId,
+    ]);
+    await db.query('UPDATE project_recent_logs SET project_id = $1 WHERE project_id = $2', [
+      newProjectId,
+      oldProjectId,
+    ]);
+    await db.query('COMMIT');
+    return true;
+  } catch (error) {
+    await db.query('ROLLBACK');
+    console.error('[log-settings] Failed to rename log ingest projectId', error);
+    await forwardSelfLog('error', 'Failed to rename log ingest projectId', {
+      stack: error?.stack,
+      context: { error: error?.message, oldProjectId, newProjectId },
+    });
+    throw error;
+  }
+}
+
 module.exports = {
   DEFAULT_SETTINGS,
   getProjectLogSettings,
@@ -263,4 +299,5 @@ module.exports = {
   addRecentLog,
   listRecentLogs,
   getRecentLogById,
+  renameLogIngestProjectId,
 };

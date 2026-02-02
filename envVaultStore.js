@@ -214,6 +214,40 @@ async function deleteEnvVar(projectId, key, envSetId) {
   return result.rowCount > 0;
 }
 
+async function renameEnvVaultProjectId(oldProjectId, newProjectId) {
+  const db = await getDb();
+  if (!db) {
+    memory.envVarSets = memory.envVarSets.map((set) =>
+      set.projectId === oldProjectId ? { ...set, projectId: newProjectId } : set,
+    );
+    memory.envVars = memory.envVars.map((entry) =>
+      entry.projectId === oldProjectId ? { ...entry, projectId: newProjectId } : entry,
+    );
+    return true;
+  }
+  try {
+    await db.query('BEGIN');
+    await db.query('UPDATE env_var_sets SET project_id = $1 WHERE project_id = $2', [
+      newProjectId,
+      oldProjectId,
+    ]);
+    await db.query('UPDATE project_env_vars SET project_id = $1 WHERE project_id = $2', [
+      newProjectId,
+      oldProjectId,
+    ]);
+    await db.query('COMMIT');
+    return true;
+  } catch (error) {
+    await db.query('ROLLBACK');
+    console.error('[envVaultStore] Failed to rename project env vault records', error);
+    await forwardSelfLog('error', 'Failed to rename env vault projectId', {
+      stack: error?.stack,
+      context: { error: error?.message, oldProjectId, newProjectId },
+    });
+    throw error;
+  }
+}
+
 async function getEnvVarValue(projectId, key, envSetId) {
   const record = await getEnvVarRecord(projectId, key, envSetId);
   if (!record) return null;
@@ -228,4 +262,5 @@ module.exports = {
   getEnvVarValue,
   upsertEnvVar,
   deleteEnvVar,
+  renameEnvVaultProjectId,
 };

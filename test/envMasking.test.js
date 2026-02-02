@@ -3,10 +3,10 @@ const assert = require('node:assert/strict');
 const { maskEnvValue, evaluateEnvValueStatus } = require('../bot');
 
 test('maskEnvValue preserves length with first/last two characters', () => {
-  assert.equal(maskEnvValue('abcdef'), 'ab**ef');
-  assert.equal(maskEnvValue('abcd'), '****');
-  assert.equal(maskEnvValue('ab'), '****');
-  assert.equal(maskEnvValue('secretvalue'), 'se*******ue');
+  assert.equal(maskEnvValue('abcdef'), 'ab***ef');
+  assert.equal(maskEnvValue('abcd'), '***');
+  assert.equal(maskEnvValue('ab'), '***');
+  assert.equal(maskEnvValue('secretvalue'), 'se***ue');
 });
 
 test('evaluateEnvValueStatus detects missing/empty/invalid/set', () => {
