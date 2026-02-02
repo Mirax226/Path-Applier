@@ -11046,6 +11046,10 @@ async function buildDataCenterView(ctx) {
   } else {
     cards.forEach(({ project, info }, index) => {
       const name = project.name || project.id;
+      const databaseEnabled =
+        resolveProjectFeatureFlag(project, 'databaseEnabled') === true ||
+        project?.databaseEnabled === true ||
+        project?.dbEnabled === true;
       lines.push(
         `📦 ${name} (🆔 ${project.id})`,
         `DB type: ${info.dbType}`,
@@ -11053,15 +11057,15 @@ async function buildDataCenterView(ctx) {
         `Key: ${info.keyName} (${info.status})`,
       );
       inline.text(`📦 ${name} (🆔 ${project.id})`, `proj:open:${project.id}`).row();
-      inline
-        .text('🌐 Open mini-site', `proj:db_mini:${project.id}`)
-        .row()
-        .text('🛠️ Edit DB config', `proj:db_config:${project.id}`)
-        .row()
-        .text('📊 Run DB overview', `proj:db_insights:${project.id}:0:0`)
-        .row()
-        .text('🧾 SQL runner', `proj:sql_menu:${project.id}`)
-        .row();
+      if (databaseEnabled) {
+        inline
+          .text('🌐 Open mini-site', `proj:db_mini:${project.id}`)
+          .text('🛠️ Edit DB config', `proj:db_config:${project.id}`)
+          .row()
+          .text('📊 Run DB overview', `proj:db_insights:${project.id}:0:0`)
+          .text('🧾 SQL runner', `proj:sql_menu:${project.id}`)
+          .row();
+      }
       if (index < cards.length - 1) {
         lines.push('');
       }
