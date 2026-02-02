@@ -32,6 +32,7 @@ const https = require('https');
 const fs = require('fs/promises');
 const path = require('path');
 const os = require('os');
+const crypto = require('crypto');
 const { execFile } = require('child_process');
 const { promisify } = require('util');
 
@@ -139,6 +140,10 @@ const DB_INSIGHTS_SAMPLE_SIZE = 3;
 const DB_INSIGHTS_QUERY_TIMEOUT_MS = 4000;
 const SUPABASE_TABLE_ACCESS_TTL_MS = 60_000;
 const MINI_SITE_TOKEN = process.env.DB_MINI_SITE_TOKEN || process.env.MINI_SITE_TOKEN;
+const MINI_SITE_SESSION_TTL_MS = 10 * 60 * 1000;
+const MINI_SITE_SESSION_COOKIE = 'pm_db_session';
+const MINI_SITE_EDIT_SESSION_COOKIE = 'pm_db_edit_session';
+const MINI_SITE_SETTINGS_KEY = 'dbMiniSite';
 const MINI_SITE_PAGE_SIZE = 25;
 const MINI_SITE_EDIT_TOKEN_TTL_SEC = 300;
 const LOG_API_TOKEN = process.env.PATH_APPLIER_TOKEN;
@@ -168,6 +173,7 @@ const supabasePools = new Map();
 const envVaultPools = new Map();
 const miniSitePools = new Map();
 const supabaseTableAccess = new Map();
+const miniSiteSessions = new Map();
 let botStarted = false;
 let botRetryTimeout = null;
 const userState = new Map();
@@ -1710,6 +1716,18 @@ async function handleProjectCallback(ctx, data) {
     case 'db_mini':
       resetUserState(ctx);
       await renderProjectDbMiniSite(ctx, projectId);
+      break;
+    case 'db_mini_open':
+      resetUserState(ctx);
+      await openProjectDbMiniSite(ctx, projectId);
+      break;
+    case 'db_mini_enable':
+      resetUserState(ctx);
+      await enableProjectDbMiniSite(ctx, projectId);
+      break;
+    case 'db_mini_rotate':
+      resetUserState(ctx);
+      await rotateProjectDbMiniSiteToken(ctx, projectId);
       break;
     case 'db_config':
       resetUserState(ctx);
@@ -10120,8 +10138,15 @@ async function renderProjectDbMiniSite(ctx, projectId) {
   const envSetId = await ensureProjectEnvSet(projectId);
   const envStatus = await buildEnvVaultDbStatus(project, envSetId);
   const supabaseStatus = await buildSupabaseBindingStatus(project);
-  const baseUrl = getPublicBaseUrl().replace(/\/$/, '');
-  const miniSiteUrl = `${baseUrl}/db-mini/${encodeURIComponent(projectId)}`;
+  const { settings: miniSiteSettings } = await getMiniSiteSettingsState();
+  const miniSiteDb = await resolveMiniSiteDbConnection(project);
+  const miniSiteDbReady = Boolean(miniSiteDb.dsn);
+  const miniSiteTokenConfigured = isMiniSiteTokenConfigured(miniSiteSettings);
+  const miniSiteTokenMask = getMiniSiteAdminTokenMask(miniSiteSettings);
+  const miniSiteTokenSource = isMiniSiteTokenFromEnv(miniSiteSettings) ? ' (env)' : '';
+  const miniSiteTokenLabel = miniSiteTokenConfigured
+    ? `${miniSiteTokenMask || 'configured'}${miniSiteTokenSource}`
+    : 'not configured';
 
   const lines = [
     `🌐 DB mini-site — ${project.name || project.id}`,
@@ -10129,15 +10154,103 @@ async function renderProjectDbMiniSite(ctx, projectId) {
     `Env Vault DB: ${envStatus.summary}`,
     `Supabase binding: ${supabaseStatus.summary}`,
     '',
-    'Open the mini-site (HTTP):',
+    `Mini-site DB: ${miniSiteDbReady ? '✅ ready' : '⚠️ missing'}`,
+    `Mini-site token: ${miniSiteTokenLabel}`,
   ];
 
-  const inline = new InlineKeyboard()
-    .url('🌐 Open mini-site', miniSiteUrl)
-    .row()
-    .text('⬅️ Back', `proj:open:${projectId}`);
+  const inline = new InlineKeyboard();
+  if (miniSiteDbReady) {
+    if (!miniSiteTokenConfigured) {
+      inline.text('✅ Enable mini-site', `proj:db_mini_enable:${projectId}`).row();
+    } else {
+      inline
+        .text('🌐 Open mini-site', `proj:db_mini_open:${projectId}`)
+        .text('🔄 Rotate mini-site token', `proj:db_mini_rotate:${projectId}`)
+        .row();
+    }
+  }
+  inline.text('⬅️ Back', `proj:open:${projectId}`);
 
   await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
+}
+
+async function ensureMiniSiteDbAvailable(ctx, projectId) {
+  const project = await getProjectById(projectId, ctx);
+  if (!project) return { ok: false, project: null };
+  const connection = await resolveMiniSiteDbConnection(project);
+  if (!connection.dsn) {
+    await renderOrEdit(ctx, 'Database connection missing. Configure a DB URL to use the mini-site.', {
+      reply_markup: buildBackKeyboard(`proj:db_config:${projectId}`),
+    });
+    return { ok: false, project };
+  }
+  return { ok: true, project };
+}
+
+async function sendMiniSiteAdminTokenOnce(ctx, token, settings, reason) {
+  const lines = [
+    '🔐 DB mini-site admin token',
+    reason ? `Reason: ${reason}` : null,
+    '',
+    token,
+    '',
+    'Store this token securely. It will only be shown once.',
+  ].filter(Boolean);
+  await ctx.reply(lines.join('\n'));
+  await markMiniSiteTokenShown(settings);
+}
+
+async function enableProjectDbMiniSite(ctx, projectId) {
+  const ready = await ensureMiniSiteDbAvailable(ctx, projectId);
+  if (!ready.ok) return;
+  const result = await ensureMiniSiteAdminToken({ rotate: false });
+  if (result.created && result.token) {
+    await sendMiniSiteAdminTokenOnce(ctx, result.token, result.settings, 'Enabled');
+  }
+  await renderDatabaseBindingMenu(ctx, projectId, result.created ? '✅ Mini-site token enabled.' : 'Mini-site token already configured.');
+}
+
+async function rotateProjectDbMiniSiteToken(ctx, projectId) {
+  const ready = await ensureMiniSiteDbAvailable(ctx, projectId);
+  if (!ready.ok) return;
+  const result = await ensureMiniSiteAdminToken({ rotate: true });
+  miniSiteSessions.clear();
+  if (result.token) {
+    await sendMiniSiteAdminTokenOnce(ctx, result.token, result.settings, 'Rotated');
+  }
+  await renderDatabaseBindingMenu(ctx, projectId, '🔄 Mini-site token rotated.');
+}
+
+async function openProjectDbMiniSite(ctx, projectId) {
+  const ready = await ensureMiniSiteDbAvailable(ctx, projectId);
+  if (!ready.ok) return;
+  const result = await ensureMiniSiteAdminToken({ rotate: false });
+  if (result.created && result.token) {
+    await sendMiniSiteAdminTokenOnce(ctx, result.token, result.settings, 'Auto-generated');
+  }
+  const sessionToken = createMiniSiteSession({
+    scope: 'link',
+    ttlMs: MINI_SITE_SESSION_TTL_MS,
+    singleUse: true,
+  });
+  const baseUrl = getPublicBaseUrl().replace(/\/$/, '');
+  const miniSiteUrl = `${baseUrl}/db-mini/${encodeURIComponent(projectId)}?session=${encodeURIComponent(
+    sessionToken,
+  )}`;
+  const inline = new InlineKeyboard()
+    .url('🌐 Open mini-site (10 min)', miniSiteUrl)
+    .row()
+    .text('⬅️ Back', `proj:db_config:${projectId}`);
+  const lines = [
+    `🌐 DB mini-site — ${ready.project.name || ready.project.id}`,
+    '',
+    'Session link (valid for 10 minutes):',
+    miniSiteUrl,
+  ];
+  await renderOrEdit(ctx, lines.join('\n'), {
+    reply_markup: inline,
+    disable_web_page_preview: true,
+  });
 }
 
 async function resolveDbInsightsSource(project) {
@@ -10473,16 +10586,155 @@ function decodeMiniSiteRowKey(encoded) {
   }
 }
 
-function isMiniSiteAuthed(req) {
-  if (!MINI_SITE_TOKEN) return false;
-  const cookies = parseCookies(req);
-  return cookies.pm_db_token === MINI_SITE_TOKEN;
+function hashMiniSiteToken(token) {
+  return crypto.createHash('sha256').update(String(token)).digest('hex');
 }
 
-function isMiniSiteEditAuthed(req) {
-  if (!MINI_SITE_TOKEN) return false;
+function compareHashedTokens(left, right) {
+  if (!left || !right) return false;
+  const leftBuffer = Buffer.from(left, 'hex');
+  const rightBuffer = Buffer.from(right, 'hex');
+  if (leftBuffer.length !== rightBuffer.length) return false;
+  return crypto.timingSafeEqual(leftBuffer, rightBuffer);
+}
+
+function maskMiniSiteToken(token) {
+  if (!token) return '••••';
+  const suffix = token.slice(-4);
+  return `••••${suffix}`;
+}
+
+function getMiniSiteAdminTokenHash(settings) {
+  if (settings?.[MINI_SITE_SETTINGS_KEY]?.adminTokenHash) {
+    return settings[MINI_SITE_SETTINGS_KEY].adminTokenHash;
+  }
+  if (MINI_SITE_TOKEN) {
+    return hashMiniSiteToken(MINI_SITE_TOKEN);
+  }
+  return null;
+}
+
+function getMiniSiteAdminTokenMask(settings) {
+  if (settings?.[MINI_SITE_SETTINGS_KEY]?.adminTokenMask) {
+    return settings[MINI_SITE_SETTINGS_KEY].adminTokenMask;
+  }
+  if (MINI_SITE_TOKEN) {
+    return maskMiniSiteToken(MINI_SITE_TOKEN);
+  }
+  return null;
+}
+
+function isMiniSiteTokenFromEnv(settings) {
+  return !settings?.[MINI_SITE_SETTINGS_KEY]?.adminTokenHash && Boolean(MINI_SITE_TOKEN);
+}
+
+function isMiniSiteTokenConfigured(settings) {
+  return Boolean(getMiniSiteAdminTokenHash(settings));
+}
+
+async function getMiniSiteSettingsState() {
+  const settings = (await loadGlobalSettings()) || {};
+  const miniSite = settings[MINI_SITE_SETTINGS_KEY] || {};
+  return { settings, miniSite };
+}
+
+async function saveMiniSiteSettingsState(settings, miniSite) {
+  const payload = { ...(settings || {}) };
+  payload[MINI_SITE_SETTINGS_KEY] = miniSite;
+  await saveGlobalSettings(payload);
+  return payload;
+}
+
+async function ensureMiniSiteAdminToken({ rotate = false } = {}) {
+  const { settings, miniSite } = await getMiniSiteSettingsState();
+  if (!rotate && miniSite.adminTokenHash) {
+    return { settings, miniSite, token: null, created: false };
+  }
+  const token = crypto.randomBytes(32).toString('base64url');
+  const nextMiniSite = {
+    ...miniSite,
+    adminTokenHash: hashMiniSiteToken(token),
+    adminTokenMask: maskMiniSiteToken(token),
+    adminTokenCreatedAt: new Date().toISOString(),
+    adminTokenShownAt: null,
+    adminTokenVersion: (miniSite.adminTokenVersion || 0) + 1,
+  };
+  const nextSettings = await saveMiniSiteSettingsState(settings, nextMiniSite);
+  return { settings: nextSettings, miniSite: nextMiniSite, token, created: true };
+}
+
+async function markMiniSiteTokenShown(settings) {
+  const miniSite = settings?.[MINI_SITE_SETTINGS_KEY] || {};
+  const updated = {
+    ...miniSite,
+    adminTokenShownAt: new Date().toISOString(),
+  };
+  return saveMiniSiteSettingsState(settings, updated);
+}
+
+function pruneMiniSiteSessions(now = Date.now()) {
+  for (const [tokenHash, session] of miniSiteSessions.entries()) {
+    if (!session || session.expiresAt <= now) {
+      miniSiteSessions.delete(tokenHash);
+    }
+  }
+}
+
+function createMiniSiteSession({ scope, ttlMs, singleUse }) {
+  const token = crypto.randomBytes(32).toString('base64url');
+  const tokenHash = hashMiniSiteToken(token);
+  const expiresAt = Date.now() + ttlMs;
+  miniSiteSessions.set(tokenHash, { scope, expiresAt, singleUse: Boolean(singleUse) });
+  return token;
+}
+
+function validateMiniSiteSession(token, scope, { consume = false } = {}) {
+  if (!token) return { ok: false, reason: 'missing' };
+  pruneMiniSiteSessions();
+  const tokenHash = hashMiniSiteToken(token);
+  const session = miniSiteSessions.get(tokenHash);
+  if (!session) return { ok: false, reason: 'missing' };
+  if (session.scope !== scope) return { ok: false, reason: 'scope' };
+  if (session.expiresAt <= Date.now()) {
+    miniSiteSessions.delete(tokenHash);
+    return { ok: false, reason: 'expired' };
+  }
+  if (session.singleUse && consume) {
+    miniSiteSessions.delete(tokenHash);
+  }
+  return { ok: true };
+}
+
+function buildMiniSiteCookie(name, token, ttlSeconds) {
+  return `${name}=${encodeURIComponent(token)}; HttpOnly; Path=/; Max-Age=${ttlSeconds}; SameSite=Strict`;
+}
+
+function getBearerToken(req) {
+  const header = req.headers?.authorization || req.headers?.Authorization;
+  if (!header) return null;
+  const [type, token] = header.split(' ');
+  if (type !== 'Bearer' || !token) return null;
+  return token.trim();
+}
+
+function isMiniSiteAdminTokenValid(token, adminTokenHash) {
+  if (!token || !adminTokenHash) return false;
+  const candidateHash = hashMiniSiteToken(token);
+  return compareHashedTokens(candidateHash, adminTokenHash);
+}
+
+function isMiniSiteAuthed(req, adminTokenHash) {
+  const bearerToken = getBearerToken(req);
+  if (isMiniSiteAdminTokenValid(bearerToken, adminTokenHash)) return true;
   const cookies = parseCookies(req);
-  return cookies.pm_db_edit_token === MINI_SITE_TOKEN;
+  return validateMiniSiteSession(cookies[MINI_SITE_SESSION_COOKIE], 'browse').ok;
+}
+
+function isMiniSiteEditAuthed(req, adminTokenHash) {
+  const bearerToken = getBearerToken(req);
+  if (isMiniSiteAdminTokenValid(bearerToken, adminTokenHash)) return true;
+  const cookies = parseCookies(req);
+  return validateMiniSiteSession(cookies[MINI_SITE_EDIT_SESSION_COOKIE], 'edit').ok;
 }
 
 function renderMiniSiteLogin(message) {
@@ -11064,7 +11316,7 @@ async function buildDataCenterView(ctx) {
       inline
         .text(`📦 ${name} (🆔 ${project.id})`, ensureCallbackData(`Project ${project.id}`, `proj:open:${project.id}`))
         .row()
-        .text('🌐 Open mini-site', ensureCallbackData('🌐 Open mini-site', `proj:db_mini:${project.id}`))
+        .text('🌐 Open mini-site', ensureCallbackData('🌐 Open mini-site', `proj:db_mini_open:${project.id}`))
         .text('🛠️ Edit DB config', ensureCallbackData('🛠️ Edit DB config', `proj:db_config:${project.id}`))
         .row()
         .text('📊 Run DB overview', ensureCallbackData('📊 Run DB overview', `proj:db_insights:${project.id}:0:0`))
@@ -11202,12 +11454,24 @@ async function renderDatabaseBindingMenu(ctx, projectId, notice) {
   const envSetId = await ensureProjectEnvSet(projectId);
   const envStatus = await buildEnvVaultDbStatus(project, envSetId);
   const supabaseStatus = await buildSupabaseBindingStatus(project);
+  const { settings: miniSiteSettings } = await getMiniSiteSettingsState();
+  const miniSiteDb = await resolveMiniSiteDbConnection(project);
+  const miniSiteDbReady = Boolean(miniSiteDb.dsn);
+  const miniSiteTokenConfigured = isMiniSiteTokenConfigured(miniSiteSettings);
+  const miniSiteTokenMask = getMiniSiteAdminTokenMask(miniSiteSettings);
+  const miniSiteTokenSource = isMiniSiteTokenFromEnv(miniSiteSettings) ? ' (env)' : '';
+  const miniSiteTokenLabel = miniSiteTokenConfigured
+    ? `${miniSiteTokenMask || 'configured'}${miniSiteTokenSource}`
+    : 'not configured';
   const lines = [
     `🗄️ Database binding — ${project.name || project.id}`,
     notice || null,
     '',
     `Env Vault DB: ${envStatus.summary}`,
     `Supabase binding: ${supabaseStatus.summary}`,
+    '',
+    `Mini-site DB: ${miniSiteDbReady ? '✅ ready' : '⚠️ missing'}`,
+    `Mini-site token: ${miniSiteTokenLabel}`,
     '',
     'DB URLs are stored in Env Vault (DATABASE_URL by default) — no external env vars required.',
     'Use Env Vault to map a custom key if needed.',
@@ -11220,6 +11484,17 @@ async function renderDatabaseBindingMenu(ctx, projectId, notice) {
 
   if (project.supabaseConnectionId) {
     inline.text('🧹 Clear Supabase binding', `proj:supabase_clear:${project.id}`);
+  }
+
+  if (miniSiteDbReady) {
+    if (!miniSiteTokenConfigured) {
+      inline.row().text('✅ Enable mini-site', `proj:db_mini_enable:${project.id}`);
+    } else {
+      inline
+        .row()
+        .text('🌐 Open mini-site', `proj:db_mini_open:${project.id}`)
+        .text('🔄 Rotate mini-site token', `proj:db_mini_rotate:${project.id}`);
+    }
   }
 
   inline
@@ -12378,23 +12653,64 @@ async function handleMiniSiteRequest(req, res, url) {
   if (!url.pathname.startsWith('/db-mini')) {
     return false;
   }
-  if (!MINI_SITE_TOKEN) {
-    res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' });
-    res.end('DB mini-site token is not configured.');
+  const { settings: miniSiteSettings } = await getMiniSiteSettingsState();
+  const adminTokenHash = getMiniSiteAdminTokenHash(miniSiteSettings);
+  if (!adminTokenHash) {
+    console.warn('[mini-site] token missing', { path: url.pathname });
+    res.writeHead(401, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end('DB mini-site token is not configured. Use the bot to enable the mini-site.');
+    return true;
+  }
+
+  if (req.method === 'GET' && url.searchParams.has('session')) {
+    const sessionToken = url.searchParams.get('session');
+    const sessionCheck = validateMiniSiteSession(sessionToken, 'link', { consume: true });
+    if (!sessionCheck.ok) {
+      console.warn('[mini-site] invalid session token', { path: url.pathname, reason: sessionCheck.reason });
+      res.writeHead(401, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end('Session token is invalid or expired.');
+      return true;
+    }
+    const browseToken = createMiniSiteSession({
+      scope: 'browse',
+      ttlMs: MINI_SITE_SESSION_TTL_MS,
+      singleUse: false,
+    });
+    const redirectUrl = new URL(url.toString());
+    redirectUrl.searchParams.delete('session');
+    const location = `${redirectUrl.pathname}${redirectUrl.search}` || '/db-mini';
+    res.writeHead(302, {
+      Location: location,
+      'Set-Cookie': buildMiniSiteCookie(
+        MINI_SITE_SESSION_COOKIE,
+        browseToken,
+        Math.floor(MINI_SITE_SESSION_TTL_MS / 1000),
+      ),
+    });
+    res.end();
     return true;
   }
 
   if (req.method === 'POST' && url.pathname === '/db-mini/login') {
     const body = await readRequestBody(req);
     const form = parseFormBody(body);
-    if (form.token !== MINI_SITE_TOKEN) {
+    if (!isMiniSiteAdminTokenValid(form.token, adminTokenHash)) {
       res.writeHead(403, { 'Content-Type': 'text/html; charset=utf-8' });
       res.end(renderMiniSiteLogin('Invalid token. Try again.'));
       return true;
     }
+    const browseToken = createMiniSiteSession({
+      scope: 'browse',
+      ttlMs: MINI_SITE_SESSION_TTL_MS,
+      singleUse: false,
+    });
     res.writeHead(302, {
       Location: '/db-mini',
-      'Set-Cookie': `pm_db_token=${encodeURIComponent(MINI_SITE_TOKEN)}; HttpOnly; Path=/; SameSite=Strict`,
+      'Set-Cookie': buildMiniSiteCookie(
+        MINI_SITE_SESSION_COOKIE,
+        browseToken,
+        Math.floor(MINI_SITE_SESSION_TTL_MS / 1000),
+      ),
     });
     res.end();
     return true;
@@ -12403,20 +12719,25 @@ async function handleMiniSiteRequest(req, res, url) {
   if (req.method === 'POST' && url.pathname === '/db-mini/edit-login') {
     const body = await readRequestBody(req);
     const form = parseFormBody(body);
-    if (form.token !== MINI_SITE_TOKEN) {
+    if (!isMiniSiteAdminTokenValid(form.token, adminTokenHash)) {
       res.writeHead(403, { 'Content-Type': 'text/html; charset=utf-8' });
       res.end(renderMiniSiteEditLogin(form.redirect || '/db-mini'));
       return true;
     }
+    const editToken = createMiniSiteSession({
+      scope: 'edit',
+      ttlMs: MINI_SITE_EDIT_TOKEN_TTL_SEC * 1000,
+      singleUse: false,
+    });
     res.writeHead(302, {
       Location: form.redirect || '/db-mini',
-      'Set-Cookie': `pm_db_edit_token=${encodeURIComponent(MINI_SITE_TOKEN)}; HttpOnly; Path=/; Max-Age=${MINI_SITE_EDIT_TOKEN_TTL_SEC}; SameSite=Strict`,
+      'Set-Cookie': buildMiniSiteCookie(MINI_SITE_EDIT_SESSION_COOKIE, editToken, MINI_SITE_EDIT_TOKEN_TTL_SEC),
     });
     res.end();
     return true;
   }
 
-  if (!isMiniSiteAuthed(req)) {
+  if (!isMiniSiteAuthed(req, adminTokenHash)) {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     res.end(renderMiniSiteLogin());
     return true;
@@ -12610,7 +12931,7 @@ async function handleMiniSiteRequest(req, res, url) {
     }
 
     const editMode = url.searchParams.get('edit') === '1';
-    if (editMode && !isMiniSiteEditAuthed(req)) {
+    if (editMode && !isMiniSiteEditAuthed(req, adminTokenHash)) {
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
       res.end(renderMiniSiteEditLogin(url.pathname + url.search));
       return true;
@@ -12669,7 +12990,7 @@ async function handleMiniSiteRequest(req, res, url) {
   }
 
   if (req.method === 'POST' && pathParts.length === 8 && pathParts[2] === 'table' && pathParts[5] === 'row' && pathParts[7] === 'edit') {
-    if (!isMiniSiteEditAuthed(req)) {
+    if (!isMiniSiteEditAuthed(req, adminTokenHash)) {
       res.writeHead(403, { 'Content-Type': 'text/html; charset=utf-8' });
       res.end(renderMiniSiteEditLogin(url.pathname.replace(/\/edit$/, '')));
       return true;
