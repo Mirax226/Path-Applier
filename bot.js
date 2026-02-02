@@ -49,6 +49,7 @@ const {
   getEnvVarValue,
   upsertEnvVar,
   deleteEnvVar,
+  renameEnvVaultProjectId,
 } = require('./envVaultStore');
 const {
   getProjectTelegramBot,
@@ -57,6 +58,7 @@ const {
   clearTelegramBotToken,
   updateTelegramWebhook,
   updateTelegramTestStatus,
+  renameTelegramBotProjectId,
 } = require('./telegramBotStore');
 const { getMasterKeyStatus, MASTER_KEY_ERROR_MESSAGE } = require('./envVaultCrypto');
 const {
@@ -65,7 +67,12 @@ const {
   sendMessage,
   sendSafeMessage,
 } = require('./telegramApi');
-const { listCronJobLinks, getCronJobLink, upsertCronJobLink } = require('./cronJobLinksStore');
+const {
+  listCronJobLinks,
+  getCronJobLink,
+  upsertCronJobLink,
+  renameCronJobLinkProjectId,
+} = require('./cronJobLinksStore');
 const { QUICK_KEYS, getProjectTypeTemplate, getProjectTypeOptions } = require('./envVaultTemplates');
 const {
   prepareRepository,
@@ -103,6 +110,7 @@ const {
   addRecentLog,
   listRecentLogs,
   getRecentLogById,
+  renameLogIngestProjectId,
 } = require('./logIngestStore');
 const { createLogIngestService, formatContext } = require('./logIngestService');
 const { createLogsRouter, parseAllowedProjects } = require('./src/routes/logs.ts');
@@ -130,6 +138,9 @@ const DB_INSIGHTS_TABLE_PAGE_SIZE = 6;
 const DB_INSIGHTS_SAMPLE_SIZE = 3;
 const DB_INSIGHTS_QUERY_TIMEOUT_MS = 4000;
 const SUPABASE_TABLE_ACCESS_TTL_MS = 60_000;
+const MINI_SITE_TOKEN = process.env.DB_MINI_SITE_TOKEN || process.env.MINI_SITE_TOKEN;
+const MINI_SITE_PAGE_SIZE = 25;
+const MINI_SITE_EDIT_TOKEN_TTL_SEC = 300;
 const LOG_API_TOKEN = process.env.PATH_APPLIER_TOKEN;
 const LOG_API_ADMIN_CHAT_ID =
   process.env.TELEGRAM_ADMIN_CHAT_ID ||
@@ -155,6 +166,7 @@ if (!ADMIN_TELEGRAM_ID) {
 const bot = new Bot(BOT_TOKEN);
 const supabasePools = new Map();
 const envVaultPools = new Map();
+const miniSitePools = new Map();
 const supabaseTableAccess = new Map();
 let botStarted = false;
 let botRetryTimeout = null;
@@ -164,6 +176,8 @@ const patchSessions = new Map();
 const changePreviewSessions = new Map();
 const structuredPatchSessions = new Map();
 const envScanCache = new Map();
+const cronCreateRetryCache = new Map();
+const cronErrorDetailsCache = new Map();
 let httpServerPromise = null;
 
 configureSelfLogger({
@@ -465,6 +479,22 @@ function formatCronApiErrorNotice(prefix, error, correlationId) {
   return `${prefix}${statusSuffix}: ${detail}\nRef: ${correlationId}`;
 }
 
+function formatCronCreateErrorPanel({ error, correlationId }) {
+  const endpoint = error?.path || '/jobs';
+  const lines = [
+    '❌ Failed to create cron job',
+    `Status code: ${error?.status || 'unknown'}`,
+    `Ref id: ${correlationId}`,
+    `Endpoint: ${endpoint}`,
+    '',
+    'Suggested next actions:',
+    '• 🔁 Retry',
+    '• 🧪 Run Cron API ping test',
+    '• 📋 Copy debug details',
+  ];
+  return lines.join('\n');
+}
+
 function isCronUrlValidationError(error) {
   if (!error) return false;
   if (error.status === 422) return true;
@@ -508,16 +538,15 @@ function validateCronExpression(raw) {
 }
 
 function maskSecretValue(value) {
-  if (!value) return '********';
-  return '********';
+  if (!value) return '***';
+  return '***';
 }
 
 function maskEnvValue(value) {
-  if (value == null) return '****';
+  if (value == null) return '***';
   const raw = String(value);
-  if (raw.length <= 4) return '****';
-  const maskedLength = Math.max(0, raw.length - 4);
-  return `${raw.slice(0, 2)}${'*'.repeat(maskedLength)}${raw.slice(-2)}`;
+  if (raw.length <= 4) return '***';
+  return `${raw.slice(0, 2)}***${raw.slice(-2)}`;
 }
 
 function evaluateEnvValueStatus(value) {
@@ -536,6 +565,19 @@ function evaluateEnvValueStatus(value) {
 
 function normalizeEnvKeyInput(value) {
   return String(value || '').trim().toUpperCase().replace(/\s+/g, '_');
+}
+
+function validateProjectIdInput(rawValue) {
+  const value = String(rawValue || '').trim();
+  if (!value) {
+    return { valid: false, message: 'Project ID is required.' };
+  }
+  const normalized = value.toLowerCase();
+  const pattern = /^[a-z0-9][a-z0-9_-]{1,39}$/;
+  if (!pattern.test(normalized)) {
+    return { valid: false, message: 'Project ID must be a slug (lowercase letters, numbers, "-" or "_").' };
+  }
+  return { valid: true, value: normalized };
 }
 
 function detectProjectType(project) {
@@ -834,6 +876,34 @@ function getMessageTargetFromCtx(ctx) {
   return { chatId: message.chat.id, messageId: message.message_id };
 }
 
+async function startProgressMessage(ctx, text, extra = {}) {
+  const message = ctx.callbackQuery?.message;
+  if (message) {
+    try {
+      await ctx.editMessageText(text, normalizeTelegramExtra(extra));
+      return { chatId: message.chat.id, messageId: message.message_id };
+    } catch (error) {
+      console.warn('[progress] Failed to edit message, falling back to new message.', error.message);
+    }
+  }
+  const sent = await ctx.reply(text, normalizeTelegramExtra(extra));
+  return { chatId: sent.chat.id, messageId: sent.message_id };
+}
+
+async function updateProgressMessage(messageContext, text, extra = {}) {
+  if (!messageContext) return;
+  try {
+    await bot.api.editMessageText(
+      messageContext.chatId,
+      messageContext.messageId,
+      text,
+      normalizeTelegramExtra(extra),
+    );
+  } catch (error) {
+    console.warn('[progress] Failed to update progress message', error.message);
+  }
+}
+
 function wrapCallbackHandler(handler, label) {
   return async (ctx) => {
     try {
@@ -925,13 +995,12 @@ async function testConfigDbConnection() {
 }
 
 const mainKeyboard = new Keyboard()
-  .text('🧭 Main menu')
-  .text('⚙️ Settings')
-  .row()
   .text('📦 Projects')
   .text('🗄️ Database')
   .row()
   .text('⏱️ Cronjobs')
+  .text('⚙️ Settings')
+  .row()
   .text('📣 Logs')
   .resized();
 
@@ -1071,11 +1140,6 @@ bot.on('message', async (ctx, next) => {
 bot.command('start', async (ctx) => {
   resetUserState(ctx);
   clearPatchSession(ctx.from.id);
-  await renderMainMenu(ctx);
-});
-
-bot.hears('🧭 Main menu', async (ctx) => {
-  resetUserState(ctx);
   await renderMainMenu(ctx);
 });
 
@@ -1314,6 +1378,9 @@ async function handleStatefulMessage(ctx, state) {
     case 'rename_project':
       await handleRenameProjectStep(ctx, state);
       break;
+    case 'edit_project_id':
+      await handleEditProjectIdInput(ctx, state);
+      break;
     case 'change_base_branch':
       await handleChangeBaseBranchStep(ctx, state);
       break;
@@ -1379,6 +1446,9 @@ async function handleStatefulMessage(ctx, state) {
       break;
     case 'env_vault_import':
       await handleEnvVaultImportInput(ctx, state);
+      break;
+    case 'env_vault_search':
+      await handleEnvVaultSearchInput(ctx, state);
       break;
     case 'cron_link_label':
       await handleCronLinkLabelInput(ctx, state);
@@ -1515,6 +1585,17 @@ async function handleProjectCallback(ctx, data) {
         reply_markup: buildCancelKeyboard(),
       });
       break;
+    case 'edit_id':
+      setUserState(ctx.from.id, {
+        type: 'edit_project_id',
+        step: 'input',
+        projectId,
+        messageContext: getMessageTargetFromCtx(ctx),
+      });
+      await renderOrEdit(ctx, 'Send the new project ID (slug only, unique).\n(Or press Cancel)', {
+        reply_markup: buildCancelKeyboard(),
+      });
+      break;
     case 'edit_repo':
       setUserState(ctx.from.id, {
         type: 'edit_repo',
@@ -1545,6 +1626,12 @@ async function handleProjectCallback(ctx, data) {
         'Send new working directory (repo-relative preferred, e.g. "." or "apps/api"). Absolute paths are allowed but discouraged. Or send "-" to reset to repo root.\n(Or press Cancel)',
         { reply_markup: buildCancelKeyboard() },
       );
+      break;
+    case 'workdir_menu':
+      await renderWorkingDirectionMenu(ctx, projectId);
+      break;
+    case 'workdir_reset':
+      await resetWorkingDir(ctx, projectId);
       break;
     case 'workdir_revalidate':
       await revalidateWorkingDir(ctx, projectId);
@@ -2758,6 +2845,7 @@ async function handleProjectCronCallback(ctx, data) {
   const action = parts[1];
   const projectId = parts[2];
   const extra = parts[3];
+  const extra2 = parts[4];
 
   console.info('[projcron] callback received', {
     action,
@@ -2791,6 +2879,27 @@ async function handleProjectCronCallback(ctx, data) {
     case 'keepalive_recreate':
       await promptProjectCronSchedule(ctx, projectId, 'keepalive', true);
       break;
+    case 'keepalive_preset': {
+      const scheduleKey = extra;
+      const recreate = extra2 === '1';
+      const scheduleInput = scheduleKey ? `every ${scheduleKey}` : '';
+      await createProjectCronJobWithSchedule(ctx, projectId, 'keepalive', scheduleInput, recreate);
+      break;
+    }
+    case 'keepalive_custom': {
+      const recreate = extra === '1';
+      setUserState(ctx.from.id, {
+        type: recreate ? 'projcron_keepalive_recreate' : 'projcron_keepalive_schedule',
+        projectId,
+        backCallback: `projcron:menu:${projectId}`,
+      });
+      await renderOrEdit(
+        ctx,
+        'Send schedule (cron string or "every 10m", "every 1h"). Or press Cancel.',
+        { reply_markup: buildCancelKeyboard() },
+      );
+      break;
+    }
     case 'deploy_recreate':
       await promptProjectCronSchedule(ctx, projectId, 'deploy', true);
       break;
@@ -2812,6 +2921,47 @@ async function handleProjectCronCallback(ctx, data) {
     case 'alerts_level':
       await toggleProjectCronAlertLevel(ctx, projectId, extra);
       break;
+    case 'retry_create': {
+      const payload = cronCreateRetryCache.get(projectId);
+      if (!payload) {
+        await ctx.answerCallbackQuery({
+          text: 'Retry details expired. Please start again.',
+          show_alert: true,
+        });
+        return;
+      }
+      cronCreateRetryCache.delete(projectId);
+      await createProjectCronJobWithSchedule(
+        ctx,
+        payload.projectId,
+        payload.type,
+        payload.scheduleInput,
+        payload.recreate,
+      );
+      break;
+    }
+    case 'copy_debug': {
+      const details = cronErrorDetailsCache.get(projectId);
+      if (!details) {
+        await ctx.answerCallbackQuery({
+          text: 'Debug details expired. Please retry.',
+          show_alert: true,
+        });
+        return;
+      }
+      const lines = [
+        'Cron debug details:',
+        `Project: ${details.projectId}`,
+        `Type: ${details.type}`,
+        `Schedule: ${details.schedule || '-'}`,
+        `Target: ${details.targetUrl || '-'}`,
+        `Status: ${details.status || '-'}`,
+        `Endpoint: ${details.path || '-'}`,
+        `Reason: ${details.reason || '-'}`,
+      ];
+      await ctx.reply(lines.join('\n'));
+      break;
+    }
     default:
       console.warn('[projcron] Unknown action', { action, projectId, extra, data });
       await ctx.answerCallbackQuery({
@@ -2856,6 +3006,29 @@ async function handleEnvVaultCallback(ctx, data) {
       break;
     case 'add':
       await renderEnvVaultQuickKeyMenu(ctx, projectId);
+      break;
+    case 'search':
+      setUserState(ctx.from.id, {
+        type: 'env_vault_search',
+        projectId,
+        backCallback: `envvault:menu:${projectId}`,
+        messageContext: getMessageTargetFromCtx(ctx),
+      });
+      await renderOrEdit(ctx, 'Search Env Vault keys (substring match, case-insensitive).\nSend a query or Cancel.', {
+        reply_markup: buildCancelKeyboard(),
+      });
+      break;
+    case 'search_edit':
+      await promptEnvVaultValue(ctx, projectId, key, { messageContext: getMessageTargetFromCtx(ctx) });
+      break;
+    case 'search_delete':
+      await handleEnvVaultDelete(ctx, projectId, key);
+      break;
+    case 'merge':
+      await startEnvVaultDuplicateMerge(ctx, projectId);
+      break;
+    case 'merge_pick':
+      await handleEnvVaultMergePick(ctx, projectId, key, extra);
       break;
     case 'set_key':
       await promptEnvVaultValue(ctx, projectId, key);
@@ -3053,7 +3226,11 @@ async function renderEnvVaultMenu(ctx, projectId) {
     .row()
     .text('🧾 List keys', `envvault:list:${projectId}`)
     .row()
+    .text('🔎 Search env', `envvault:search:${projectId}`)
+    .row()
     .text('🗑 Delete key', `envvault:delete_menu:${projectId}`)
+    .row()
+    .text('🧩 Duplicate env merge', `envvault:merge:${projectId}`)
     .row()
     .text('🧩 Recommended keys', `envvault:recommend:${projectId}`)
     .row()
@@ -3174,6 +3351,188 @@ async function renderEnvVaultExport(ctx, projectId) {
   await renderOrEdit(ctx, `Exported keys (no values):\n${output}`, {
     reply_markup: buildBackKeyboard(`envvault:menu:${projectId}`),
   });
+}
+
+async function handleEnvVaultSearchInput(ctx, state) {
+  const query = ctx.message.text?.trim();
+  if (!query) {
+    await ctx.reply('Please send a search query.');
+    return;
+  }
+  if (query.toLowerCase() === 'cancel') {
+    resetUserState(ctx);
+    await renderStateMessage(ctx, state, 'Operation cancelled.', {
+      reply_markup: buildBackKeyboard(state.backCallback || 'main:back'),
+    });
+    return;
+  }
+  const envSetId = await ensureProjectEnvSet(state.projectId);
+  const envVars = await listEnvVars(state.projectId, envSetId);
+  const matches = [];
+  const lowerQuery = query.toLowerCase();
+  for (const entry of envVars) {
+    if (entry.key.toLowerCase().includes(lowerQuery)) {
+      const value = await getEnvVarValue(state.projectId, entry.key, envSetId);
+      matches.push({ key: entry.key, value });
+    }
+  }
+
+  const lines = [
+    `🔎 Env Vault search — ${state.projectId}`,
+    `Query: ${query}`,
+    '',
+  ];
+  if (!matches.length) {
+    lines.push('No matching keys found.');
+    clearUserState(ctx.from.id);
+    await renderStateMessage(ctx, state, lines.join('\n'), {
+      reply_markup: buildBackKeyboard(`envvault:menu:${state.projectId}`),
+    });
+    return;
+  }
+
+  const inline = new InlineKeyboard();
+  matches.forEach((match) => {
+    const masked = maskEnvValue(match.value);
+    lines.push(`${match.key} = ${masked}`);
+    inline
+      .text('✏️ Edit', `envvault:search_edit:${state.projectId}:${match.key}`)
+      .text('🗑️ Delete', `envvault:search_delete:${state.projectId}:${match.key}`)
+      .row();
+  });
+  inline.text('⬅️ Back', `envvault:menu:${state.projectId}`);
+  clearUserState(ctx.from.id);
+  await renderStateMessage(ctx, state, lines.join('\n'), { reply_markup: inline });
+}
+
+function buildEnvDuplicateCandidates(project, envVars, envSetId) {
+  const candidates = new Map();
+  const addCandidate = (key, value, source, firstSeenIn) => {
+    if (!key || evaluateEnvValueStatus(value).status !== 'SET') return;
+    if (!candidates.has(key)) {
+      candidates.set(key, []);
+    }
+    candidates.get(key).push({ value, source, firstSeenIn });
+  };
+
+  envVars.forEach((entry) => {
+    addCandidate(entry.key, entry.value, 'project_env_vault', 'env_vault');
+  });
+
+  const trackedKeys = new Set(envVars.map((entry) => entry.key));
+  trackedKeys.add('DATABASE_URL');
+  trackedKeys.add('PROJECT_NAME');
+
+  trackedKeys.forEach((key) => {
+    if (process.env[key]) {
+      addCandidate(key, process.env[key], 'process_env', 'runtime');
+    }
+  });
+
+  if (project?.databaseUrl) {
+    addCandidate('DATABASE_URL', project.databaseUrl, 'project_db_config', 'project_config');
+  }
+  if (project?.name || project?.id) {
+    addCandidate('PROJECT_NAME', project.name || project.id, 'computed_default', 'project_meta');
+  }
+
+  return Array.from(candidates.entries())
+    .map(([key, values]) => {
+      const uniqueValues = new Map();
+      values.forEach((candidate) => {
+        const normalized = String(candidate.value);
+        if (!uniqueValues.has(normalized)) {
+          uniqueValues.set(normalized, candidate);
+        }
+      });
+      return { key, candidates: Array.from(uniqueValues.values()) };
+    })
+    .filter((entry) => entry.candidates.length > 1);
+}
+
+async function startEnvVaultDuplicateMerge(ctx, projectId) {
+  const project = await getProjectById(projectId, ctx);
+  if (!project) return;
+  const envSetId = await ensureProjectEnvSet(projectId);
+  const envVars = await listEnvVars(projectId, envSetId);
+  const hydrated = [];
+  for (const entry of envVars) {
+    const value = await getEnvVarValue(projectId, entry.key, envSetId);
+    hydrated.push({ key: entry.key, value });
+  }
+  const conflicts = buildEnvDuplicateCandidates(project, hydrated, envSetId);
+  if (!conflicts.length) {
+    await renderOrEdit(ctx, 'No duplicate env keys detected across sources.', {
+      reply_markup: buildBackKeyboard(`envvault:menu:${projectId}`),
+    });
+    return;
+  }
+  setUserState(ctx.from.id, {
+    type: 'env_vault_merge',
+    projectId,
+    envSetId,
+    conflicts,
+    index: 0,
+    resolved: [],
+    messageContext: getMessageTargetFromCtx(ctx),
+  });
+  await renderEnvVaultMergePrompt(ctx, getUserState(ctx.from.id));
+}
+
+async function renderEnvVaultMergePrompt(ctx, state) {
+  if (!state || state.type !== 'env_vault_merge') return;
+  const conflict = state.conflicts[state.index];
+  if (!conflict) {
+    clearUserState(ctx.from.id);
+    await renderOrEdit(ctx, 'Duplicate env merge complete.', {
+      reply_markup: buildBackKeyboard(`envvault:menu:${state.projectId}`),
+    });
+    return;
+  }
+
+  const lines = [
+    `🧩 Duplicate env merge — ${state.projectId}`,
+    `Key: ${conflict.key}`,
+    '',
+    'Pick the value to keep (others will be overridden by Env Vault):',
+  ];
+  const inline = new InlineKeyboard();
+  conflict.candidates.forEach((candidate, idx) => {
+    const masked = maskEnvValue(candidate.value);
+    lines.push(`• ${masked} (source: ${candidate.source}, firstSeenIn: ${candidate.firstSeenIn})`);
+    inline.text(`✅ Use ${candidate.source}`, `envvault:merge_pick:${state.projectId}:${conflict.key}:${idx}`).row();
+  });
+  inline.text('⬅️ Back', `envvault:menu:${state.projectId}`);
+  await renderStateMessage(ctx, state, lines.join('\n'), { reply_markup: inline });
+}
+
+async function handleEnvVaultMergePick(ctx, projectId, key, indexToken) {
+  const state = getUserState(ctx.from.id);
+  if (!state || state.type !== 'env_vault_merge') {
+    await renderOrEdit(ctx, 'Merge session expired.', {
+      reply_markup: buildBackKeyboard(`envvault:menu:${projectId}`),
+    });
+    return;
+  }
+  const conflict = state.conflicts[state.index];
+  if (!conflict || conflict.key !== key) {
+    await renderOrEdit(ctx, 'Merge session out of sync. Restart from Env Vault.', {
+      reply_markup: buildBackKeyboard(`envvault:menu:${projectId}`),
+    });
+    clearUserState(ctx.from.id);
+    return;
+  }
+  const idx = Number(indexToken);
+  const candidate = conflict.candidates[idx];
+  if (!candidate) {
+    await ctx.answerCallbackQuery({ text: 'Invalid selection.', show_alert: true });
+    return;
+  }
+  await upsertEnvVar(projectId, key, candidate.value, state.envSetId);
+  state.resolved.push({ key, source: candidate.source });
+  state.index += 1;
+  setUserState(ctx.from.id, state);
+  await renderEnvVaultMergePrompt(ctx, state);
 }
 
 async function renderEnvVaultQuickKeyMenu(ctx, projectId) {
@@ -3874,6 +4233,69 @@ function escapeHtml(value) {
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;');
+}
+
+function parseCookies(request) {
+  const header = request.headers?.cookie;
+  if (!header) return {};
+  return header.split(';').reduce((acc, pair) => {
+    const [rawKey, ...rest] = pair.split('=');
+    if (!rawKey) return acc;
+    acc[rawKey.trim()] = decodeURIComponent(rest.join('=').trim());
+    return acc;
+  }, {});
+}
+
+function parseFormBody(body) {
+  const params = new URLSearchParams(body);
+  const result = {};
+  params.forEach((value, key) => {
+    result[key] = value;
+  });
+  return result;
+}
+
+function renderMiniSiteLayout(title, body) {
+  return `
+    <!doctype html>
+    <html lang="en">
+      <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>${escapeHtml(title)}</title>
+        <style>
+          body { font-family: Inter, system-ui, sans-serif; background: #0b0f1a; color: #e6e8ef; margin: 0; }
+          header { padding: 24px; background: #111827; border-bottom: 1px solid #1f2937; }
+          main { padding: 24px; max-width: 960px; margin: 0 auto; }
+          .card { background: #0f172a; border: 1px solid #1e293b; border-radius: 12px; padding: 16px; margin-bottom: 16px; box-shadow: 0 10px 30px rgba(0,0,0,0.2); transition: transform .2s ease, box-shadow .2s ease; }
+          .card:hover { transform: translateY(-2px); box-shadow: 0 14px 40px rgba(0,0,0,0.25); }
+          a { color: #60a5fa; text-decoration: none; transition: color .2s ease; }
+          a:hover { color: #93c5fd; }
+          .button { display: inline-block; padding: 8px 14px; border-radius: 8px; background: #1d4ed8; color: #fff; transition: transform .2s ease, background .2s ease; }
+          .button:hover { background: #2563eb; transform: translateY(-1px); }
+          .muted { color: #9ca3af; }
+          table { width: 100%; border-collapse: collapse; }
+          th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #1f2937; }
+          th { color: #93c5fd; font-weight: 600; }
+          .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; background: #1e293b; color: #cbd5f5; font-size: 12px; }
+          .row-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+          .fade-in { animation: fadeIn .35s ease; }
+          @keyframes fadeIn { from { opacity: 0; transform: translateY(4px);} to { opacity: 1; transform: translateY(0);} }
+          input, select, textarea { width: 100%; padding: 8px 10px; border-radius: 8px; border: 1px solid #334155; background: #0b1220; color: #e6e8ef; }
+          .form-row { margin-bottom: 12px; }
+        </style>
+      </head>
+      <body>
+        <header>
+          <h2>Project Manager DB mini-site</h2>
+          <p class="muted">${escapeHtml(title)}</p>
+        </header>
+        <main class="fade-in">
+          ${body}
+        </main>
+      </body>
+    </html>
+  `;
 }
 
 function formatRowsAsCodeBlock(rows, columnNames, truncatedNote) {
@@ -5506,22 +5928,17 @@ async function handleCronEditTimezoneMessage(ctx, state) {
   }
 }
 
-async function handleProjectCronScheduleMessage(ctx, state) {
-  const text = ctx.message.text?.trim();
-  if (!text) {
-    await ctx.reply('Please send a schedule or press Cancel.');
-    return;
-  }
+async function createProjectCronJobWithSchedule(ctx, projectId, type, scheduleInput, recreate) {
   let schedule;
   try {
-    schedule = parseScheduleInput(text);
+    schedule = typeof scheduleInput === 'string' ? parseScheduleInput(scheduleInput) : scheduleInput;
   } catch (error) {
     await ctx.reply(`Invalid schedule: ${error.message}`);
     return;
   }
 
   const projects = await loadProjects();
-  const project = findProjectById(projects, state.projectId);
+  const project = findProjectById(projects, projectId);
   if (!project) {
     clearUserState(ctx.from.id);
     await ctx.reply('Project not found.');
@@ -5529,7 +5946,7 @@ async function handleProjectCronScheduleMessage(ctx, state) {
   }
 
   const cronSettings = await getEffectiveCronSettings();
-  const isKeepAlive = state.type.includes('keepalive');
+  const isKeepAlive = type === 'keepalive';
   const jobName = isKeepAlive
     ? `path-applier:${project.id}:keep-alive`
     : `path-applier:${project.id}:deploy`;
@@ -5570,7 +5987,7 @@ async function handleProjectCronScheduleMessage(ctx, state) {
   });
 
   try {
-    if (state.type.endsWith('recreate')) {
+    if (recreate) {
       const oldJobId = isKeepAlive ? project.cronKeepAliveJobId : project.cronDeployHookJobId;
       if (oldJobId) {
         try {
@@ -5617,8 +6034,50 @@ async function handleProjectCronScheduleMessage(ctx, state) {
     if (await replyCronRateLimitIfNeeded(ctx, error, correlationId)) {
       return;
     }
+    if (error?.status === 500) {
+      cronCreateRetryCache.set(correlationId, {
+        projectId,
+        type,
+        scheduleInput,
+        recreate: Boolean(recreate),
+      });
+      cronErrorDetailsCache.set(correlationId, {
+        projectId,
+        type,
+        schedule: schedule?.cron,
+        targetUrl: urlValidation.url,
+        status: error.status,
+        path: error.path || '/jobs',
+        reason: extractCronApiErrorReason(error) || error.message,
+      });
+      const inline = new InlineKeyboard()
+        .text('🔁 Retry', `projcron:retry_create:${correlationId}`)
+        .row()
+        .text('🧪 Run Cron API ping test', 'gsettings:ping_test')
+        .row()
+        .text('📋 Copy debug details', `projcron:copy_debug:${correlationId}`)
+        .row()
+        .text('⬅️ Back', `projcron:menu:${projectId}`);
+      await ctx.reply(formatCronCreateErrorPanel({ error, correlationId }), { reply_markup: inline });
+      return;
+    }
     await ctx.reply(formatCronApiErrorNotice('Failed to create cron job', error, correlationId));
   }
+}
+
+async function handleProjectCronScheduleMessage(ctx, state) {
+  const text = ctx.message.text?.trim();
+  if (!text) {
+    await ctx.reply('Please send a schedule or press Cancel.');
+    return;
+  }
+  await createProjectCronJobWithSchedule(
+    ctx,
+    state.projectId,
+    state.type.includes('keepalive') ? 'keepalive' : 'deploy',
+    text,
+    state.type.endsWith('recreate'),
+  );
 }
 
 async function handleSupabaseConsoleMessage(ctx, state) {
@@ -7148,7 +7607,8 @@ async function handleRenameProjectStep(ctx, state) {
   }
 
   if (state.step === 2) {
-    const newId = text || state.projectId;
+    const newIdRaw = text === '-' ? '' : text;
+    const newId = newIdRaw ? newIdRaw : state.projectId;
     const projects = await loadProjects();
     const idx = projects.findIndex((p) => p.id === state.projectId);
     if (idx === -1) {
@@ -7156,26 +7616,121 @@ async function handleRenameProjectStep(ctx, state) {
       clearUserState(ctx.from.id);
       return;
     }
-
-    if (newId !== state.projectId && projects.find((p) => p.id === newId)) {
-      await ctx.reply('A project with this ID already exists.');
+    if (newId !== state.projectId) {
+      const validation = validateProjectIdInput(newId);
+      if (!validation.valid) {
+        await ctx.reply(`Invalid project ID: ${validation.message}`);
+        return;
+      }
+      if (projects.find((p) => p.id === validation.value)) {
+        await ctx.reply('A project with this ID already exists.');
+        return;
+      }
+      setUserState(ctx.from.id, {
+        type: 'rename_project',
+        step: 3,
+        projectId: state.projectId,
+        data: { newName: state.data.newName, newId: validation.value },
+        messageContext: state.messageContext,
+      });
+      await ctx.reply(
+        `⚠️ Confirm project ID change:\n${state.projectId} → ${validation.value}\nType CONFIRM to proceed.`,
+        { reply_markup: buildCancelKeyboard() },
+      );
       return;
     }
 
-    const updatedProject = { ...projects[idx], name: state.data.newName, id: newId };
-    projects[idx] = updatedProject;
+    projects[idx] = { ...projects[idx], name: state.data.newName };
     await saveProjects(projects);
-
-    const settings = await loadGlobalSettings();
-    if (settings.defaultProjectId === state.projectId) {
-      settings.defaultProjectId = newId;
-      await saveGlobalSettings(settings);
-    }
-
     clearUserState(ctx.from.id);
-    await renderProjectSettingsForMessage(state.messageContext, newId, '✅ Updated');
+    await renderProjectSettingsForMessage(state.messageContext, state.projectId, '✅ Updated');
     if (!state.messageContext) {
-      await renderProjectSettings(ctx, newId, '✅ Updated');
+      await renderProjectSettings(ctx, state.projectId, '✅ Updated');
+    }
+  }
+
+  if (state.step === 3) {
+    if (text !== 'CONFIRM') {
+      await ctx.reply('Type CONFIRM to proceed or Cancel.');
+      return;
+    }
+    const newId = state.data?.newId;
+    const newName = state.data?.newName;
+    try {
+      const updated = await migrateProjectId(state.projectId, newId);
+      if (newName) {
+        await updateProjectField(updated.id, 'name', newName);
+      }
+      clearUserState(ctx.from.id);
+      await renderProjectSettingsForMessage(state.messageContext, updated.id, '✅ Updated');
+      if (!state.messageContext) {
+        await renderProjectSettings(ctx, updated.id, '✅ Updated');
+      }
+    } catch (error) {
+      await ctx.reply(`Failed to update project ID: ${error.message}`);
+      clearUserState(ctx.from.id);
+    }
+  }
+}
+
+async function handleEditProjectIdInput(ctx, state) {
+  const text = ctx.message.text?.trim();
+  if (!text) {
+    await ctx.reply('Please send text.');
+    return;
+  }
+  if (text.toLowerCase() === 'cancel') {
+    resetUserState(ctx);
+    await renderStateMessage(ctx, state, 'Operation cancelled.', {
+      reply_markup: buildBackKeyboard(`proj:open:${state.projectId}`),
+    });
+    return;
+  }
+  if (state.step === 'input') {
+    const validation = validateProjectIdInput(text);
+    if (!validation.valid) {
+      await ctx.reply(`Invalid project ID: ${validation.message}`);
+      return;
+    }
+    if (validation.value === state.projectId) {
+      await ctx.reply('Project ID unchanged.');
+      clearUserState(ctx.from.id);
+      await renderProjectSettings(ctx, state.projectId);
+      return;
+    }
+    const projects = await loadProjects();
+    if (projects.find((p) => p.id === validation.value)) {
+      await ctx.reply('A project with this ID already exists.');
+      return;
+    }
+    setUserState(ctx.from.id, {
+      type: 'edit_project_id',
+      step: 'confirm',
+      projectId: state.projectId,
+      data: { newId: validation.value },
+      messageContext: state.messageContext,
+    });
+    await ctx.reply(
+      `⚠️ Confirm project ID change:\n${state.projectId} → ${validation.value}\nType CONFIRM to proceed.`,
+      { reply_markup: buildCancelKeyboard() },
+    );
+    return;
+  }
+  if (state.step === 'confirm') {
+    if (text !== 'CONFIRM') {
+      await ctx.reply('Type CONFIRM to proceed or Cancel.');
+      return;
+    }
+    try {
+      const updated = await migrateProjectId(state.projectId, state.data.newId);
+      clearUserState(ctx.from.id);
+      await renderProjectSettingsForMessage(state.messageContext, updated.id, '✅ Updated');
+      if (!state.messageContext) {
+        await renderProjectSettings(ctx, updated.id, '✅ Updated');
+      }
+    } catch (error) {
+      await ctx.reply(`Failed to update project ID: ${error.message}`);
+      clearUserState(ctx.from.id);
     }
   }
 }
@@ -7456,6 +8011,38 @@ async function revalidateWorkingDir(ctx, projectId) {
   });
 }
 
+async function renderWorkingDirectionMenu(ctx, projectId, notice) {
+  const project = await getProjectById(projectId, ctx);
+  if (!project) return;
+  const workingDirLabel = formatWorkingDirDisplay(project);
+  const lines = [
+    `📁 Working Direction — ${project.name || project.id}`,
+    notice || null,
+    '',
+    `Current: ${workingDirLabel}`,
+  ].filter(Boolean);
+
+  const inline = new InlineKeyboard()
+    .text('✏️ Set working dir', `proj:edit_workdir:${projectId}`)
+    .row()
+    .text('♻️ Reset to default', `proj:workdir_reset:${projectId}`)
+    .row()
+    .text('🔁 Re-checkout & Validate WorkingDir', `proj:workdir_revalidate:${projectId}`)
+    .row()
+    .text('⬅️ Back', `proj:open:${projectId}`);
+
+  await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
+}
+
+async function resetWorkingDir(ctx, projectId) {
+  const updated = await updateProjectField(projectId, 'workingDir', undefined);
+  if (!updated) {
+    await renderOrEdit(ctx, 'Project not found.');
+    return;
+  }
+  await renderWorkingDirectionMenu(ctx, projectId, '✅ Reset to default');
+}
+
 async function handleEditGithubTokenStep(ctx, state) {
   const text = ctx.message.text?.trim();
   if (!text) {
@@ -7653,6 +8240,24 @@ function formatDiagnosticsCheckLine(status, label, detail) {
   return `${icon} ${label}${detailText}`;
 }
 
+function buildDiagnosticsErrorHints(result, commandLabel, commandText) {
+  const lines = [];
+  const exitCode = result?.exitCode;
+  if (exitCode === 134) {
+    lines.push('Interpretation: exit 134 — likely Node/V8 OOM or process crash during tests.');
+    lines.push('📌 Suggested fixes:');
+    lines.push('• reduce test concurrency');
+    lines.push('• increase Node memory (NODE_OPTIONS=--max-old-space-size=...)');
+  }
+  if (exitCode === 2 && /lint/i.test(commandText || commandLabel || '')) {
+    lines.push('Interpretation: lint exit 2 — lint command failed (code style/type errors).');
+    lines.push('📌 Suggested fixes:');
+    lines.push('• ensure dependencies installed');
+    lines.push('• run lint locally/CI and check first failing lines');
+  }
+  return lines;
+}
+
 async function resolveEnvValueSources(project, key) {
   const sources = [];
   if (isEnvVaultAvailable()) {
@@ -7705,10 +8310,7 @@ async function buildLogForwardingDiagnostics(project) {
     const sources = await resolveEnvValueSources(project, key);
     const effective = selectEffectiveEnvValue(sources);
     const baseStatus = evaluateEnvValueStatus(effective.value);
-    const computedOnly = effective.source === 'computed_default';
-    const status = computedOnly
-      ? { status: 'MISSING', reason: 'Value derived from computed default; env key not set.' }
-      : baseStatus;
+    const status = baseStatus;
     const masked = effective.value ? maskEnvValue(effective.value) : '(missing)';
     if (status.status !== 'SET') {
       if (!missingSet.has(key)) {
@@ -7740,7 +8342,7 @@ async function buildLogForwardingDiagnostics(project) {
   return {
     status,
     summary,
-    details,
+    details: missing.length ? details : [],
     missingKeys: missing.map((entry) => entry.key),
   };
 }
@@ -7854,7 +8456,7 @@ async function runProjectLightDiagnostics(ctx, projectId) {
   await safeRespond(ctx, report.lines.join('\n'), { reply_markup: inline }, { action: 'light_diagnostics' });
 }
 
-async function buildHeavyDiagnosticsReport(project) {
+async function buildHeavyDiagnosticsReport(project, options = {}) {
   const checks = [];
   const lines = [];
   let repoInfo = null;
@@ -7862,6 +8464,7 @@ async function buildHeavyDiagnosticsReport(project) {
   let checkoutDir = null;
   const globalSettings = await loadGlobalSettings();
   const baseBranch = project.baseBranch || globalSettings.defaultBaseBranch || DEFAULT_BASE_BRANCH;
+  const onStep = typeof options.onStep === 'function' ? options.onStep : null;
 
   try {
     const projectForCheckout = { ...project, workingDir: undefined };
@@ -7876,6 +8479,9 @@ async function buildHeavyDiagnosticsReport(project) {
     }
   }
 
+  if (onStep) {
+    await onStep('Step 2/6: Validate working directory');
+  }
   const workingDir = resolveWorkingDirAgainstCheckout(project.workingDir, checkoutDir) || repoInfo?.workingDir;
   if (!workingDir) {
     blockedReason = blockedReason || 'workingDir missing';
@@ -7917,6 +8523,9 @@ async function buildHeavyDiagnosticsReport(project) {
     detail: validation?.details || workingDir,
   });
 
+  if (onStep) {
+    await onStep('Step 3/6: Git fetch');
+  }
   const tokenInfo = await resolveGithubToken(project);
   const fetchCheck = repoInfo
     ? await checkGitFetch(repoInfo.repoUrl, tokenInfo.token, baseBranch)
@@ -7927,6 +8536,30 @@ async function buildHeavyDiagnosticsReport(project) {
     detail: fetchCheck.detail,
   });
 
+  if (onStep) {
+    await onStep('Step 4/6: Install deps (if applicable)');
+  }
+  if (project.installCommand) {
+    const installResult = await runCommandInProject({ ...project, workingDir }, project.installCommand);
+    checks.push({
+      status: installResult.exitCode === 0 ? 'ok' : 'fail',
+      label: 'Install deps',
+      detail: `exit ${installResult.exitCode} (${installResult.durationMs} ms)`,
+      details:
+        installResult.exitCode === 0
+          ? []
+          : [
+              `Last output: ${truncateText(installResult.stderr || installResult.stdout || '', 200)}`,
+              ...buildDiagnosticsErrorHints(installResult, 'Install deps', project.installCommand),
+            ],
+    });
+  } else {
+    checks.push({ status: 'ok', label: 'Install deps', detail: 'not configured' });
+  }
+
+  if (onStep) {
+    await onStep('Step 5/6: Run test command');
+  }
   if (project.testCommand) {
     const testResult = await runCommandInProject({ ...project, workingDir }, project.testCommand);
     checks.push({
@@ -7936,12 +8569,18 @@ async function buildHeavyDiagnosticsReport(project) {
       details:
         testResult.exitCode === 0
           ? []
-          : [`Last output: ${truncateText(testResult.stderr || testResult.stdout || '', 200)}`],
+          : [
+              `Last output: ${truncateText(testResult.stderr || testResult.stdout || '', 200)}`,
+              ...buildDiagnosticsErrorHints(testResult, 'Test command', project.testCommand),
+            ],
     });
   } else {
     checks.push({ status: 'fail', label: 'Test command', detail: 'not configured' });
   }
 
+  if (onStep) {
+    await onStep('Step 6/6: Run diagnostic command');
+  }
   if (project.diagnosticCommand) {
     const diagResult = await runCommandInProject({ ...project, workingDir }, project.diagnosticCommand);
     checks.push({
@@ -7951,7 +8590,10 @@ async function buildHeavyDiagnosticsReport(project) {
       details:
         diagResult.exitCode === 0
           ? []
-          : [`Last output: ${truncateText(diagResult.stderr || diagResult.stdout || '', 200)}`],
+          : [
+              `Last output: ${truncateText(diagResult.stderr || diagResult.stdout || '', 200)}`,
+              ...buildDiagnosticsErrorHints(diagResult, 'Diagnostic command', project.diagnosticCommand),
+            ],
     });
   } else {
     checks.push({ status: 'fail', label: 'Diagnostic command', detail: 'not configured' });
@@ -7975,11 +8617,20 @@ async function runProjectFullDiagnostics(ctx, projectId) {
     return;
   }
 
+  const header = `🧪 Full Diagnostics — ${project.name || project.id}`;
+  const progress = await startProgressMessage(ctx, `${header}\n⏳ waiting testing…\nStep 1/6: Resolve env`);
+  const updateProgress = async (stepLine) =>
+    updateProgressMessage(progress, `${header}\n⏳ waiting testing…\n${stepLine}`);
+
+  await updateProgress('Step 1/6: Resolve env');
   const lightReport = await buildLightDiagnosticsReport(project, { includeHeader: false });
-  const heavyReport = await buildHeavyDiagnosticsReport(project);
+
+  const heavyReport = await buildHeavyDiagnosticsReport(project, {
+    onStep: async (stepLine) => updateProgress(stepLine),
+  });
 
   const lines = [
-    `🧪 Full Diagnostics — ${project.name || project.id}`,
+    header,
     '',
     'Light diagnostics:',
     ...lightReport.lines,
@@ -7998,7 +8649,7 @@ async function runProjectFullDiagnostics(ctx, projectId) {
   }
   inline.text('⬅️ Back', `proj:diagnostics_menu:${project.id}`);
 
-  await safeRespond(ctx, lines.join('\n'), { reply_markup: inline }, { action: 'full_diagnostics' });
+  await updateProgressMessage(progress, lines.join('\n'), { reply_markup: inline });
 }
 
 async function runProjectDiagnostics(ctx, projectId) {
@@ -8028,16 +8679,8 @@ function formatMaskedEnvExportLine(entry) {
   const status = evaluateEnvValueStatus(entry.value);
   const masked = maskEnvValue(entry.value);
   const display = status.status === 'SET' ? masked : '(missing)';
-  return `${entry.key} = ${display}  (source: ${entry.source})  (status: ${status.status})`;
-}
-
-function formatEnvExportFileSection(title, entries) {
-  const lines = [`# ${title}`];
-  entries.forEach((entry) => {
-    lines.push(`# source: ${entry.source}`);
-    lines.push(`${entry.key}=${entry.value == null ? '' : String(entry.value)}`);
-  });
-  return lines;
+  const source = entry.source ? `source: ${entry.source}` : 'source: -';
+  return `${entry.key} = ${display} (${source}, status: ${status.status})`;
 }
 
 async function exportProjectEnv(ctx, projectId) {
@@ -8099,32 +8742,18 @@ async function exportProjectEnv(ctx, projectId) {
   const sortedProcess = [...processEntries].sort((a, b) => a.key.localeCompare(b.key));
   const sortedEffective = [...effectiveEntries].sort((a, b) => a.key.localeCompare(b.key));
 
-  const lines = [`🔐 Env export — ${project.name || project.id}`, ''];
-  if (sortedEnvVault.length) {
-    lines.push('Project Env Vault:', ...sortedEnvVault.map(formatMaskedEnvExportLine), '');
-  } else {
-    lines.push('Project Env Vault: no keys found.', '');
-  }
-  lines.push('Process/runtime env:', ...sortedProcess.map(formatMaskedEnvExportLine), '');
-  lines.push('Effective resolved env:', ...sortedEffective.map(formatMaskedEnvExportLine));
+  const lines = [
+    `🔐 Env export — ${project.name || project.id}`,
+    '',
+    'Effective resolved env (masked):',
+    ...sortedEffective.map(formatMaskedEnvExportLine),
+  ];
 
   await sendChunkedMessages(ctx, lines);
 
-  const header = [
-    '# WARNING: This file contains sensitive values. Handle securely.',
-    `# Project: ${project.name || project.id}`,
-    `# Generated: ${new Date().toISOString()}`,
-    '',
-  ];
-  const fileLines = [
-    ...header,
-    ...formatEnvExportFileSection('Project Env Vault (unmasked)', sortedEnvVault),
-    '',
-    ...formatEnvExportFileSection('Process/runtime env (unmasked)', sortedProcess),
-    '',
-    ...formatEnvExportFileSection('Effective resolved env (unmasked)', sortedEffective),
-    '',
-  ];
+  const fileLines = sortedEffective.map(
+    (entry) => `${entry.key}=${entry.value == null ? '' : String(entry.value)}`,
+  );
 
   const filename = `${projectId}-env-export.txt`;
   await sendTextFile(ctx, filename, fileLines.join('\n'));
@@ -8173,6 +8802,7 @@ function recordEnvUsage(envMap, name, info) {
     envMap.set(name, {
       name,
       firstSeen: info.firstSeen,
+      firstSeenExcerpt: info.firstSeen?.excerpt || null,
       seenInCode: false,
       seenInExample: false,
       usage: { required: false, optional: false },
@@ -8181,6 +8811,9 @@ function recordEnvUsage(envMap, name, info) {
   const entry = envMap.get(name);
   if (!entry.firstSeen) {
     entry.firstSeen = info.firstSeen;
+  }
+  if (!entry.firstSeenExcerpt && info.firstSeen?.excerpt) {
+    entry.firstSeenExcerpt = info.firstSeen.excerpt;
   }
   if (info.isExample) {
     entry.seenInExample = true;
@@ -8203,7 +8836,19 @@ function classifyNodeUsage(line, name) {
   return requiredRegex.test(line) ? 'required' : 'optional';
 }
 
-function scanLineForEnv(line, lineNumber, relativePath, envMap, isExample) {
+function buildEnvExcerpt(lines, lineNumber, context = 2) {
+  const index = Math.max(0, lineNumber - 1);
+  const start = Math.max(0, index - context);
+  const end = Math.min(lines.length - 1, index + context);
+  const excerptLines = [];
+  for (let i = start; i <= end; i += 1) {
+    const marker = i + 1 === lineNumber ? '▶' : ' ';
+    excerptLines.push(`${marker} ${i + 1}: ${lines[i]}`);
+  }
+  return excerptLines.join('\n');
+}
+
+function scanLineForEnv(line, lineNumber, relativePath, envMap, isExample, lines) {
   const patterns = [
     { regex: /process\.env\.([A-Z0-9_]+)/g, type: 'node' },
     { regex: /process\.env\[['"]([A-Z0-9_]+)['"]\]/g, type: 'node' },
@@ -8227,7 +8872,11 @@ function scanLineForEnv(line, lineNumber, relativePath, envMap, isExample) {
         required = classifyNodeUsage(line, name) === 'required';
       }
       recordEnvUsage(envMap, name, {
-        firstSeen: { path: relativePath, line: lineNumber },
+        firstSeen: {
+          path: relativePath,
+          line: lineNumber,
+          excerpt: Array.isArray(lines) ? buildEnvExcerpt(lines, lineNumber) : null,
+        },
         isExample,
         required,
       });
@@ -8239,7 +8888,13 @@ async function scanEnvRequirements(ctx, projectId) {
   const project = await getProjectById(projectId, ctx);
   if (!project) return;
 
+  const header = `🔎 Env scan — ${project.name || project.id}`;
+  const progress = await startProgressMessage(ctx, `${header}\n⏳ waiting testing…`);
+  const updateProgress = async (statusLine, extraLines = [], extra = {}) =>
+    updateProgressMessage(progress, [header, statusLine, ...extraLines].filter(Boolean).join('\n'), extra);
+
   console.log('[env scan] start', { projectId });
+  await updateProgress('⏳ Preparing repository…');
   const globalSettings = await loadGlobalSettings();
   const baseBranch = project.baseBranch || globalSettings.defaultBaseBranch || DEFAULT_BASE_BRANCH;
   let repoInfo = null;
@@ -8251,18 +8906,21 @@ async function scanEnvRequirements(ctx, projectId) {
       error.message === 'Project is missing repoSlug'
         ? 'Repo slug missing. Set repoSlug before scanning env requirements.'
         : `Repo preparation failed: ${error.message}`;
-    await safeRespond(ctx, message, { reply_markup: buildBackKeyboard(`proj:diagnostics_menu:${projectId}`) }, { action: 'env_scan' });
+    await updateProgress(`❌ ${message}`, [], {
+      reply_markup: buildBackKeyboard(`proj:diagnostics_menu:${projectId}`),
+    });
     return;
   }
 
   const workingDir = resolveProjectWorkingDir(project) || repoInfo?.workingDir;
   if (!workingDir) {
-    await safeRespond(ctx, 'workingDir missing. Set a working directory before scanning.', {
+    await updateProgress('❌ workingDir missing. Set a working directory before scanning.', [], {
       reply_markup: buildBackKeyboard(`proj:diagnostics_menu:${projectId}`),
-    }, { action: 'env_scan' });
+    });
     return;
   }
 
+  await updateProgress('⏳ Validating working directory…');
   const validation = await validateWorkingDir({ ...project, workingDir });
   if (!validation.ok) {
     const lines = ['Env scan blocked: workingDir is invalid.', `Reason: ${validation.details}`];
@@ -8276,10 +8934,11 @@ async function scanEnvRequirements(ctx, projectId) {
       .text('Fix WorkingDir', `proj:edit_workdir:${projectId}`)
       .row()
       .text('⬅️ Back', `proj:diagnostics_menu:${projectId}`);
-    await safeRespond(ctx, lines.join('\n'), { reply_markup: inline }, { action: 'env_scan' });
+    await updateProgress(lines.join('\n'), [], { reply_markup: inline });
     return;
   }
 
+  await updateProgress('⏳ Scanning files for env usage…');
   const envMap = new Map();
   const files = await collectEnvScanFiles(workingDir);
   for (const file of files) {
@@ -8302,7 +8961,7 @@ async function scanEnvRequirements(ctx, projectId) {
     const isExample = relativePath.endsWith('.env.example');
     const lines = content.split(/\r?\n/);
     lines.forEach((line, index) => {
-      scanLineForEnv(line, index + 1, relativePath, envMap, isExample);
+      scanLineForEnv(line, index + 1, relativePath, envMap, isExample, lines);
     });
   }
 
@@ -8322,6 +8981,7 @@ async function scanEnvRequirements(ctx, projectId) {
     }
   });
 
+  await updateProgress('⏳ Resolving current env values…');
   const allKeys = entries.map((entry) => entry.name);
   const envVaultValues = new Map();
   if (isEnvVaultAvailable()) {
@@ -8354,55 +9014,64 @@ async function scanEnvRequirements(ctx, projectId) {
     };
   };
 
-  const buildSectionLines = (label, list, includeSet) => {
-    if (!list.length) return [`${label}: none`];
-    const sorted = [...list].sort((a, b) => a.name.localeCompare(b.name));
-    const items = [];
-    const missing = [];
-    const present = [];
-    sorted.forEach((entry) => {
-      const resolved = resolveEnvStatus(entry.name);
-      const payload = {
-        entry,
-        resolved,
-      };
-      if (resolved.status === 'SET') {
-        present.push(payload);
-      } else {
-        missing.push(payload);
-      }
-    });
-    const combined = [...missing, ...(includeSet ? present : [])];
-    const lines = [`${label}:`];
-    combined.forEach(({ entry, resolved }) => {
-      const sourceText = resolved.source ? ` [source: ${resolved.source}]` : '';
+  const summarizeEntry = (entry, classification, resolved) => {
+    const lines = [
+      `${classification} ${entry.name}`,
+      `• Source: ${resolved.source || '-'} | First seen: ${entry.firstSeen?.path || '-'}:${entry.firstSeen?.line || '-'}`,
+    ];
+    if (entry.firstSeenExcerpt) {
       lines.push(
-        `${entry.name} = ${resolved.maskedValue} [${resolved.status}]${sourceText} [firstSeenIn: ${entry.firstSeen?.path || '-'}:${entry.firstSeen?.line || '-'}]`,
+        ...entry.firstSeenExcerpt.split('\n').map((line) => `> ${line}`),
       );
-    });
+    }
     return lines;
   };
 
-  const missingRequired = [];
-  required.forEach((entry) => {
-    const resolved = resolveEnvStatus(entry.name);
-    if (resolved.status !== 'SET') {
-      missingRequired.push(entry.name);
-    }
-  });
+  const missingRequiredEntries = required.filter(
+    (entry) => resolveEnvStatus(entry.name).status !== 'SET',
+  );
+  const missingOptionalEntries = optional.filter(
+    (entry) => resolveEnvStatus(entry.name).status !== 'SET',
+  );
+
+  const missingRequired = missingRequiredEntries.map((entry) => entry.name);
   envScanCache.set(projectId, { missingRequired, updatedAt: Date.now() });
 
-  const summary = `Summary: required=${required.length}, optional=${optional.length}, suggested=${suggested.length}; required missing=${missingRequired.length}`;
-  const reportLines = [
-    `🔎 Env scan — ${project.name || project.id}`,
-    summary,
-    '',
-    ...buildSectionLines('REQUIRED', required, true),
-    '',
-    ...buildSectionLines('OPTIONAL', optional, true),
-    '',
-    ...buildSectionLines('SUGGESTED', suggested, false),
+  const summary = [
+    `✅ Ready: ${required.length - missingRequiredEntries.length}/${required.length} required set`,
+    `❌ Required missing: ${missingRequiredEntries.length}`,
+    `⚠️ Optional missing: ${missingOptionalEntries.length}`,
+    `💡 Suggested: ${suggested.length}`,
   ];
+
+  const reportLines = [header, ...summary];
+  if (missingRequiredEntries.length) {
+    reportLines.push('', '❌ Required missing:');
+    missingRequiredEntries.forEach((entry) => {
+      const resolved = resolveEnvStatus(entry.name);
+      reportLines.push(...summarizeEntry(entry, '❌ Required:', resolved));
+      reportLines.push('');
+    });
+  }
+  if (missingOptionalEntries.length) {
+    reportLines.push('', '⚠️ Optional missing:');
+    missingOptionalEntries.forEach((entry) => {
+      const resolved = resolveEnvStatus(entry.name);
+      reportLines.push(...summarizeEntry(entry, '⚠️ Optional:', resolved));
+      reportLines.push('');
+    });
+  }
+  if (suggested.length) {
+    reportLines.push('', '💡 Suggested:');
+    suggested
+      .slice()
+      .sort((a, b) => a.name.localeCompare(b.name))
+      .forEach((entry) => {
+        const resolved = resolveEnvStatus(entry.name);
+        reportLines.push(...summarizeEntry(entry, '💡 Suggested:', resolved));
+        reportLines.push('');
+      });
+  }
 
   const maxLines = 120;
   const maxChars = 3500;
@@ -8412,22 +9081,22 @@ async function scanEnvRequirements(ctx, projectId) {
     outputLines = outputLines.slice(0, maxLines);
     truncated = true;
   }
-  let outputText = outputLines.join('\n');
+  let outputText = outputLines.join('\n').trim();
   if (outputText.length > maxChars) {
     outputText = `${outputText.slice(0, maxChars)}\n... (truncated)`;
     truncated = true;
   }
 
   const inline = new InlineKeyboard()
-    .text('Fix missing required envs', `proj:env_scan_fix_missing:${projectId}`)
+    .text('🛠️ Fix missing required envs', `proj:env_scan_fix_missing:${projectId}`)
     .row()
-    .text('Fix a specific env', `proj:env_scan_fix_specific:${projectId}`)
+    .text('🎯 Fix a specific env', `proj:env_scan_fix_specific:${projectId}`)
     .row()
-    .text('Export env (masked + full file)', `proj:env_export:${projectId}`)
+    .text('📤 Export env (masked + full file)', `proj:env_export:${projectId}`)
     .row()
     .text('⬅️ Back', `proj:diagnostics_menu:${projectId}`);
 
-  await safeRespond(ctx, outputText, { reply_markup: inline }, { action: 'env_scan' });
+  await updateProgress(outputText, [], { reply_markup: inline });
 
   if (truncated) {
     const filename = `${projectId}-env-scan-report.txt`;
@@ -8566,7 +9235,7 @@ async function renderProjectSettings(ctx, projectId, notice) {
     return;
   }
   const globalSettings = await loadGlobalSettings();
-  const view = buildProjectSettingsView(project, globalSettings, notice);
+  const view = await buildProjectSettingsView(project, globalSettings, notice);
   await renderOrEdit(ctx, view.text, { reply_markup: view.keyboard });
 }
 
@@ -8613,7 +9282,7 @@ function resolveProjectFeatureFlag(project, key) {
   return undefined;
 }
 
-function getMissingRequirements(project) {
+async function getMissingRequirements(project) {
   const missing = [];
   const runModeRaw = project?.runMode || project?.run_mode || '';
   const runMode = String(runModeRaw).trim();
@@ -8676,17 +9345,20 @@ function getMissingRequirements(project) {
   }
 
   if (logAlertsEnabled) {
-    const missingEnv = ['PATH_APPLIER_URL', 'PATH_APPLIER_TOKEN', 'PROJECT_NAME'].filter(
-      (key) => !process.env[key],
-    );
-    if (missingEnv.length) {
-      missing.push({
-        key: 'logForwardingEnv',
-        title: 'Log forwarding env missing',
-        description: 'PATH_APPLIER_URL, PATH_APPLIER_TOKEN, PROJECT_NAME must be set.',
-        severity: 'required',
-        fixAction: 'FIX_LOG_FORWARDING_ENV',
-      });
+    const requiredKeys = ['PATH_APPLIER_URL', 'PATH_APPLIER_TOKEN', 'PROJECT_NAME'];
+    for (const key of requiredKeys) {
+      const sources = await resolveEnvValueSources(project, key);
+      const effective = selectEffectiveEnvValue(sources);
+      const status = evaluateEnvValueStatus(effective.value);
+      if (status.status !== 'SET') {
+        missing.push({
+          key: `logForwardingEnv:${key}`,
+          title: `Log forwarding env: ${key}`,
+          description: `Set ${key} to enable log forwarding.`,
+          severity: 'required',
+          fixAction: `FIX_LOG_FORWARDING_ENV:${key}`,
+        });
+      }
     }
   }
 
@@ -8722,6 +9394,17 @@ function getMissingRequirements(project) {
         fixAction: 'FIX_SERVICE_HEALTH',
       });
     }
+  }
+
+  const envScan = envScanCache.get(project?.id);
+  if (envScan?.missingRequired?.length) {
+    missing.push({
+      key: 'envScanMissing',
+      title: `Missing envs (${envScan.missingRequired.length})`,
+      description: `Required envs missing: ${envScan.missingRequired.join(', ')}`,
+      severity: 'required',
+      fixAction: 'FIX_ENV_SCAN_MISSING',
+    });
   }
 
   return missing;
@@ -8787,14 +9470,14 @@ function getProjectMissingSetup(project, globalSettings) {
   return missing;
 }
 
-function buildProjectSettingsView(project, globalSettings, notice) {
+async function buildProjectSettingsView(project, globalSettings, notice) {
   const effectiveBase = project.baseBranch || globalSettings.defaultBaseBranch || DEFAULT_BASE_BRANCH;
   const isDefault = globalSettings.defaultProjectId === project.id;
   const name = project.name || project.id;
   const tokenKey = project.githubTokenEnvKey || 'GITHUB_TOKEN';
   const tokenLabel = tokenKey === 'GITHUB_TOKEN' ? 'GITHUB_TOKEN (default)' : tokenKey;
   const projectTypeLabel = getProjectTypeLabel(project);
-  const missingSetup = getMissingRequirements(project);
+  const missingSetup = await getMissingRequirements(project);
   const workingDirLabel = formatWorkingDirDisplay(project);
 
   const lines = [
@@ -8830,9 +9513,7 @@ function buildProjectSettingsView(project, globalSettings, notice) {
     .text('🏷️ Project type', `proj:project_type:${project.id}`)
     .row()
     .text('📝 Edit repo', `proj:edit_repo:${project.id}`)
-    .text('📁 Edit working dir', `proj:edit_workdir:${project.id}`)
-    .row()
-    .text('🔁 Re-checkout & Validate WorkingDir', `proj:workdir_revalidate:${project.id}`)
+    .text('📁 Working Direction', `proj:workdir_menu:${project.id}`)
     .row()
     .text('🔑 Edit GitHub token', `proj:edit_github_token:${project.id}`)
     .row()
@@ -8866,8 +9547,8 @@ function buildProjectSettingsView(project, globalSettings, notice) {
   return { text: lines.join('\n'), keyboard: inline };
 }
 
-function buildProjectMissingSetupView(project, globalSettings, notice) {
-  const missing = getMissingRequirements(project);
+async function buildProjectMissingSetupView(project, globalSettings, notice) {
+  const missing = await getMissingRequirements(project);
   const lines = [
     `🧩 Missing setup — ${project.name || project.id}`,
     notice || null,
@@ -8918,11 +9599,18 @@ async function renderProjectMissingSetup(ctx, projectId, notice) {
     return;
   }
   const globalSettings = await loadGlobalSettings();
-  const view = buildProjectMissingSetupView(project, globalSettings, notice);
+  const view = await buildProjectMissingSetupView(project, globalSettings, notice);
   await safeRespond(ctx, view.text, { reply_markup: view.keyboard }, { action: 'missing_setup' });
 }
 
 function getMissingFixTarget(projectId, fixAction) {
+  if (fixAction?.startsWith('FIX_LOG_FORWARDING_ENV:')) {
+    const [, key] = fixAction.split(':');
+    return { type: 'log_env_fix', key };
+  }
+  if (fixAction === 'FIX_ENV_SCAN_MISSING') {
+    return { type: 'env_scan_missing' };
+  }
   switch (fixAction) {
     case 'FIX_RUNMODE':
       return { type: 'run_mode' };
@@ -8932,8 +9620,6 @@ function getMissingFixTarget(projectId, fixAction) {
       return { type: 'command_edit', field: 'testCommand' };
     case 'FIX_DIAGNOSTIC_COMMAND':
       return { type: 'command_edit', field: 'diagnosticCommand' };
-    case 'FIX_LOG_FORWARDING_ENV':
-      return { type: 'env_vault' };
     case 'FIX_DATABASE_URL':
       return { type: 'env_vault' };
     case 'FIX_SUPABASE_BINDING':
@@ -8956,7 +9642,7 @@ async function handleProjectMissingFix(ctx, projectId, fixAction) {
     return;
   }
 
-  const missing = getMissingRequirements(project);
+  const missing = await getMissingRequirements(project);
   const targetItem = missing.find((item) => item.fixAction === fixAction);
   if (!targetItem) {
     const known = missing.map((item) => item.key).join(', ') || 'none';
@@ -9003,6 +9689,14 @@ async function handleProjectMissingFix(ctx, projectId, fixAction) {
   }
   if (target.type === 'env_vault') {
     await renderEnvVaultMenu(ctx, projectId);
+    return;
+  }
+  if (target.type === 'env_scan_missing') {
+    await handleEnvScanFixMissing(ctx, projectId);
+    return;
+  }
+  if (target.type === 'log_env_fix') {
+    await handleLogForwardingEnvFix(ctx, projectId, target.key);
     return;
   }
   if (target.type === 'supabase') {
@@ -9307,7 +10001,7 @@ async function renderProjectSettingsForMessage(messageContext, projectId, notice
     return;
   }
   const globalSettings = await loadGlobalSettings();
-  const view = buildProjectSettingsView(project, globalSettings, notice);
+  const view = await buildProjectSettingsView(project, globalSettings, notice);
   if (!messageContext.messageId) {
     await bot.api.sendMessage(
       messageContext.chatId,
@@ -9353,6 +10047,8 @@ async function renderProjectMenu(ctx, projectId) {
     .row()
     .text('✏️ Edit project', `proj:rename:${projectId}`)
     .row()
+    .text('🆔 Edit project ID', `proj:edit_id:${projectId}`)
+    .row()
     .text('🌿 Change base branch', `proj:change_base:${projectId}`)
     .row()
     .text('🧰 Edit commands', `proj:commands:${projectId}`)
@@ -9383,10 +10079,6 @@ async function renderProjectDiagnosticsMenu(ctx, projectId, notice) {
     .text('🩺 Run Light Diagnostics', `proj:diagnostics_light:${projectId}`)
     .row()
     .text('🧪 Run Full Diagnostics', `proj:diagnostics_full:${projectId}`)
-    .row()
-    .text('📤 Export env (masked + file)', `proj:env_export:${projectId}`)
-    .row()
-    .text('🔎 Scan env requirements', `proj:env_scan:${projectId}`)
     .row()
     .text('⬅️ Back', `proj:open:${projectId}`);
 
@@ -9428,6 +10120,8 @@ async function renderProjectDbMiniSite(ctx, projectId) {
   const envSetId = await ensureProjectEnvSet(projectId);
   const envStatus = await buildEnvVaultDbStatus(project, envSetId);
   const supabaseStatus = await buildSupabaseBindingStatus(project);
+  const baseUrl = getPublicBaseUrl().replace(/\/$/, '');
+  const miniSiteUrl = `${baseUrl}/db-mini/${encodeURIComponent(projectId)}`;
 
   const lines = [
     `🌐 DB mini-site — ${project.name || project.id}`,
@@ -9435,19 +10129,11 @@ async function renderProjectDbMiniSite(ctx, projectId) {
     `Env Vault DB: ${envStatus.summary}`,
     `Supabase binding: ${supabaseStatus.summary}`,
     '',
-    'Choose an action:',
+    'Open the mini-site (HTTP):',
   ];
 
-  const inline = new InlineKeyboard();
-  if (project.supabaseConnectionId) {
-    inline.text('📋 Tables', `supabase:tables:${project.supabaseConnectionId}`).row();
-  } else if (envStatus.ready) {
-    inline.text('📋 Tables', `proj:db_insights:${projectId}:0:0`).row();
-  }
-  inline
-    .text('📊 DB overview', `proj:db_insights:${projectId}:0:0`)
-    .row()
-    .text('📝 SQL runner', `proj:sql_menu:${projectId}`)
+  const inline = new InlineKeyboard()
+    .url('🌐 Open mini-site', miniSiteUrl)
     .row()
     .text('⬅️ Back', `proj:open:${projectId}`);
 
@@ -9699,6 +10385,139 @@ function buildSupabaseDsnFromUrl(supabaseUrl, serviceRoleKey) {
   return `postgres://postgres:${password}@db.${projectRef}.supabase.co:5432/postgres?sslmode=require`;
 }
 
+async function resolveMiniSiteDbConnection(project) {
+  if (!project) return { dsn: null, source: 'missing_project' };
+  if (isEnvVaultAvailable()) {
+    const envSetId = await ensureProjectEnvSet(project.id);
+    const envVault = await resolveEnvVaultConnection(project.id, envSetId);
+    if (envVault.dsn) {
+      return { dsn: envVault.dsn, source: envVault.source || 'env_vault' };
+    }
+  }
+  if (project.supabaseConnectionId) {
+    const connection = await findSupabaseConnection(project.supabaseConnectionId);
+    if (connection) {
+      const dsnInfo = await resolveSupabaseConnectionDsn(connection);
+      if (dsnInfo.dsn) {
+        return { dsn: dsnInfo.dsn, source: connection.envKey || 'supabase' };
+      }
+    }
+  }
+  if (project.databaseUrl) {
+    return { dsn: project.databaseUrl, source: 'project_db_config' };
+  }
+  if (process.env.DATABASE_URL) {
+    return { dsn: process.env.DATABASE_URL, source: 'process_env' };
+  }
+  return { dsn: null, source: 'missing' };
+}
+
+function getMiniSitePool(dsn) {
+  if (!dsn) return null;
+  if (!miniSitePools.has(dsn)) {
+    miniSitePools.set(dsn, new Pool({ connectionString: dsn }));
+  }
+  return miniSitePools.get(dsn);
+}
+
+async function listMiniSiteTables(pool) {
+  const { rows } = await pool.query(
+    `
+      SELECT table_schema, table_name
+      FROM information_schema.tables
+      WHERE table_type = 'BASE TABLE'
+        AND table_schema NOT IN ('pg_catalog', 'information_schema')
+      ORDER BY table_schema, table_name;
+    `,
+  );
+  return rows;
+}
+
+async function fetchMiniSiteTableColumns(pool, schema, table) {
+  const { rows } = await pool.query(
+    `
+      SELECT column_name, data_type
+      FROM information_schema.columns
+      WHERE table_schema = $1 AND table_name = $2
+      ORDER BY ordinal_position;
+    `,
+    [schema, table],
+  );
+  return rows;
+}
+
+async function fetchMiniSitePrimaryKeys(pool, schema, table) {
+  const qualified = `${quoteIdentifier(schema)}.${quoteIdentifier(table)}`;
+  const { rows } = await pool.query(
+    `
+      SELECT a.attname
+      FROM pg_index i
+      JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+      WHERE i.indrelid = $1::regclass AND i.indisprimary;
+    `,
+    [qualified],
+  );
+  return rows.map((row) => row.attname);
+}
+
+function encodeMiniSiteRowKey(keyData) {
+  return Buffer.from(JSON.stringify(keyData)).toString('base64url');
+}
+
+function decodeMiniSiteRowKey(encoded) {
+  try {
+    const raw = Buffer.from(encoded, 'base64url').toString('utf8');
+    return JSON.parse(raw);
+  } catch (error) {
+    return null;
+  }
+}
+
+function isMiniSiteAuthed(req) {
+  if (!MINI_SITE_TOKEN) return false;
+  const cookies = parseCookies(req);
+  return cookies.pm_db_token === MINI_SITE_TOKEN;
+}
+
+function isMiniSiteEditAuthed(req) {
+  if (!MINI_SITE_TOKEN) return false;
+  const cookies = parseCookies(req);
+  return cookies.pm_db_edit_token === MINI_SITE_TOKEN;
+}
+
+function renderMiniSiteLogin(message) {
+  const body = `
+    <div class="card">
+      <h3>🔐 Mini-site access</h3>
+      <p class="muted">${escapeHtml(message || 'Enter the access token to continue.')}</p>
+      <form method="POST" action="/db-mini/login">
+        <div class="form-row">
+          <input type="password" name="token" placeholder="Access token" required />
+        </div>
+        <button class="button" type="submit">Unlock</button>
+      </form>
+    </div>
+  `;
+  return renderMiniSiteLayout('Login required', body);
+}
+
+function renderMiniSiteEditLogin(redirectPath) {
+  const body = `
+    <div class="card">
+      <h3>🔐 Confirm edit access</h3>
+      <p class="muted">Re-enter the token to open the editor.</p>
+      <form method="POST" action="/db-mini/edit-login">
+        <input type="hidden" name="redirect" value="${escapeHtml(redirectPath)}" />
+        <div class="form-row">
+          <input type="password" name="token" placeholder="Access token" required />
+        </div>
+        <button class="button" type="submit">Continue</button>
+      </form>
+    </div>
+  `;
+  return renderMiniSiteLayout('Edit confirmation', body);
+}
+
 async function runEnvVaultQuery(projectId, envSetId, sql) {
   const connection = await resolveEnvVaultConnection(projectId, envSetId);
   if (!connection.dsn) {
@@ -9890,14 +10709,28 @@ async function handleProjectCronJobAction(ctx, projectId, type) {
 }
 
 async function promptProjectCronSchedule(ctx, projectId, type, recreate) {
+  if (type === 'keepalive') {
+    clearUserState(ctx.from.id);
+    const inline = new InlineKeyboard()
+      .text('⏱️ every 1m', `projcron:keepalive_preset:${projectId}:1m:${recreate ? '1' : '0'}`)
+      .row()
+      .text('⏱️ every 5m', `projcron:keepalive_preset:${projectId}:5m:${recreate ? '1' : '0'}`)
+      .row()
+      .text('⏱️ every 10m', `projcron:keepalive_preset:${projectId}:10m:${recreate ? '1' : '0'}`)
+      .row()
+      .text('⏱️ every 30m', `projcron:keepalive_preset:${projectId}:30m:${recreate ? '1' : '0'}`)
+      .row()
+      .text('⏱️ every 1h', `projcron:keepalive_preset:${projectId}:1h:${recreate ? '1' : '0'}`)
+      .row()
+      .text('✍️ Custom schedule', `projcron:keepalive_custom:${projectId}:${recreate ? '1' : '0'}`)
+      .row()
+      .text('⬅️ Back', `projcron:menu:${projectId}`);
+    await renderOrEdit(ctx, 'Choose a keep-alive schedule:', { reply_markup: inline });
+    return;
+  }
+
   setUserState(ctx.from.id, {
-    type: recreate
-      ? type === 'keepalive'
-        ? 'projcron_keepalive_recreate'
-        : 'projcron_deploy_recreate'
-      : type === 'keepalive'
-        ? 'projcron_keepalive_schedule'
-        : 'projcron_deploy_schedule',
+    type: recreate ? 'projcron_deploy_recreate' : 'projcron_deploy_schedule',
     projectId,
     backCallback: `projcron:menu:${projectId}`,
   });
@@ -10207,29 +11040,31 @@ async function buildDataCenterView(ctx) {
     cards.push({ project, info });
   }
 
-  const configuredCards = cards.filter((card) => card.info.ready);
-  if (!configuredCards.length) {
-    lines.push('No databases configured.');
+  if (!cards.length) {
+    lines.push('No projects configured yet.');
     inline.text('Configure per-project DB', 'proj:list').row();
   } else {
     cards.forEach(({ project, info }, index) => {
       const name = project.name || project.id;
       lines.push(
         `📦 ${name} (🆔 ${project.id})`,
-        `- DB type: ${info.dbType}`,
-        `- Source: ${info.source}`,
-        `- Key: ${info.keyName} (${info.status})`,
+        `DB type: ${info.dbType}`,
+        `Source: ${info.source}`,
+        `Key: ${info.keyName} (${info.status})`,
       );
+      inline.text(`📦 ${name} (🆔 ${project.id})`, `proj:open:${project.id}`).row();
+      inline
+        .text('🌐 Open mini-site', `proj:db_mini:${project.id}`)
+        .row()
+        .text('🛠️ Edit DB config', `proj:db_config:${project.id}`)
+        .row()
+        .text('📊 Run DB overview', `proj:db_insights:${project.id}:0:0`)
+        .row()
+        .text('🧾 SQL runner', `proj:sql_menu:${project.id}`)
+        .row();
       if (index < cards.length - 1) {
         lines.push('');
       }
-      inline
-        .text('Open mini-site', `proj:db_mini:${project.id}`)
-        .text('Edit DB config', `proj:db_config:${project.id}`)
-        .row()
-        .text('Run DB overview', `proj:db_insights:${project.id}:0:0`)
-        .text('SQL runner', `proj:sql_menu:${project.id}`)
-        .row();
     });
   }
 
@@ -11240,6 +12075,45 @@ async function updateProjectField(projectId, field, value) {
   return true;
 }
 
+async function migrateProjectId(oldProjectId, newProjectId) {
+  const projects = await loadProjects();
+  const idx = projects.findIndex((p) => p.id === oldProjectId);
+  if (idx === -1) {
+    throw new Error('Project not found.');
+  }
+  if (projects.some((p) => p.id === newProjectId)) {
+    throw new Error('Project ID already exists.');
+  }
+
+  const rollback = [];
+  try {
+    await renameEnvVaultProjectId(oldProjectId, newProjectId);
+    rollback.push(() => renameEnvVaultProjectId(newProjectId, oldProjectId));
+    await renameCronJobLinkProjectId(oldProjectId, newProjectId);
+    rollback.push(() => renameCronJobLinkProjectId(newProjectId, oldProjectId));
+    await renameLogIngestProjectId(oldProjectId, newProjectId);
+    rollback.push(() => renameLogIngestProjectId(newProjectId, oldProjectId));
+    await renameTelegramBotProjectId(oldProjectId, newProjectId);
+    rollback.push(() => renameTelegramBotProjectId(newProjectId, oldProjectId));
+  } catch (error) {
+    await Promise.allSettled(rollback.map((fn) => fn()));
+    throw error;
+  }
+
+  projects[idx] = { ...projects[idx], id: newProjectId };
+  await saveProjects(projects);
+  const settings = await loadGlobalSettings();
+  if (settings.defaultProjectId === oldProjectId) {
+    settings.defaultProjectId = newProjectId;
+    await saveGlobalSettings(settings);
+  }
+  if (envScanCache.has(oldProjectId)) {
+    envScanCache.set(newProjectId, envScanCache.get(oldProjectId));
+    envScanCache.delete(oldProjectId);
+  }
+  return projects[idx];
+}
+
 async function clearProjectCommands(projectId) {
   const projects = await loadProjects();
   const idx = projects.findIndex((p) => p.id === projectId);
@@ -11490,6 +12364,358 @@ async function initEnvVault() {
   throw new Error(`Startup aborted: ${reason}`);
 }
 
+async function handleMiniSiteRequest(req, res, url) {
+  if (!url.pathname.startsWith('/db-mini')) {
+    return false;
+  }
+  if (!MINI_SITE_TOKEN) {
+    res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end('DB mini-site token is not configured.');
+    return true;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/db-mini/login') {
+    const body = await readRequestBody(req);
+    const form = parseFormBody(body);
+    if (form.token !== MINI_SITE_TOKEN) {
+      res.writeHead(403, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(renderMiniSiteLogin('Invalid token. Try again.'));
+      return true;
+    }
+    res.writeHead(302, {
+      Location: '/db-mini',
+      'Set-Cookie': `pm_db_token=${encodeURIComponent(MINI_SITE_TOKEN)}; HttpOnly; Path=/; SameSite=Strict`,
+    });
+    res.end();
+    return true;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/db-mini/edit-login') {
+    const body = await readRequestBody(req);
+    const form = parseFormBody(body);
+    if (form.token !== MINI_SITE_TOKEN) {
+      res.writeHead(403, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(renderMiniSiteEditLogin(form.redirect || '/db-mini'));
+      return true;
+    }
+    res.writeHead(302, {
+      Location: form.redirect || '/db-mini',
+      'Set-Cookie': `pm_db_edit_token=${encodeURIComponent(MINI_SITE_TOKEN)}; HttpOnly; Path=/; Max-Age=${MINI_SITE_EDIT_TOKEN_TTL_SEC}; SameSite=Strict`,
+    });
+    res.end();
+    return true;
+  }
+
+  if (!isMiniSiteAuthed(req)) {
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(renderMiniSiteLogin());
+    return true;
+  }
+
+  const pathParts = url.pathname.split('/').filter(Boolean);
+  const projectId = pathParts[1] ? decodeURIComponent(pathParts[1]) : null;
+
+  if (req.method === 'GET' && pathParts.length === 1) {
+    const projects = await loadProjects();
+    const cards = projects
+      .map((project) => {
+        const label = escapeHtml(project.name || project.id);
+        return `
+          <div class="card">
+            <h3>${label}</h3>
+            <p class="muted">ID: ${escapeHtml(project.id)}</p>
+            <a class="button" href="/db-mini/${encodeURIComponent(project.id)}">Open project</a>
+          </div>
+        `;
+      })
+      .join('');
+    const body = cards || '<p class="muted">No projects configured yet.</p>';
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(renderMiniSiteLayout('Project list', body));
+    return true;
+  }
+
+  const project = projectId ? await getProjectById(projectId) : null;
+  if (!project) {
+    res.writeHead(404, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(renderMiniSiteLayout('Project not found', '<p>Unknown project.</p>'));
+    return true;
+  }
+
+  const connection = await resolveMiniSiteDbConnection(project);
+  if (!connection.dsn) {
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(
+      renderMiniSiteLayout(
+        'Database not configured',
+        `<div class="card"><p>Database connection missing for this project.</p><p class="muted">Source: ${escapeHtml(connection.source || '-')}</p></div>`,
+      ),
+    );
+    return true;
+  }
+  const pool = getMiniSitePool(connection.dsn);
+  if (!pool) {
+    res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end('Failed to connect to database.');
+    return true;
+  }
+
+  if (req.method === 'GET' && pathParts.length === 2) {
+    const tables = await listMiniSiteTables(pool);
+    const body = `
+      <div class="card">
+        <h3>${escapeHtml(project.name || project.id)}</h3>
+        <p class="muted">Source: ${escapeHtml(connection.source || '-')}</p>
+        <p>Tables: <span class="pill">${tables.length}</span></p>
+        <div class="row-actions">
+          <a class="button" href="/db-mini/${encodeURIComponent(project.id)}/tables">View tables</a>
+        </div>
+      </div>
+    `;
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(renderMiniSiteLayout(`Project ${project.id}`, body));
+    return true;
+  }
+
+  if (req.method === 'GET' && pathParts.length === 3 && pathParts[2] === 'tables') {
+    const tables = await listMiniSiteTables(pool);
+    const items = tables
+      .map(
+        (table) => `
+          <tr>
+            <td>${escapeHtml(table.table_schema)}</td>
+            <td>${escapeHtml(table.table_name)}</td>
+            <td><a href="/db-mini/${encodeURIComponent(project.id)}/table/${encodeURIComponent(
+              table.table_schema,
+            )}/${encodeURIComponent(table.table_name)}">Browse</a></td>
+          </tr>
+        `,
+      )
+      .join('');
+    const body = `
+      <div class="card">
+        <h3>Tables (${tables.length})</h3>
+        <table>
+          <thead><tr><th>Schema</th><th>Table</th><th></th></tr></thead>
+          <tbody>${items}</tbody>
+        </table>
+        <p><a href="/db-mini/${encodeURIComponent(project.id)}">⬅ Back</a></p>
+      </div>
+    `;
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(renderMiniSiteLayout('Tables', body));
+    return true;
+  }
+
+  if (req.method === 'GET' && pathParts.length === 5 && pathParts[2] === 'table') {
+    const schema = decodeURIComponent(pathParts[3]);
+    const table = decodeURIComponent(pathParts[4]);
+    const page = Math.max(0, Number(url.searchParams.get('page') || 0));
+    const offset = page * MINI_SITE_PAGE_SIZE;
+    const columns = await fetchMiniSiteTableColumns(pool, schema, table);
+    const primaryKeys = await fetchMiniSitePrimaryKeys(pool, schema, table);
+    const orderBy = primaryKeys.length
+      ? `ORDER BY ${primaryKeys.map((key) => quoteIdentifier(key)).join(', ')}`
+      : '';
+    const { rows } = await pool.query(
+      `SELECT ctid, * FROM ${quoteIdentifier(schema)}.${quoteIdentifier(table)} ${orderBy} LIMIT $1 OFFSET $2`,
+      [MINI_SITE_PAGE_SIZE + 1, offset],
+    );
+    const hasNext = rows.length > MINI_SITE_PAGE_SIZE;
+    const pageRows = rows.slice(0, MINI_SITE_PAGE_SIZE);
+    const headerCells = columns.map((col) => `<th>${escapeHtml(col.column_name)}</th>`).join('');
+    const bodyRows = pageRows
+      .map((row) => {
+        const keyPayload = primaryKeys.length
+          ? { mode: 'pk', values: primaryKeys.reduce((acc, key) => ({ ...acc, [key]: row[key] }), {}) }
+          : { mode: 'ctid', values: { ctid: row.ctid } };
+        const encoded = encodeMiniSiteRowKey(keyPayload);
+        const cells = columns
+          .map((col) => `<td>${escapeHtml(row[col.column_name])}</td>`)
+          .join('');
+        return `
+          <tr>
+            ${cells}
+            <td><a href="/db-mini/${encodeURIComponent(project.id)}/table/${encodeURIComponent(
+              schema,
+            )}/${encodeURIComponent(table)}/row/${encoded}">View</a></td>
+          </tr>
+        `;
+      })
+      .join('');
+    const pager = `
+      <div class="row-actions">
+        ${page > 0 ? `<a class="button" href="?page=${page - 1}">⬅ Prev</a>` : ''}
+        ${hasNext ? `<a class="button" href="?page=${page + 1}">Next ➡</a>` : ''}
+      </div>
+    `;
+    const body = `
+      <div class="card">
+        <h3>${escapeHtml(schema)}.${escapeHtml(table)}</h3>
+        <p class="muted">Page ${page + 1}</p>
+        <table>
+          <thead><tr>${headerCells}<th></th></tr></thead>
+          <tbody>${bodyRows || '<tr><td colspan="99" class="muted">(no rows)</td></tr>'}</tbody>
+        </table>
+        ${pager}
+        <p><a href="/db-mini/${encodeURIComponent(project.id)}/tables">⬅ Back to tables</a></p>
+      </div>
+    `;
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(renderMiniSiteLayout(`${schema}.${table}`, body));
+    return true;
+  }
+
+  if (pathParts.length === 7 && pathParts[2] === 'table' && pathParts[5] === 'row') {
+    const schema = decodeURIComponent(pathParts[3]);
+    const table = decodeURIComponent(pathParts[4]);
+    const keyData = decodeMiniSiteRowKey(pathParts[6]);
+    if (!keyData) {
+      res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end('Invalid row key.');
+      return true;
+    }
+    const columns = await fetchMiniSiteTableColumns(pool, schema, table);
+    const primaryKeys = await fetchMiniSitePrimaryKeys(pool, schema, table);
+    let row = null;
+    if (keyData.mode === 'pk') {
+      const whereParts = primaryKeys.map((key, index) => `${quoteIdentifier(key)} = $${index + 1}`);
+      const values = primaryKeys.map((key) => keyData.values?.[key]);
+      const { rows } = await pool.query(
+        `SELECT * FROM ${quoteIdentifier(schema)}.${quoteIdentifier(table)} WHERE ${whereParts.join(' AND ')} LIMIT 1`,
+        values,
+      );
+      row = rows[0] || null;
+    } else if (keyData.mode === 'ctid') {
+      const { rows } = await pool.query(
+        `SELECT ctid, * FROM ${quoteIdentifier(schema)}.${quoteIdentifier(table)} WHERE ctid = $1 LIMIT 1`,
+        [keyData.values?.ctid],
+      );
+      row = rows[0] || null;
+    }
+    if (!row) {
+      res.writeHead(404, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(renderMiniSiteLayout('Row not found', '<p>Row not found.</p>'));
+      return true;
+    }
+
+    const editMode = url.searchParams.get('edit') === '1';
+    if (editMode && !isMiniSiteEditAuthed(req)) {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(renderMiniSiteEditLogin(url.pathname + url.search));
+      return true;
+    }
+
+    const rowsHtml = columns
+      .map((col) => `<tr><th>${escapeHtml(col.column_name)}</th><td>${escapeHtml(row[col.column_name])}</td></tr>`)
+      .join('');
+    const editToggle = `<a class="button" href="${url.pathname}?edit=1">Enable edit mode</a>`;
+    let editForm = '';
+    if (editMode) {
+      if (!primaryKeys.length) {
+        editForm = '<p class="muted">Editing disabled: no primary key detected.</p>';
+      } else {
+        const inputs = columns
+          .filter((col) => !primaryKeys.includes(col.column_name))
+          .map(
+            (col) => `
+              <div class="form-row">
+                <label>${escapeHtml(col.column_name)}</label>
+                <input name="${escapeHtml(col.column_name)}" value="${escapeHtml(row[col.column_name] ?? '')}" />
+              </div>
+            `,
+          )
+          .join('');
+        editForm = `
+          <div class="card">
+            <h4>✏️ Edit row</h4>
+            <form method="POST" action="${url.pathname}/edit">
+              ${inputs}
+              <div class="form-row">
+                <input name="confirm" placeholder="Type CONFIRM to save" required />
+              </div>
+              <button class="button" type="submit">Save changes</button>
+            </form>
+          </div>
+        `;
+      }
+    }
+    const body = `
+      <div class="card">
+        <h3>Row detail</h3>
+        <table>${rowsHtml}</table>
+        <div class="row-actions">
+          ${editToggle}
+          <a href="/db-mini/${encodeURIComponent(project.id)}/table/${encodeURIComponent(
+            schema,
+          )}/${encodeURIComponent(table)}">⬅ Back</a>
+        </div>
+      </div>
+      ${editForm}
+    `;
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(renderMiniSiteLayout(`Row ${schema}.${table}`, body));
+    return true;
+  }
+
+  if (req.method === 'POST' && pathParts.length === 8 && pathParts[2] === 'table' && pathParts[5] === 'row' && pathParts[7] === 'edit') {
+    if (!isMiniSiteEditAuthed(req)) {
+      res.writeHead(403, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(renderMiniSiteEditLogin(url.pathname.replace(/\/edit$/, '')));
+      return true;
+    }
+    const schema = decodeURIComponent(pathParts[3]);
+    const table = decodeURIComponent(pathParts[4]);
+    const keyData = decodeMiniSiteRowKey(pathParts[6]);
+    if (!keyData || keyData.mode !== 'pk') {
+      res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end('Row editing requires a primary key.');
+      return true;
+    }
+    const primaryKeys = await fetchMiniSitePrimaryKeys(pool, schema, table);
+    if (!primaryKeys.length) {
+      res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end('Row editing requires a primary key.');
+      return true;
+    }
+    const body = await readRequestBody(req);
+    const form = parseFormBody(body);
+    if (form.confirm !== 'CONFIRM') {
+      res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end('Confirmation missing. Type CONFIRM to save.');
+      return true;
+    }
+    const columns = await fetchMiniSiteTableColumns(pool, schema, table);
+    const editableCols = columns.map((col) => col.column_name).filter((col) => !primaryKeys.includes(col));
+    const updates = [];
+    const values = [];
+    editableCols.forEach((col) => {
+      if (Object.prototype.hasOwnProperty.call(form, col)) {
+        values.push(form[col]);
+        updates.push(`${quoteIdentifier(col)} = $${values.length}`);
+      }
+    });
+    if (!updates.length) {
+      res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end('No editable fields provided.');
+      return true;
+    }
+    const whereParts = primaryKeys.map((key, index) => `${quoteIdentifier(key)} = $${values.length + index + 1}`);
+    const whereValues = primaryKeys.map((key) => keyData.values?.[key]);
+    await pool.query(
+      `UPDATE ${quoteIdentifier(schema)}.${quoteIdentifier(table)} SET ${updates.join(', ')} WHERE ${whereParts.join(' AND ')}`,
+      [...values, ...whereValues],
+    );
+    res.writeHead(302, { Location: url.pathname.replace(/\/edit$/, '') + '?edit=1' });
+    res.end();
+    return true;
+  }
+
+  res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+  res.end('Not found');
+  return true;
+}
+
 function startHttpServer() {
   if (httpServerPromise) {
     return httpServerPromise;
@@ -11497,6 +12723,9 @@ function startHttpServer() {
   httpServerPromise = new Promise((resolve, reject) => {
     const server = http.createServer(async (req, res) => {
       const url = new URL(req.url, `http://${req.headers.host}`);
+      if (await handleMiniSiteRequest(req, res, url)) {
+        return;
+      }
       if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/healthz')) {
         const payload = {
           ok: true,

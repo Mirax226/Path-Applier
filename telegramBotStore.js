@@ -212,6 +212,34 @@ async function getTelegramBotToken(projectId) {
   return decryptSecret(record.botTokenEnc);
 }
 
+async function renameTelegramBotProjectId(oldProjectId, newProjectId) {
+  const db = await getDb();
+  if (!db) {
+    const existingIndex = memory.bots.findIndex((bot) => bot.projectId === oldProjectId);
+    if (existingIndex !== -1) {
+      memory.bots[existingIndex] = {
+        ...memory.bots[existingIndex],
+        projectId: newProjectId,
+      };
+    }
+    return true;
+  }
+  try {
+    await db.query('UPDATE project_telegram_bots SET project_id = $1 WHERE project_id = $2', [
+      newProjectId,
+      oldProjectId,
+    ]);
+    return true;
+  } catch (error) {
+    console.error('[telegramBotStore] Failed to rename project telegram bot', error);
+    await forwardSelfLog('error', 'Failed to rename telegram bot projectId', {
+      stack: error?.stack,
+      context: { error: error?.message, oldProjectId, newProjectId },
+    });
+    throw error;
+  }
+}
+
 module.exports = {
   getProjectTelegramBot,
   getTelegramBotToken,
@@ -219,4 +247,5 @@ module.exports = {
   clearTelegramBotToken,
   updateTelegramWebhook,
   updateTelegramTestStatus,
+  renameTelegramBotProjectId,
 };

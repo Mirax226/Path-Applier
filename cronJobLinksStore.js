@@ -108,9 +108,34 @@ async function deleteCronJobLink(cronJobId) {
   return result.rowCount > 0;
 }
 
+async function renameCronJobLinkProjectId(oldProjectId, newProjectId) {
+  const db = await getDb();
+  if (!db) {
+    memory.links = memory.links.map((link) =>
+      link.projectId === oldProjectId ? { ...link, projectId: newProjectId } : link,
+    );
+    return true;
+  }
+  try {
+    await db.query('UPDATE cron_job_links SET project_id = $1 WHERE project_id = $2', [
+      newProjectId,
+      oldProjectId,
+    ]);
+    return true;
+  } catch (error) {
+    console.error('[cronJobLinksStore] Failed to rename cron job link projectId', error);
+    await forwardSelfLog('error', 'Failed to rename cron job link projectId', {
+      stack: error?.stack,
+      context: { error: error?.message, oldProjectId, newProjectId },
+    });
+    throw error;
+  }
+}
+
 module.exports = {
   listCronJobLinks,
   getCronJobLink,
   upsertCronJobLink,
   deleteCronJobLink,
+  renameCronJobLinkProjectId,
 };
