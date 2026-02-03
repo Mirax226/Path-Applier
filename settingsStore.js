@@ -6,6 +6,66 @@ const { forwardSelfLog } = require('./logger');
 const SETTINGS_FILE = path.join(__dirname, 'globalSettings.json');
 const ENV_DEFAULT_BASE = process.env.DEFAULT_BASE_BRANCH || 'main';
 const DEFAULT_CRON_SETTINGS = { enabled: true, defaultTimezone: 'UTC' };
+const DEFAULT_GLOBAL_SETTINGS = {
+  defaultBaseBranch: ENV_DEFAULT_BASE,
+  defaultProjectId: undefined,
+  selfLogForwarding: { enabled: false, levels: ['error'], targetChatId: null },
+  uiCleanup: {
+    autoCleanMenus: true,
+    ephemeralTtlSec: 30,
+    keepLastPanels: 1,
+  },
+  security: {
+    adminIds: [],
+    miniSiteSessionTtlMinutes: 10,
+    envMaskPolicy: 'strict',
+  },
+  logs: {
+    defaultLevels: ['error'],
+    allowedProjectsMode: 'allow-all',
+  },
+  integrations: {
+    baseUrlOverride: '',
+    healthPingIntervalMinutes: 5,
+  },
+  backups: {
+    channelId: '',
+    captionTemplate:
+      'Project: {projectName} ({projectId})\\nNote: {title}\\nCategory: {category}\\nStatus: {status}\\nCreated: {createdAt}\\nNoteId: {noteId}',
+  },
+};
+
+function applySettingsDefaults(settings) {
+  const payload = settings && typeof settings === 'object' ? settings : {};
+  return {
+    ...DEFAULT_GLOBAL_SETTINGS,
+    ...payload,
+    selfLogForwarding: {
+      ...DEFAULT_GLOBAL_SETTINGS.selfLogForwarding,
+      ...(payload.selfLogForwarding || {}),
+    },
+    uiCleanup: {
+      ...DEFAULT_GLOBAL_SETTINGS.uiCleanup,
+      ...(payload.uiCleanup || {}),
+    },
+    security: {
+      ...DEFAULT_GLOBAL_SETTINGS.security,
+      ...(payload.security || {}),
+    },
+    logs: {
+      ...DEFAULT_GLOBAL_SETTINGS.logs,
+      ...(payload.logs || {}),
+    },
+    integrations: {
+      ...DEFAULT_GLOBAL_SETTINGS.integrations,
+      ...(payload.integrations || {}),
+    },
+    backups: {
+      ...DEFAULT_GLOBAL_SETTINGS.backups,
+      ...(payload.backups || {}),
+    },
+  };
+}
 
 async function ensureSettingsFile() {
   try {
@@ -22,32 +82,30 @@ async function ensureSettingsFile() {
 async function loadGlobalSettings() {
   const dbSettings = await configStore.loadGlobalSettings();
   if (dbSettings) {
-    if (!dbSettings.defaultBaseBranch) {
-      dbSettings.defaultBaseBranch = ENV_DEFAULT_BASE;
+    const hydrated = applySettingsDefaults(dbSettings);
+    if (JSON.stringify(hydrated) !== JSON.stringify(dbSettings)) {
+      await configStore.saveGlobalSettings(hydrated);
     }
-    return dbSettings;
+    return hydrated;
   }
 
   await ensureSettingsFile();
   try {
     const raw = await fs.readFile(SETTINGS_FILE, 'utf-8');
-    const parsed = JSON.parse(raw);
-    if (!parsed.defaultBaseBranch) {
-      parsed.defaultBaseBranch = ENV_DEFAULT_BASE;
-    }
+    const parsed = applySettingsDefaults(JSON.parse(raw));
     if (parsed && !dbSettings) {
       await configStore.saveGlobalSettings(parsed);
     }
     return parsed;
   } catch (error) {
     console.error('Failed to load globalSettings.json', error);
-    return { defaultBaseBranch: ENV_DEFAULT_BASE };
+    return applySettingsDefaults({});
   }
 }
 
 async function saveGlobalSettings(settings) {
   try {
-    const payload = { ...settings };
+    const payload = applySettingsDefaults(settings);
     await configStore.saveGlobalSettings(payload);
     await fs.writeFile(SETTINGS_FILE, JSON.stringify(payload, null, 2), 'utf-8');
   } catch (error) {

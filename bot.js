@@ -136,6 +136,15 @@ const {
 const { createLogIngestService, formatContext } = require('./logIngestService');
 const { createLogsRouter, parseAllowedProjects } = require('./src/routes/logs.ts');
 const {
+  listNotes,
+  getNote,
+  createNote,
+  updateNote,
+  addNoteAttachment,
+  removeNoteAttachment,
+  appendNoteBackup,
+} = require('./notesStore');
+const {
   CRON_API_TOKEN,
   listJobs,
   getJob,
@@ -170,6 +179,8 @@ const MINI_SITE_EDIT_SESSION_COOKIE = 'pm_db_edit_session';
 const MINI_SITE_SETTINGS_KEY = 'dbMiniSite';
 const MINI_SITE_PAGE_SIZE = 25;
 const MINI_SITE_EDIT_TOKEN_TTL_SEC = 300;
+const MINI_SITE_CONNECTION_TIMEOUT_MS = 5000;
+const MINI_SITE_QUERY_TIMEOUT_MS = 5000;
 const PROJECT_DB_SSL_DEFAULT_MODE = 'require';
 const PROJECT_DB_SSL_DEFAULT_VERIFY = true;
 const PROJECT_DB_SSL_MODES = new Set(['disable', 'require']);
@@ -189,6 +200,10 @@ const LOG_API_ENABLED = Boolean(LOG_API_TOKEN);
 const LOG_API_ALLOWED_PROJECTS = parseAllowedProjects(process.env.ALLOWED_PROJECTS);
 const LOG_API_ALLOWED_PROJECTS_MODE = LOG_API_ALLOWED_PROJECTS.size ? 'whitelist' : 'allow-all';
 const LOG_API_STATUS_LABEL = LOG_API_ENABLED ? 'ENABLED' : 'DISABLED';
+const NOTE_CATEGORIES = ['Bug', 'Feature', 'Deploy', 'DB', 'Idea', 'Security', 'Custom'];
+const NOTE_STATUS = { OPEN: 'OPEN', DONE: 'DONE' };
+const ENV_VALUE_PREVIEW_LIMIT = 160;
+const SPOILER_WRAP = (value) => `<span class="tg-spoiler">${value}</span>`;
 
 console.error(`[boot] PATH_APPLIER_TOKEN: ${LOG_API_ENABLED ? 'SET' : 'MISSING'}`);
 console.error(`[boot] Log API status: ${LOG_API_STATUS_LABEL}`);
@@ -225,10 +240,14 @@ const structuredPatchSessions = new Map();
 const envScanCache = new Map();
 const cronCreateRetryCache = new Map();
 const cronErrorDetailsCache = new Map();
-const lastMenuMessageByChat = new Map();
+const panelMessageHistoryByChat = new Map();
+const ephemeralMessageIdsByChat = new Map();
+const ephemeralTimersByChat = new Map();
 const webSessions = new Map();
 const webLoginAttempts = new Map();
 let httpServerPromise = null;
+let cachedSettings = null;
+let cachedSettingsAt = 0;
 
 configureSelfLogger({
   bot,
@@ -252,6 +271,7 @@ const logsRouter = createLogsRouter({
   token: LOG_API_TOKEN,
   adminChatId: LOG_API_ADMIN_CHAT_ID,
   allowedProjects: LOG_API_ALLOWED_PROJECTS,
+  getAllowedProjectsMode: () => cachedSettings?.logs?.allowedProjectsMode || LOG_API_ALLOWED_PROJECTS_MODE,
   logger: console,
   now: () => Date.now(),
   rateLimitPerMinute: 20,
@@ -269,6 +289,69 @@ function normalizeLogLevels(levels) {
   return levels.map((level) => normalizeLogLevel(level)).filter(Boolean);
 }
 
+async function getCachedSettings(force = false) {
+  const now = Date.now();
+  if (!force && cachedSettings && now - cachedSettingsAt < 30_000) {
+    return cachedSettings;
+  }
+  cachedSettings = await loadGlobalSettings();
+  cachedSettingsAt = now;
+  return cachedSettings;
+}
+
+async function saveGlobalSettingsAndCache(settings) {
+  await saveGlobalSettings(settings);
+  cachedSettings = settings;
+  cachedSettingsAt = Date.now();
+}
+
+function normalizeUiCleanupSettings(settings) {
+  const ui = settings?.uiCleanup || {};
+  const keepLastPanels = [1, 3, 5].includes(ui.keepLastPanels) ? ui.keepLastPanels : 1;
+  const ttlOptions = [0, 30, 60];
+  const ttl = ttlOptions.includes(ui.ephemeralTtlSec) ? ui.ephemeralTtlSec : 30;
+  return {
+    autoCleanMenus: ui.autoCleanMenus !== false,
+    keepLastPanels,
+    ephemeralTtlSec: ttl,
+  };
+}
+
+function normalizeSecuritySettings(settings) {
+  const security = settings?.security || {};
+  return {
+    adminIds: Array.isArray(security.adminIds) ? security.adminIds.map(String) : [],
+    miniSiteSessionTtlMinutes: Number(security.miniSiteSessionTtlMinutes) || MINI_SITE_SESSION_DEFAULT_TTL_MINUTES,
+    envMaskPolicy: security.envMaskPolicy || 'strict',
+  };
+}
+
+function normalizeBackupSettings(settings) {
+  const backups = settings?.backups || {};
+  return {
+    channelId: backups.channelId ? String(backups.channelId) : '',
+    captionTemplate: backups.captionTemplate || '',
+  };
+}
+
+function normalizeLogDefaults(settings) {
+  const logs = settings?.logs || {};
+  return {
+    defaultLevels: normalizeLogLevels(logs.defaultLevels).length
+      ? normalizeLogLevels(logs.defaultLevels)
+      : ['error'],
+    allowedProjectsMode: logs.allowedProjectsMode === 'whitelist' ? 'whitelist' : 'allow-all',
+  };
+}
+
+function normalizeIntegrationSettings(settings) {
+  const integrations = settings?.integrations || {};
+  return {
+    baseUrlOverride: integrations.baseUrlOverride || '',
+    healthPingIntervalMinutes: Number(integrations.healthPingIntervalMinutes) || 5,
+  };
+}
+
 function getLogApiHealthStatus() {
   if (LOG_API_ENABLED) {
     return { enabled: true };
@@ -278,12 +361,13 @@ function getLogApiHealthStatus() {
 
 function buildLogApiStatusText() {
   const status = getLogApiHealthStatus();
+  const allowedMode = cachedSettings?.logs?.allowedProjectsMode || LOG_API_ALLOWED_PROJECTS_MODE;
   const lines = ['📣 Log API status', `Status: ${status.enabled ? 'enabled' : 'disabled'}`];
   lines.push(`Token: ${LOG_API_ENABLED ? 'present' : 'missing'}`);
   if (!status.enabled) {
     lines.push(`Reason: ${status.reason}`);
   }
-  lines.push(`Allowed projects: ${LOG_API_ALLOWED_PROJECTS_MODE}`);
+  lines.push(`Allowed projects: ${allowedMode}`);
   return lines.join('\n');
 }
 
@@ -300,19 +384,27 @@ function getEffectiveProjectLogForwarding(project) {
 function normalizeProjectLogSettings(settings) {
   const payload = settings || {};
   const levels = normalizeLogLevels(payload.levels);
+  const mode = ['admin', 'channel', 'both'].includes(payload.destinationMode) ? payload.destinationMode : 'admin';
   return {
     enabled: typeof payload.enabled === 'boolean' ? payload.enabled : DEFAULT_LOG_ALERT_SETTINGS.enabled,
     levels: levels.length ? levels : [...DEFAULT_LOG_ALERT_SETTINGS.levels],
     destinationChatId: payload.destinationChatId ? String(payload.destinationChatId) : null,
+    destinationMode: mode,
   };
 }
 
 async function getProjectLogSettingsWithDefaults(projectId) {
   const settings = await getProjectLogSettings(projectId);
-  if (!settings) {
-    return { ...DEFAULT_LOG_ALERT_SETTINGS };
+  if (settings) {
+    return normalizeProjectLogSettings(settings);
   }
-  return normalizeProjectLogSettings(settings);
+  const globalSettings = await getCachedSettings();
+  const defaults = normalizeLogDefaults(globalSettings);
+  return {
+    ...DEFAULT_LOG_ALERT_SETTINGS,
+    levels: defaults.defaultLevels,
+    destinationMode: 'admin',
+  };
 }
 
 function getEffectiveSelfLogForwarding(settings) {
@@ -470,27 +562,7 @@ async function respond(ctx, text, extra) {
       console.error('[UI] editMessageText failed, fallback to reply', err);
     }
   }
-  const chatId = getChatIdFromCtx(ctx);
-  if (safeExtra?.reply_markup && chatId && lastMenuMessageByChat.has(chatId)) {
-    const messageId = lastMenuMessageByChat.get(chatId);
-    try {
-      await bot.api.editMessageText(chatId, messageId, text, safeExtra);
-      return { chat: { id: chatId }, message_id: messageId };
-    } catch (err) {
-      if (isMessageNotModifiedError(err)) {
-        return;
-      }
-      if (isButtonDataInvalidError(err)) {
-        await handleTelegramUiError(ctx, err);
-        return;
-      }
-      console.warn('[UI] editMessageText failed for sticky menu, fallback to reply', err?.message);
-    }
-  }
   const response = await replySafely(ctx, text, safeExtra);
-  if (response?.chat?.id && response?.message_id && safeExtra?.reply_markup) {
-    lastMenuMessageByChat.set(response.chat.id, response.message_id);
-  }
   return response;
 }
 
@@ -510,7 +582,147 @@ async function safeRespond(ctx, text, extra, context) {
   }
 }
 
+function getPanelHistory(chatId) {
+  if (!panelMessageHistoryByChat.has(chatId)) {
+    panelMessageHistoryByChat.set(chatId, []);
+  }
+  return panelMessageHistoryByChat.get(chatId);
+}
+
+async function deactivatePanelMessage(chatId, messageId, reason) {
+  if (!chatId || !messageId) return;
+  try {
+    await bot.api.editMessageReplyMarkup(chatId, messageId, {
+      reply_markup: { inline_keyboard: [] },
+    });
+  } catch (error) {
+    console.warn('[cleanup] Failed to deactivate panel', {
+      chatId,
+      messageId,
+      reason,
+      error: error?.message,
+    });
+  }
+}
+
+async function trackPanelMessage(chatId, messageId, settings) {
+  if (!chatId || !messageId) return;
+  const history = getPanelHistory(chatId);
+  const filtered = history.filter((entry) => entry !== messageId);
+  filtered.unshift(messageId);
+  panelMessageHistoryByChat.set(chatId, filtered);
+
+  await Promise.all(
+    filtered.slice(1).map((oldId) => deactivatePanelMessage(chatId, oldId, 'new_panel')),
+  );
+
+  if (!settings.autoCleanMenus) {
+    return;
+  }
+  const keep = settings.keepLastPanels || 1;
+  const toRemove = filtered.slice(keep);
+  await Promise.all(toRemove.map((oldId) => safeDeleteMessage(null, chatId, oldId, 'panel_limit')));
+  panelMessageHistoryByChat.set(chatId, filtered.slice(0, keep));
+}
+
+async function clearPanelMessages(ctx, reason) {
+  const chatId = getChatIdFromCtx(ctx);
+  if (!chatId) return;
+  const history = getPanelHistory(chatId);
+  await Promise.all(history.map((messageId) => safeDeleteMessage(ctx, chatId, messageId, reason)));
+  panelMessageHistoryByChat.set(chatId, []);
+}
+
+function trackEphemeralMessage(chatId, messageId) {
+  if (!chatId || !messageId) return;
+  if (!ephemeralMessageIdsByChat.has(chatId)) {
+    ephemeralMessageIdsByChat.set(chatId, new Set());
+  }
+  ephemeralMessageIdsByChat.get(chatId).add(messageId);
+}
+
+function clearEphemeralTimer(chatId, messageId) {
+  const timers = ephemeralTimersByChat.get(chatId);
+  if (!timers) return;
+  const timer = timers.get(messageId);
+  if (timer) {
+    clearTimeout(timer);
+    timers.delete(messageId);
+  }
+}
+
+async function clearEphemeralMessages(ctx, reason) {
+  const chatId = getChatIdFromCtx(ctx);
+  if (!chatId) return;
+  const set = ephemeralMessageIdsByChat.get(chatId);
+  if (!set) return;
+  await Promise.all(
+    Array.from(set).map((messageId) => safeDeleteMessage(ctx, chatId, messageId, reason)),
+  );
+  set.forEach((messageId) => clearEphemeralTimer(chatId, messageId));
+  ephemeralMessageIdsByChat.set(chatId, new Set());
+}
+
+async function sendEphemeralMessage(ctx, text, extra) {
+  const settings = await getCachedSettings();
+  const cleanup = normalizeUiCleanupSettings(settings);
+  const response = await replySafely(ctx, text, extra);
+  if (response?.chat?.id && response?.message_id) {
+    const chatId = response.chat.id;
+    const messageId = response.message_id;
+    trackEphemeralMessage(chatId, messageId);
+    if (cleanup.ephemeralTtlSec > 0) {
+      if (!ephemeralTimersByChat.has(chatId)) {
+        ephemeralTimersByChat.set(chatId, new Map());
+      }
+      const timer = setTimeout(() => {
+        safeDeleteMessage(ctx, chatId, messageId, 'ephemeral_ttl');
+        const set = ephemeralMessageIdsByChat.get(chatId);
+        if (set) {
+          set.delete(messageId);
+        }
+        clearEphemeralTimer(chatId, messageId);
+      }, cleanup.ephemeralTtlSec * 1000);
+      ephemeralTimersByChat.get(chatId).set(messageId, timer);
+    }
+  }
+  return response;
+}
+
+async function renderPanel(ctx, text, extra) {
+  const safeExtra = normalizeTelegramExtra(extra);
+  const settings = await getCachedSettings();
+  const cleanup = normalizeUiCleanupSettings(settings);
+  let response = null;
+  if (ctx.callbackQuery?.message && ctx.editMessageText) {
+    try {
+      await ctx.editMessageText(text, safeExtra);
+      response = ctx.callbackQuery.message;
+    } catch (error) {
+      if (isMessageNotModifiedError(error)) {
+        await ensureAnswerCallback(ctx);
+        return;
+      }
+      if (isButtonDataInvalidError(error)) {
+        await handleTelegramUiError(ctx, error);
+        return;
+      }
+      console.warn('[UI] Failed to edit panel message, sending new.', error?.message);
+    }
+  }
+  if (!response) {
+    response = await replySafely(ctx, text, safeExtra);
+  }
+  if (response?.chat?.id && response?.message_id) {
+    await trackPanelMessage(response.chat.id, response.message_id, cleanup);
+  }
+  return response;
+}
+
 async function renderOrEdit(ctx, text, extra) {
+  if (extra?.reply_markup?.inline_keyboard) {
+    return renderPanel(ctx, text, extra);
+  }
   return respond(ctx, text, extra);
 }
 
@@ -645,6 +857,33 @@ function maskEnvValue(value) {
   const raw = String(value);
   if (raw.length <= 4) return '***';
   return `${raw.slice(0, 2)}***${raw.slice(-2)}`;
+}
+
+function isSensitiveEnvKey(key) {
+  if (!key) return false;
+  const normalized = String(key).toUpperCase();
+  if (normalized === 'DATABASE_URL') return true;
+  return ['_KEY', '_TOKEN', '_SECRET'].some((suffix) => normalized.endsWith(suffix));
+}
+
+function maskEnvValueForKey(key, value) {
+  const length = value != null ? String(value).length : 0;
+  return `•••• (${length} chars)`;
+}
+
+function formatEnvValueForDisplay(key, value, settings) {
+  const security = normalizeSecuritySettings(settings);
+  const raw = value == null ? '' : String(value);
+  const truncated = raw.length > ENV_VALUE_PREVIEW_LIMIT ? `${raw.slice(0, ENV_VALUE_PREVIEW_LIMIT - 1)}…` : raw;
+  if (isSensitiveEnvKey(key)) {
+    const masked = maskEnvValueForKey(key, raw);
+    return { text: SPOILER_WRAP(escapeHtml(masked)), length: raw.length };
+  }
+  if (security.envMaskPolicy === 'strict') {
+    const masked = maskEnvValue(raw);
+    return { text: SPOILER_WRAP(escapeHtml(masked)), length: raw.length };
+  }
+  return { text: SPOILER_WRAP(escapeHtml(truncated)), length: raw.length };
 }
 
 function evaluateEnvValueStatus(value) {
@@ -1001,7 +1240,26 @@ function appendChangeChunk(session, chunk, inputType) {
 }
 
 async function renderMainMenu(ctx) {
-  await renderOrEdit(ctx, '🧭 Main menu:', { reply_markup: mainKeyboard });
+  await clearPanelMessages(ctx, 'main_menu');
+  await clearEphemeralMessages(ctx, 'main_menu');
+  await replySafely(ctx, '🧭 Main menu:', { reply_markup: mainKeyboard });
+}
+
+async function resetToMainMenu(ctx, notice) {
+  resetUserState(ctx);
+  clearPatchSession(ctx.from?.id);
+  await clearPanelMessages(ctx, 'main_menu');
+  await clearEphemeralMessages(ctx, 'main_menu');
+  if (notice) {
+    await replySafely(ctx, notice);
+  }
+  await renderMainMenu(ctx);
+}
+
+async function handleReplyKeyboardNavigation(ctx, handler) {
+  resetUserState(ctx);
+  await clearPanelMessages(ctx, 'reply_keyboard_nav');
+  return handler();
 }
 
 function buildCancelKeyboard() {
@@ -1171,13 +1429,13 @@ async function handleGlobalCommand(ctx, command) {
   clearPatchSession(ctx.from.id);
   switch (command) {
     case '/start':
-      await renderMainMenu(ctx);
+      await resetToMainMenu(ctx);
       return true;
     case '/settings':
       await renderGlobalSettings(ctx);
       return true;
     case '/logs':
-      await ctx.reply(buildLogApiStatusText());
+      await renderLogsProjectList(ctx, '📣 Logs');
       return true;
     case '/projects':
       await renderProjectsList(ctx);
@@ -1195,7 +1453,10 @@ async function handleGlobalCommand(ctx, command) {
 
 bot.use(async (ctx, next) => {
   if (!ctx.from) return;
-  if (String(ctx.from.id) !== String(ADMIN_TELEGRAM_ID)) {
+  const settings = await getCachedSettings();
+  const security = normalizeSecuritySettings(settings);
+  const adminIds = new Set([String(ADMIN_TELEGRAM_ID), ...security.adminIds.map(String)]);
+  if (!adminIds.has(String(ctx.from.id))) {
     if (ctx.updateType === 'message' || ctx.updateType === 'callback_query') {
       await ctx.reply('Unauthorized');
     }
@@ -1295,34 +1556,27 @@ bot.on('message', async (ctx, next) => {
 });
 
 bot.command('start', async (ctx) => {
-  resetUserState(ctx);
-  clearPatchSession(ctx.from.id);
-  await renderMainMenu(ctx);
+  await resetToMainMenu(ctx);
 });
 
 bot.hears('📦 Projects', async (ctx) => {
-  resetUserState(ctx);
-  await renderProjectsList(ctx);
+  await handleReplyKeyboardNavigation(ctx, () => renderProjectsList(ctx));
 });
 
 bot.hears('🗄️ Database', async (ctx) => {
-  resetUserState(ctx);
-  await renderDataCenterMenu(ctx);
+  await handleReplyKeyboardNavigation(ctx, () => renderDataCenterMenu(ctx));
 });
 
 bot.hears('⚙️ Settings', async (ctx) => {
-  resetUserState(ctx);
-  await renderGlobalSettings(ctx);
+  await handleReplyKeyboardNavigation(ctx, () => renderGlobalSettings(ctx));
 });
 
 bot.hears('⏱️ Cronjobs', async (ctx) => {
-  resetUserState(ctx);
-  await renderCronMenu(ctx);
+  await handleReplyKeyboardNavigation(ctx, () => renderCronMenu(ctx));
 });
 
 bot.hears('📣 Logs', async (ctx) => {
-  resetUserState(ctx);
-  await renderGlobalSettings(ctx, '📣 Logs');
+  await handleReplyKeyboardNavigation(ctx, () => renderLogsProjectList(ctx));
 });
 
 bot.callbackQuery('cancel_input', wrapCallbackHandler(async (ctx) => {
@@ -1492,6 +1746,18 @@ bot.on('callback_query:data', wrapCallbackHandler(async (ctx) => {
     await handleProjectLogCallback(ctx, data);
     return;
   }
+  if (data.startsWith('dbmenu:')) {
+    await handleDatabaseMenuCallback(ctx, data);
+    return;
+  }
+  if (data.startsWith('logmenu:')) {
+    await handleLogsMenuCallback(ctx, data);
+    return;
+  }
+  if (data.startsWith('notes:')) {
+    await handleNotesCallback(ctx, data);
+    return;
+  }
   if (data.startsWith('projwiz:')) {
     await handleProjectWizardCallback(ctx, data);
     return;
@@ -1568,6 +1834,18 @@ async function handleStatefulMessage(ctx, state) {
     case 'global_change_base':
       await handleGlobalBaseChange(ctx, state);
       break;
+    case 'gsettings_admin_add':
+      await handleAdminAddInput(ctx, state);
+      break;
+    case 'gsettings_base_url':
+      await handleBaseUrlInput(ctx, state);
+      break;
+    case 'gsettings_backup_channel':
+      await handleBackupChannelInput(ctx, state);
+      break;
+    case 'gsettings_backup_caption':
+      await handleBackupCaptionInput(ctx, state);
+      break;
     case 'supabase_console':
       await handleSupabaseConsoleMessage(ctx, state);
       break;
@@ -1619,6 +1897,18 @@ async function handleStatefulMessage(ctx, state) {
     case 'proj_log_chat_input':
       await handleProjectLogChatInput(ctx, state);
       break;
+    case 'note_create':
+      await handleNoteCreateInput(ctx, state);
+      break;
+    case 'note_edit_field':
+      await handleNoteEditInput(ctx, state);
+      break;
+    case 'note_search':
+      await handleNoteSearchInput(ctx, state);
+      break;
+    case 'note_add_attachment':
+      await handleNoteAttachmentInput(ctx, state);
+      break;
     case 'structured_fix_block':
       await handleStructuredFixBlockInput(ctx, state);
       break;
@@ -1667,7 +1957,7 @@ async function handleMainCallback(ctx, data) {
   await ensureAnswerCallback(ctx);
   const [, action] = data.split(':');
   if (action === 'back') {
-    await renderMainMenu(ctx);
+    await resetToMainMenu(ctx);
   }
 }
 
@@ -2046,9 +2336,12 @@ async function handleProjectLogCallback(ctx, data) {
   const parts = data.split(':');
   const action = parts[1];
   const level = action === 'level' ? parts[2] : null;
-  const projectId = action === 'level' ? parts[3] : parts[2];
-  const page = action === 'logs' ? Number(parts[3] || 0) : Number(parts[4] || 0);
-  const logId = action === 'log' ? parts[3] : null;
+  const mode = action === 'dest_mode' ? parts[2] : null;
+  const projectId =
+    action === 'level' || action === 'dest_mode'
+      ? parts[3]
+      : parts[2];
+  const page = action === 'recent' ? Number(parts[3] || 0) : 0;
 
   if (!projectId) {
     await renderOrEdit(ctx, 'Project not found.');
@@ -2085,6 +2378,11 @@ async function handleProjectLogCallback(ctx, data) {
     }
   }
 
+  if (action === 'levels') {
+    await renderProjectLogLevelsMenu(ctx, projectId);
+    return;
+  }
+
   if (action === 'level') {
     const normalized = normalizeLogLevel(level);
     if (normalized) {
@@ -2098,7 +2396,22 @@ async function handleProjectLogCallback(ctx, data) {
       if (current.enabled && updated.levels.length === 0) {
         updated.levels = ['error'];
       }
+      await upsertProjectLogSettings(projectId, updated);
     }
+    await renderProjectLogLevelsMenu(ctx, projectId);
+    return;
+  }
+
+  if (action === 'dest') {
+    await renderProjectLogDestinationMenu(ctx, projectId);
+    return;
+  }
+
+  if (action === 'dest_mode') {
+    updated.destinationMode = ['admin', 'channel', 'both'].includes(mode) ? mode : 'admin';
+    await upsertProjectLogSettings(projectId, updated);
+    await renderProjectLogDestinationMenu(ctx, projectId);
+    return;
   }
 
   if (action === 'set_chat') {
@@ -2120,19 +2433,25 @@ async function handleProjectLogCallback(ctx, data) {
       return;
     }
     updated.destinationChatId = String(chatId);
+    await upsertProjectLogSettings(projectId, updated);
+    await renderProjectLogDestinationMenu(ctx, projectId);
+    return;
   }
 
   if (action === 'clear_chat') {
     updated.destinationChatId = null;
+    await upsertProjectLogSettings(projectId, updated);
+    await renderProjectLogDestinationMenu(ctx, projectId);
+    return;
   }
 
-  if (action === 'logs') {
+  if (action === 'recent') {
     await renderProjectLogList(ctx, projectId, Number.isNaN(page) ? 0 : page);
     return;
   }
 
-  if (action === 'log') {
-    await renderProjectLogDetail(ctx, projectId, logId, Number.isNaN(page) ? 0 : page);
+  if (action === 'test') {
+    await sendProjectLogTest(ctx, projectId);
     return;
   }
 
@@ -2145,6 +2464,227 @@ async function handleGlobalSettingsCallback(ctx, data) {
   const parts = data.split(':');
   const action = parts[1];
   switch (action) {
+    case 'ui': {
+      const settings = await getCachedSettings();
+      const view = buildUiCleanupSettingsView(settings);
+      await renderOrEdit(ctx, view.text, { reply_markup: view.keyboard });
+      break;
+    }
+    case 'ui_toggle': {
+      const settings = await getCachedSettings();
+      const ui = normalizeUiCleanupSettings(settings);
+      const updated = {
+        ...settings,
+        uiCleanup: { ...settings.uiCleanup, autoCleanMenus: !ui.autoCleanMenus },
+      };
+      await saveGlobalSettingsAndCache(updated);
+      const view = buildUiCleanupSettingsView(updated);
+      await renderOrEdit(ctx, view.text, { reply_markup: view.keyboard });
+      break;
+    }
+    case 'ui_ttl': {
+      const ttl = Number(parts[2]);
+      const settings = await getCachedSettings();
+      const updated = {
+        ...settings,
+        uiCleanup: { ...settings.uiCleanup, ephemeralTtlSec: [0, 30, 60].includes(ttl) ? ttl : 30 },
+      };
+      await saveGlobalSettingsAndCache(updated);
+      const view = buildUiCleanupSettingsView(updated);
+      await renderOrEdit(ctx, view.text, { reply_markup: view.keyboard });
+      break;
+    }
+    case 'ui_keep': {
+      const keep = Number(parts[2]);
+      const settings = await getCachedSettings();
+      const updated = {
+        ...settings,
+        uiCleanup: { ...settings.uiCleanup, keepLastPanels: [1, 3, 5].includes(keep) ? keep : 1 },
+      };
+      await saveGlobalSettingsAndCache(updated);
+      const view = buildUiCleanupSettingsView(updated);
+      await renderOrEdit(ctx, view.text, { reply_markup: view.keyboard });
+      break;
+    }
+    case 'security': {
+      const settings = await getCachedSettings();
+      const view = buildSecuritySettingsView(settings);
+      await renderOrEdit(ctx, view.text, { reply_markup: view.keyboard });
+      break;
+    }
+    case 'admins': {
+      const settings = await getCachedSettings();
+      const view = buildAdminListView(settings);
+      await renderOrEdit(ctx, view.text, { reply_markup: view.keyboard });
+      break;
+    }
+    case 'admin_add': {
+      setUserState(ctx.from.id, {
+        type: 'gsettings_admin_add',
+        messageContext: getMessageTargetFromCtx(ctx),
+        backCallback: 'gsettings:admins',
+      });
+      await renderOrEdit(ctx, '🪪 Send the Telegram user ID to add as admin.\n(Or press Cancel)', {
+        reply_markup: buildCancelKeyboard(),
+      });
+      break;
+    }
+    case 'admin_remove': {
+      const adminId = parts[2];
+      const settings = await getCachedSettings();
+      const security = normalizeSecuritySettings(settings);
+      const updated = {
+        ...settings,
+        security: {
+          ...settings.security,
+          adminIds: security.adminIds.filter((id) => id !== adminId),
+        },
+      };
+      await saveGlobalSettingsAndCache(updated);
+      const view = buildAdminListView(updated);
+      await renderOrEdit(ctx, view.text, { reply_markup: view.keyboard });
+      break;
+    }
+    case 'mini_ttl': {
+      const ttl = Number(parts[2]);
+      const settings = await getCachedSettings();
+      const updated = {
+        ...settings,
+        security: {
+          ...settings.security,
+          miniSiteSessionTtlMinutes: Number.isFinite(ttl) ? ttl : MINI_SITE_SESSION_DEFAULT_TTL_MINUTES,
+        },
+      };
+      await saveGlobalSettingsAndCache(updated);
+      const view = buildSecuritySettingsView(updated);
+      await renderOrEdit(ctx, view.text, { reply_markup: view.keyboard });
+      break;
+    }
+    case 'env_mask': {
+      const mode = parts[2] === 'spoiler' ? 'spoiler' : 'strict';
+      const settings = await getCachedSettings();
+      const updated = {
+        ...settings,
+        security: { ...settings.security, envMaskPolicy: mode },
+      };
+      await saveGlobalSettingsAndCache(updated);
+      const view = buildSecuritySettingsView(updated);
+      await renderOrEdit(ctx, view.text, { reply_markup: view.keyboard });
+      break;
+    }
+    case 'logs': {
+      const settings = await getCachedSettings();
+      const view = buildLogsSettingsView(settings);
+      await renderOrEdit(ctx, view.text, { reply_markup: view.keyboard });
+      break;
+    }
+    case 'log_default_level': {
+      const level = normalizeLogLevel(parts[2]);
+      if (!level) {
+        await renderOrEdit(ctx, 'Invalid log level.');
+        break;
+      }
+      const settings = await getCachedSettings();
+      const logsDefaults = normalizeLogDefaults(settings);
+      const levels = new Set(logsDefaults.defaultLevels);
+      if (levels.has(level)) {
+        levels.delete(level);
+      } else {
+        levels.add(level);
+      }
+      const updatedLevels = Array.from(levels).filter((entry) => LOG_LEVELS.includes(entry));
+      const updated = {
+        ...settings,
+        logs: { ...settings.logs, defaultLevels: updatedLevels.length ? updatedLevels : ['error'] },
+      };
+      await saveGlobalSettingsAndCache(updated);
+      const view = buildLogsSettingsView(updated);
+      await renderOrEdit(ctx, view.text, { reply_markup: view.keyboard });
+      break;
+    }
+    case 'log_allowed': {
+      const mode = parts[2] === 'whitelist' ? 'whitelist' : 'allow-all';
+      const settings = await getCachedSettings();
+      const updated = {
+        ...settings,
+        logs: { ...settings.logs, allowedProjectsMode: mode },
+      };
+      await saveGlobalSettingsAndCache(updated);
+      const view = buildLogsSettingsView(updated);
+      await renderOrEdit(ctx, view.text, { reply_markup: view.keyboard });
+      break;
+    }
+    case 'integrations': {
+      const settings = await getCachedSettings();
+      const view = buildIntegrationsSettingsView(settings);
+      await renderOrEdit(ctx, view.text, { reply_markup: view.keyboard });
+      break;
+    }
+    case 'base_url': {
+      setUserState(ctx.from.id, {
+        type: 'gsettings_base_url',
+        messageContext: getMessageTargetFromCtx(ctx),
+        backCallback: 'gsettings:integrations',
+      });
+      await renderOrEdit(ctx, '🌐 Send base URL override.\n(Or press Cancel)', {
+        reply_markup: buildCancelKeyboard(),
+      });
+      break;
+    }
+    case 'base_url_clear': {
+      const settings = await getCachedSettings();
+      const updated = {
+        ...settings,
+        integrations: { ...settings.integrations, baseUrlOverride: '' },
+      };
+      await saveGlobalSettingsAndCache(updated);
+      const view = buildIntegrationsSettingsView(updated);
+      await renderOrEdit(ctx, view.text, { reply_markup: view.keyboard });
+      break;
+    }
+    case 'ping_interval': {
+      const interval = Number(parts[2]);
+      const settings = await getCachedSettings();
+      const updated = {
+        ...settings,
+        integrations: {
+          ...settings.integrations,
+          healthPingIntervalMinutes: Number.isFinite(interval) ? interval : 5,
+        },
+      };
+      await saveGlobalSettingsAndCache(updated);
+      const view = buildIntegrationsSettingsView(updated);
+      await renderOrEdit(ctx, view.text, { reply_markup: view.keyboard });
+      break;
+    }
+    case 'backups': {
+      const settings = await getCachedSettings();
+      const view = buildBackupsSettingsView(settings);
+      await renderOrEdit(ctx, view.text, { reply_markup: view.keyboard });
+      break;
+    }
+    case 'backup_channel': {
+      setUserState(ctx.from.id, {
+        type: 'gsettings_backup_channel',
+        messageContext: getMessageTargetFromCtx(ctx),
+        backCallback: 'gsettings:backups',
+      });
+      await renderOrEdit(ctx, '📦 Send backup channel chat_id.\n(Or press Cancel)', {
+        reply_markup: buildCancelKeyboard(),
+      });
+      break;
+    }
+    case 'backup_caption': {
+      setUserState(ctx.from.id, {
+        type: 'gsettings_backup_caption',
+        messageContext: getMessageTargetFromCtx(ctx),
+        backCallback: 'gsettings:backups',
+      });
+      await renderOrEdit(ctx, '🧾 Send backup caption template.\n(Or press Cancel)', {
+        reply_markup: buildCancelKeyboard(),
+      });
+      break;
+    }
     case 'bot_log_alerts':
       await renderSelfLogAlerts(ctx);
       break;
@@ -2162,7 +2702,7 @@ async function handleGlobalSettingsCallback(ctx, data) {
       if (updated.selfLogForwarding.enabled && !updated.selfLogForwarding.levels.length) {
         updated.selfLogForwarding.levels = ['error'];
       }
-      await saveGlobalSettings(updated);
+      await saveGlobalSettingsAndCache(updated);
       await renderSelfLogAlerts(ctx);
       break;
     }
@@ -2192,7 +2732,7 @@ async function handleGlobalSettingsCallback(ctx, data) {
       if (current.enabled && updated.selfLogForwarding.levels.length === 0) {
         updated.selfLogForwarding.levels = ['error'];
       }
-      await saveGlobalSettings(updated);
+      await saveGlobalSettingsAndCache(updated);
       await renderSelfLogAlerts(ctx);
       break;
     }
@@ -2231,7 +2771,7 @@ async function handleGlobalSettingsCallback(ctx, data) {
       await renderGlobalSettings(ctx);
       break;
     case 'back':
-      await renderMainMenu(ctx);
+      await resetToMainMenu(ctx);
       break;
     default:
       break;
@@ -3255,7 +3795,7 @@ async function handleEnvVaultCallback(ctx, data) {
         backCallback: `envvault:menu:${projectId}`,
         messageContext: getMessageTargetFromCtx(ctx),
       });
-      await renderOrEdit(ctx, 'Search Env Vault keys (substring match, case-insensitive).\nSend a query or Cancel.', {
+      await renderOrEdit(ctx, 'Search Env Vault key by name.\nSend the key or Cancel.', {
         reply_markup: buildCancelKeyboard(),
       });
       break;
@@ -3296,6 +3836,9 @@ async function handleEnvVaultCallback(ctx, data) {
       break;
     case 'reveal':
       await revealEnvVaultValue(ctx, projectId, key);
+      break;
+    case 'view':
+      await revealEnvVaultValue(ctx, projectId, key, { ephemeral: true });
       break;
     case 'import':
       setUserState(ctx.from.id, {
@@ -3500,7 +4043,10 @@ async function renderEnvVaultKeyList(ctx, projectId) {
 
   const inline = new InlineKeyboard();
   keys.forEach((key) => {
-    inline.text(key, `envvault:key:${projectId}:${key}`).row();
+    inline
+      .text(`🔎 ${key}`, `envvault:key:${projectId}:${key}`)
+      .text('👁 View (30s)', `envvault:view:${projectId}:${key}`)
+      .row();
   });
   inline.text('⬅️ Back', `envvault:menu:${projectId}`);
 
@@ -3565,7 +4111,7 @@ async function handleEnvVaultDelete(ctx, projectId, key) {
   });
 }
 
-async function revealEnvVaultValue(ctx, projectId, key) {
+async function revealEnvVaultValue(ctx, projectId, key, options = {}) {
   const envSetId = await ensureProjectEnvSet(projectId);
   try {
     const value = await getEnvVarValue(projectId, key, envSetId);
@@ -3573,7 +4119,10 @@ async function revealEnvVaultValue(ctx, projectId, key) {
       await ctx.reply('Key not found.');
       return;
     }
-    await ctx.reply(`🔐 ${key}:\n${value}`);
+    const settings = await getCachedSettings();
+    const formatted = formatEnvValueForDisplay(key, value, settings);
+    const message = `🔐 ${escapeHtml(key)}:\n${formatted.text}`;
+    await sendEphemeralMessage(ctx, message, { parse_mode: 'HTML' });
   } catch (error) {
     await ctx.reply(`Failed to decrypt key: ${error.message}`);
   }
@@ -3608,42 +4157,24 @@ async function handleEnvVaultSearchInput(ctx, state) {
     return;
   }
   const envSetId = await ensureProjectEnvSet(state.projectId);
-  const envVars = await listEnvVars(state.projectId, envSetId);
-  const matches = [];
-  const lowerQuery = query.toLowerCase();
-  for (const entry of envVars) {
-    if (entry.key.toLowerCase().includes(lowerQuery)) {
-      const value = await getEnvVarValue(state.projectId, entry.key, envSetId);
-      matches.push({ key: entry.key, value });
-    }
-  }
-
-  const lines = [
-    `🔎 Env Vault search — ${state.projectId}`,
-    `Query: ${query}`,
-    '',
-  ];
-  if (!matches.length) {
-    lines.push('No matching keys found.');
+  const envVars = await listEnvVarKeys(state.projectId, envSetId);
+  const matchKey = envVars.find((key) => key.toLowerCase() === query.toLowerCase());
+  if (!matchKey) {
     clearUserState(ctx.from.id);
-    await renderStateMessage(ctx, state, lines.join('\n'), {
+    await renderStateMessage(ctx, state, '⚠️ No matching key found.', {
       reply_markup: buildBackKeyboard(`envvault:menu:${state.projectId}`),
     });
     return;
   }
-
-  const inline = new InlineKeyboard();
-  matches.forEach((match) => {
-    const masked = maskEnvValue(match.value);
-    lines.push(`${match.key} = ${masked}`);
-    inline
-      .text('✏️ Edit', `envvault:search_edit:${state.projectId}:${match.key}`)
-      .text('🗑️ Delete', `envvault:search_delete:${state.projectId}:${match.key}`)
-      .row();
-  });
-  inline.text('⬅️ Back', `envvault:menu:${state.projectId}`);
+  const value = await getEnvVarValue(state.projectId, matchKey, envSetId);
+  const settings = await getCachedSettings();
+  const formatted = formatEnvValueForDisplay(matchKey, value, settings);
+  const message = `🔎 Env Vault — ${escapeHtml(matchKey)}\n${formatted.text}`;
+  await sendEphemeralMessage(ctx, message, { parse_mode: 'HTML' });
   clearUserState(ctx.from.id);
-  await renderStateMessage(ctx, state, lines.join('\n'), { reply_markup: inline });
+  await renderStateMessage(ctx, state, '✅ Result sent (auto-delete enabled).', {
+    reply_markup: buildBackKeyboard(`envvault:menu:${state.projectId}`),
+  });
 }
 
 function buildEnvDuplicateCandidates(project, envVars, envSetId) {
@@ -8585,12 +9116,123 @@ async function handleGlobalBaseChange(ctx, state) {
 
   const settings = await loadGlobalSettings();
   settings.defaultBaseBranch = text;
-  await saveGlobalSettings(settings);
+  await saveGlobalSettingsAndCache(settings);
   clearUserState(ctx.from.id);
   await renderGlobalSettingsForMessage(state.messageContext, '✅ Updated');
   if (!state.messageContext) {
     await renderGlobalSettings(ctx, '✅ Updated');
   }
+}
+
+async function handleAdminAddInput(ctx, state) {
+  const text = ctx.message.text?.trim();
+  if (!text) {
+    await ctx.reply('Please send a Telegram user ID.');
+    return;
+  }
+  if (text.toLowerCase() === 'cancel') {
+    resetUserState(ctx);
+    await renderOrEdit(ctx, 'Operation cancelled.', {
+      reply_markup: buildBackKeyboard('gsettings:security'),
+    });
+    return;
+  }
+  const settings = await getCachedSettings();
+  const security = normalizeSecuritySettings(settings);
+  const normalizedId = text.trim();
+  const adminIds = new Set(security.adminIds.map(String));
+  adminIds.add(normalizedId);
+  const updated = {
+    ...settings,
+    security: { ...settings.security, adminIds: Array.from(adminIds) },
+  };
+  await saveGlobalSettingsAndCache(updated);
+  clearUserState(ctx.from.id);
+  const view = buildAdminListView(updated);
+  await renderOrEdit(ctx, view.text, { reply_markup: view.keyboard });
+}
+
+async function handleBaseUrlInput(ctx, state) {
+  const text = ctx.message.text?.trim();
+  if (!text) {
+    await ctx.reply('Please send a URL.');
+    return;
+  }
+  if (text.toLowerCase() === 'cancel') {
+    resetUserState(ctx);
+    await renderOrEdit(ctx, 'Operation cancelled.', {
+      reply_markup: buildBackKeyboard('gsettings:integrations'),
+    });
+    return;
+  }
+  let parsed;
+  try {
+    parsed = new URL(text);
+  } catch (error) {
+    await ctx.reply('⚠️ Invalid URL. Include http:// or https://.');
+    return;
+  }
+  if (!['http:', 'https:'].includes(parsed.protocol)) {
+    await ctx.reply('⚠️ Invalid URL scheme. Use http:// or https://.');
+    return;
+  }
+  const settings = await getCachedSettings();
+  const updated = {
+    ...settings,
+    integrations: { ...settings.integrations, baseUrlOverride: text },
+  };
+  await saveGlobalSettingsAndCache(updated);
+  clearUserState(ctx.from.id);
+  const view = buildIntegrationsSettingsView(updated);
+  await renderOrEdit(ctx, view.text, { reply_markup: view.keyboard });
+}
+
+async function handleBackupChannelInput(ctx, state) {
+  const text = ctx.message.text?.trim();
+  if (!text) {
+    await ctx.reply('Please send a chat_id.');
+    return;
+  }
+  if (text.toLowerCase() === 'cancel') {
+    resetUserState(ctx);
+    await renderOrEdit(ctx, 'Operation cancelled.', {
+      reply_markup: buildBackKeyboard('gsettings:backups'),
+    });
+    return;
+  }
+  const settings = await getCachedSettings();
+  const updated = {
+    ...settings,
+    backups: { ...settings.backups, channelId: text },
+  };
+  await saveGlobalSettingsAndCache(updated);
+  clearUserState(ctx.from.id);
+  const view = buildBackupsSettingsView(updated);
+  await renderOrEdit(ctx, view.text, { reply_markup: view.keyboard });
+}
+
+async function handleBackupCaptionInput(ctx, state) {
+  const text = ctx.message.text;
+  if (!text) {
+    await ctx.reply('Please send a caption template.');
+    return;
+  }
+  if (text.trim().toLowerCase() === 'cancel') {
+    resetUserState(ctx);
+    await renderOrEdit(ctx, 'Operation cancelled.', {
+      reply_markup: buildBackKeyboard('gsettings:backups'),
+    });
+    return;
+  }
+  const settings = await getCachedSettings();
+  const updated = {
+    ...settings,
+    backups: { ...settings.backups, captionTemplate: text.trim() },
+  };
+  await saveGlobalSettingsAndCache(updated);
+  clearUserState(ctx.from.id);
+  const view = buildBackupsSettingsView(updated);
+  await renderOrEdit(ctx, view.text, { reply_markup: view.keyboard });
 }
 
 function formatDiagnosticsCheckLine(status, label, detail) {
@@ -9893,6 +10535,8 @@ async function buildProjectSettingsView(project, globalSettings, notice) {
     .text('📝 SQL runner', `proj:sql_menu:${project.id}`)
     .row()
     .text('📣 Log alerts', `projlog:menu:${project.id}`)
+    .row()
+    .text('📝 Quick Notes', `notes:menu:${project.id}`)
     .row();
 
   if (missingSetup.length) {
@@ -10154,40 +10798,36 @@ async function updateProjectType(ctx, projectId, typeId) {
   await renderProjectSettings(ctx, projectId);
 }
 
-function buildProjectLogAlertsView(project, settings) {
+function buildProjectLogAlertsView(project, settings, notice) {
   const forwarding = normalizeProjectLogSettings(settings);
   const levelsLabel = forwarding.levels.length ? forwarding.levels.join(' / ') : 'error';
-  const selected = new Set(forwarding.levels);
   const destinationLabel = forwarding.destinationChatId || 'not set';
   const lines = [
-    `📣 Log alerts — ${project.name || project.id}`,
+    `📣 Logs — ${project.name || project.id}`,
+    notice || null,
     '',
-    `Status: ${forwarding.enabled ? 'Enabled' : 'Disabled'}`,
+    `Status: ${forwarding.enabled ? '✅ enabled' : '🚫 disabled'}`,
     `Levels: ${levelsLabel}`,
-    `Destination chat: ${destinationLabel}`,
-  ];
+    `Destination: ${forwarding.destinationMode || 'admin'} (${destinationLabel})`,
+  ].filter(Boolean);
 
   const inline = new InlineKeyboard()
-    .text(forwarding.enabled ? '✅ Enabled' : '🚫 Disabled', `projlog:toggle:${project.id}`)
+    .text(forwarding.enabled ? '🟢 Disable forwarding' : '🟢 Enable forwarding', `projlog:toggle:${project.id}`)
     .row()
-    .text(`❗ Errors: ${selected.has('error') ? 'ON' : 'OFF'}`, `projlog:level:error:${project.id}`)
-    .text(`⚠️ Warnings: ${selected.has('warn') ? 'ON' : 'OFF'}`, `projlog:level:warn:${project.id}`)
+    .text('🎚 Select log levels', `projlog:levels:${project.id}`)
     .row()
-    .text(`ℹ️ Info: ${selected.has('info') ? 'ON' : 'OFF'}`, `projlog:level:info:${project.id}`)
+    .text('🧪 Send test log', `projlog:test:${project.id}`)
     .row()
-    .text('✏️ Set chat_id', `projlog:set_chat:${project.id}`)
-    .text('📌 Use this chat', `projlog:use_chat:${project.id}`)
+    .text('📦 Recent deliveries', `projlog:recent:${project.id}:0`)
     .row()
-    .text('🧹 Clear chat_id', `projlog:clear_chat:${project.id}`)
-    .row()
-    .text('🧾 Recent logs', `projlog:logs:${project.id}:0`)
+    .text('📍 Destination config', `projlog:dest:${project.id}`)
     .row()
     .text('⬅️ Back', `projlog:back:${project.id}`);
 
   return { text: lines.join('\n'), keyboard: inline };
 }
 
-async function renderProjectLogAlerts(ctx, projectId) {
+async function renderProjectLogAlerts(ctx, projectId, notice) {
   const projects = await loadProjects();
   const project = findProjectById(projects, projectId);
   if (!project) {
@@ -10195,7 +10835,7 @@ async function renderProjectLogAlerts(ctx, projectId) {
     return;
   }
   const settings = await getProjectLogSettingsWithDefaults(projectId);
-  const view = buildProjectLogAlertsView(project, settings);
+  const view = buildProjectLogAlertsView(project, settings, notice);
   await renderOrEdit(ctx, view.text, { reply_markup: view.keyboard });
 }
 
@@ -10205,8 +10845,8 @@ async function renderProjectLogAlertsForMessage(messageContext, projectId, notic
   const project = findProjectById(projects, projectId);
   if (!project) return;
   const settings = await getProjectLogSettingsWithDefaults(projectId);
-  const view = buildProjectLogAlertsView(project, settings);
-  const text = notice ? `${notice}\n\n${view.text}` : view.text;
+  const view = buildProjectLogAlertsView(project, settings, notice);
+  const text = view.text;
   try {
     await bot.api.editMessageText(
       messageContext.chatId,
@@ -10219,6 +10859,102 @@ async function renderProjectLogAlertsForMessage(messageContext, projectId, notic
   }
 }
 
+function buildProjectLogLevelsView(project, settings) {
+  const forwarding = normalizeProjectLogSettings(settings);
+  const selected = new Set(forwarding.levels);
+  const lines = [
+    `🎚 Log levels — ${project.name || project.id}`,
+    '',
+    `Current: ${forwarding.levels.join(' / ') || 'error'}`,
+  ];
+  const inline = new InlineKeyboard()
+    .text(`❗ Errors ${selected.has('error') ? '✅' : 'OFF'}`, `projlog:level:error:${project.id}`)
+    .text(`⚠️ Warn ${selected.has('warn') ? '✅' : 'OFF'}`, `projlog:level:warn:${project.id}`)
+    .row()
+    .text(`ℹ️ Info ${selected.has('info') ? '✅' : 'OFF'}`, `projlog:level:info:${project.id}`)
+    .row()
+    .text('⬅️ Back', `projlog:menu:${project.id}`);
+  return { text: lines.join('\n'), keyboard: inline };
+}
+
+async function renderProjectLogLevelsMenu(ctx, projectId) {
+  const projects = await loadProjects();
+  const project = findProjectById(projects, projectId);
+  if (!project) {
+    await renderOrEdit(ctx, 'Project not found.');
+    return;
+  }
+  const settings = await getProjectLogSettingsWithDefaults(projectId);
+  const view = buildProjectLogLevelsView(project, settings);
+  await renderOrEdit(ctx, view.text, { reply_markup: view.keyboard });
+}
+
+function buildProjectLogDestinationView(project, settings) {
+  const forwarding = normalizeProjectLogSettings(settings);
+  const lines = [
+    `📍 Destination config — ${project.name || project.id}`,
+    '',
+    `Mode: ${forwarding.destinationMode || 'admin'}`,
+    `Channel chat_id: ${forwarding.destinationChatId || 'not set'}`,
+  ];
+  const inline = new InlineKeyboard()
+    .text(`👤 Admin ${forwarding.destinationMode === 'admin' ? '✅' : ''}`, `projlog:dest_mode:admin:${project.id}`)
+    .text(`📣 Channel ${forwarding.destinationMode === 'channel' ? '✅' : ''}`, `projlog:dest_mode:channel:${project.id}`)
+    .row()
+    .text(`👥 Both ${forwarding.destinationMode === 'both' ? '✅' : ''}`, `projlog:dest_mode:both:${project.id}`)
+    .row()
+    .text('✏️ Set chat_id', `projlog:set_chat:${project.id}`)
+    .text('📌 Use this chat', `projlog:use_chat:${project.id}`)
+    .row()
+    .text('🧹 Clear chat_id', `projlog:clear_chat:${project.id}`)
+    .row()
+    .text('⬅️ Back', `projlog:menu:${project.id}`);
+  return { text: lines.join('\n'), keyboard: inline };
+}
+
+async function renderProjectLogDestinationMenu(ctx, projectId) {
+  const projects = await loadProjects();
+  const project = findProjectById(projects, projectId);
+  if (!project) {
+    await renderOrEdit(ctx, 'Project not found.');
+    return;
+  }
+  const settings = await getProjectLogSettingsWithDefaults(projectId);
+  const view = buildProjectLogDestinationView(project, settings);
+  await renderOrEdit(ctx, view.text, { reply_markup: view.keyboard });
+}
+
+async function sendProjectLogTest(ctx, projectId) {
+  const projects = await loadProjects();
+  const project = findProjectById(projects, projectId);
+  if (!project) {
+    await renderOrEdit(ctx, 'Project not found.');
+    return;
+  }
+  const settings = await getProjectLogSettingsWithDefaults(projectId);
+  const forwarding = normalizeProjectLogSettings(settings);
+  const targets = new Set();
+  if (forwarding.destinationMode === 'admin' || forwarding.destinationMode === 'both') {
+    targets.add(ADMIN_TELEGRAM_ID);
+  }
+  if ((forwarding.destinationMode === 'channel' || forwarding.destinationMode === 'both') && forwarding.destinationChatId) {
+    targets.add(forwarding.destinationChatId);
+  }
+  const resolvedTargets = Array.from(targets).filter(Boolean);
+  if (!resolvedTargets.length) {
+    await renderProjectLogAlerts(ctx, projectId, '⚠️ No destination configured.');
+    return;
+  }
+  const message = `🧪 Test log for ${project.name || project.id} (${project.id})`;
+  try {
+    await Promise.all(resolvedTargets.map((chatId) => sendSafeMessage(BOT_TOKEN, chatId, message)));
+    await renderProjectLogAlerts(ctx, projectId, '✅ Test log sent.');
+  } catch (error) {
+    console.error('[logs] Failed to send test log', { projectId, error: error?.message });
+    await renderProjectLogAlerts(ctx, projectId, `⚠️ Test log failed: ${error.message}`);
+  }
+}
+
 function formatLogTimestamp(value) {
   if (!value) return '-';
   const date = new Date(value);
@@ -10227,7 +10963,7 @@ function formatLogTimestamp(value) {
 }
 
 function buildProjectLogListView(project, logs, page, hasNext) {
-  const lines = [`🧾 Last logs — ${project.name || project.id}`, `Page: ${page + 1}`];
+  const lines = [`📦 Recent deliveries — ${project.name || project.id}`, `Page: ${page + 1}`];
   if (!logs.length) {
     lines.push('', 'No logs stored yet.');
   } else {
@@ -10241,16 +10977,11 @@ function buildProjectLogListView(project, logs, page, hasNext) {
   }
 
   const inline = new InlineKeyboard();
-  logs.forEach((log) => {
-    const label = `${(log.level || 'log').toUpperCase()} ${truncateText(log.message, 24)}`;
-    inline.text(label, `projlog:log:${project.id}:${log.id}:${page}`).row();
-  });
-
   if (page > 0) {
-    inline.text('⬅️ Prev', `projlog:logs:${project.id}:${page - 1}`);
+    inline.text('⬅️ Prev', `projlog:recent:${project.id}:${page - 1}`);
   }
   if (hasNext) {
-    inline.text('➡️ Next', `projlog:logs:${project.id}:${page + 1}`);
+    inline.text('➡️ Next', `projlog:recent:${project.id}:${page + 1}`);
   }
   if (page > 0 || hasNext) {
     inline.row();
@@ -10298,7 +11029,7 @@ function buildProjectLogDetailView(project, logEntry, page) {
   }
 
   const inline = new InlineKeyboard()
-    .text('⬅️ Back to logs', `projlog:logs:${project.id}:${page}`)
+    .text('⬅️ Back to logs', `projlog:recent:${project.id}:${page}`)
     .row()
     .text('⬅️ Back to alerts', `projlog:menu:${project.id}`);
 
@@ -10325,14 +11056,613 @@ async function renderProjectLogDetail(ctx, projectId, logId, page) {
   await renderOrEdit(ctx, view.text, { reply_markup: view.keyboard });
 }
 
+function formatBackupCaption(template, payload) {
+  const replacements = {
+    '{projectName}': payload.projectName || '-',
+    '{projectId}': payload.projectId || '-',
+    '{title}': payload.title || '-',
+    '{category}': payload.category || '-',
+    '{status}': payload.status || '-',
+    '{createdAt}': payload.createdAt || '-',
+    '{noteId}': payload.noteId || '-',
+  };
+  let result = template || '';
+  Object.entries(replacements).forEach(([token, value]) => {
+    result = result.split(token).join(String(value));
+  });
+  return result;
+}
+
+function formatNoteDetail(note) {
+  const lines = [
+    `📝 ${note.title}`,
+    `Category: ${note.category}`,
+    `Status: ${note.status}`,
+    `Created: ${note.createdAt}`,
+    note.doneAt ? `Done: ${note.doneAt}` : null,
+    note.nextAction ? `Next action: ${note.nextAction}` : null,
+    note.text ? `\n${note.text}` : null,
+  ].filter(Boolean);
+  if (note.attachments?.length) {
+    lines.push('', `Attachments: ${note.attachments.length}`);
+    note.attachments.forEach((att, index) => {
+      lines.push(`• ${index + 1}. ${att.type} ${att.fileName || ''}`.trim());
+    });
+  }
+  return lines.join('\n');
+}
+
+async function ensureBackupChannelConfigured(ctx) {
+  const settings = await getCachedSettings();
+  const backups = normalizeBackupSettings(settings);
+  if (!backups.channelId) {
+    await renderOrEdit(
+      ctx,
+      '⚠️ Backup channel not configured. Set it in Settings → Backups before using Notes.',
+      { reply_markup: buildBackKeyboard('gsettings:backups') },
+    );
+    return null;
+  }
+  return backups.channelId;
+}
+
+async function sendNoteBackupMessage(project, note, options = {}) {
+  const settings = await getCachedSettings();
+  const backups = normalizeBackupSettings(settings);
+  if (!backups.channelId) {
+    throw new Error('Backup channel not configured.');
+  }
+  const caption = formatBackupCaption(backups.captionTemplate, {
+    projectName: project.name || project.id,
+    projectId: project.id,
+    title: note.title,
+    category: note.category,
+    status: note.status,
+    createdAt: note.createdAt,
+    noteId: note.id,
+  });
+  const bodyLines = [caption];
+  if (note.nextAction) {
+    bodyLines.push(`Next action: ${note.nextAction}`);
+  }
+  if (note.text) {
+    bodyLines.push('', truncateText(note.text, 1000));
+  }
+  const message = bodyLines.join('\n');
+  const response = await bot.api.sendMessage(backups.channelId, message);
+  await appendNoteBackup(project.id, note.id, {
+    chatId: response.chat.id,
+    messageId: response.message_id,
+    type: 'note',
+    createdAt: new Date().toISOString(),
+  });
+}
+
+async function sendNoteAttachmentBackup(project, noteId, attachment, caption) {
+  const settings = await getCachedSettings();
+  const backups = normalizeBackupSettings(settings);
+  if (!backups.channelId) {
+    throw new Error('Backup channel not configured.');
+  }
+  const safeCaption = caption ? truncateText(caption, 1000) : '';
+  let response;
+  if (attachment.type === 'photo') {
+    response = await bot.api.sendPhoto(backups.channelId, attachment.fileId, { caption: safeCaption });
+  } else if (attachment.type === 'video') {
+    response = await bot.api.sendVideo(backups.channelId, attachment.fileId, { caption: safeCaption });
+  } else if (attachment.type === 'voice') {
+    response = await bot.api.sendVoice(backups.channelId, attachment.fileId, { caption: safeCaption });
+  } else {
+    response = await bot.api.sendDocument(backups.channelId, attachment.fileId, { caption: safeCaption });
+  }
+  await appendNoteBackup(project.id, noteId, {
+    chatId: response.chat.id,
+    messageId: response.message_id,
+    type: 'attachment',
+    attachmentId: attachment.id,
+    createdAt: new Date().toISOString(),
+  });
+}
+
+async function renderNotesMenu(ctx, projectId, notice) {
+  const project = await getProjectById(projectId, ctx);
+  if (!project) return;
+  const openNotes = await listNotes(projectId, NOTE_STATUS.OPEN);
+  const doneNotes = await listNotes(projectId, NOTE_STATUS.DONE);
+  const backups = normalizeBackupSettings(await getCachedSettings());
+  const backupWarning = backups.channelId ? null : '⚠️ Backup channel not configured.';
+  const lines = [
+    `📝 Quick Notes — ${project.name || project.id}`,
+    notice || null,
+    '',
+    `Open notes: ${openNotes.length}`,
+    `Done notes: ${doneNotes.length}`,
+    backupWarning,
+  ].filter(Boolean);
+  const inline = new InlineKeyboard()
+    .text('➕ Create note', `notes:create:${projectId}`)
+    .row()
+    .text('📂 View open notes', `notes:list:${projectId}:${NOTE_STATUS.OPEN}`)
+    .row()
+    .text('✅ Done history', `notes:list:${projectId}:${NOTE_STATUS.DONE}`)
+    .row()
+    .text('🔎 Search notes', `notes:search:${projectId}`)
+    .row()
+    .text('🏷 Categories', `notes:categories:${projectId}`)
+    .row()
+    .text('⬅️ Back', `proj:open:${projectId}`);
+  await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
+}
+
+async function renderNotesList(ctx, projectId, status) {
+  const project = await getProjectById(projectId, ctx);
+  if (!project) return;
+  const notes = await listNotes(projectId, status);
+  const lines = [
+    `${status === NOTE_STATUS.DONE ? '✅ Done' : '📂 Open'} notes — ${project.name || project.id}`,
+  ];
+  if (!notes.length) {
+    lines.push('', 'No notes found.');
+  } else {
+    lines.push('');
+    notes.forEach((note) => {
+      lines.push(`• ${note.title} (${note.category}) — ${note.nextAction || 'no next action'}`);
+    });
+  }
+  const inline = new InlineKeyboard();
+  notes.forEach((note) => {
+    inline.text(`📝 ${truncateText(note.title, 24)}`, `notes:view:${projectId}:${note.id}`).row();
+  });
+  inline.text('⬅️ Back', `notes:menu:${projectId}`);
+  await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
+}
+
+async function renderNotesCategories(ctx, projectId) {
+  const project = await getProjectById(projectId, ctx);
+  if (!project) return;
+  const notes = await listNotes(projectId);
+  const counts = NOTE_CATEGORIES.reduce((acc, category) => {
+    acc[category] = 0;
+    return acc;
+  }, {});
+  notes.forEach((note) => {
+    counts[note.category] = (counts[note.category] || 0) + 1;
+  });
+  const lines = [`🏷 Categories — ${project.name || project.id}`, ''];
+  NOTE_CATEGORIES.forEach((category) => {
+    lines.push(`• ${category}: ${counts[category] || 0}`);
+  });
+  const inline = new InlineKeyboard();
+  NOTE_CATEGORIES.forEach((category) => {
+    inline.text(`🏷 ${category}`, `notes:category:${projectId}:${category}`).row();
+  });
+  inline.text('⬅️ Back', `notes:menu:${projectId}`);
+  await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
+}
+
+async function renderNotesByCategory(ctx, projectId, category) {
+  const project = await getProjectById(projectId, ctx);
+  if (!project) return;
+  const notes = (await listNotes(projectId)).filter((note) => note.category === category);
+  const lines = [`🏷 ${category} notes — ${project.name || project.id}`];
+  if (!notes.length) {
+    lines.push('', 'No notes found.');
+  } else {
+    lines.push('');
+    notes.forEach((note) => {
+      lines.push(`• ${note.title} (${note.status})`);
+    });
+  }
+  const inline = new InlineKeyboard();
+  notes.forEach((note) => {
+    inline.text(`📝 ${truncateText(note.title, 24)}`, `notes:view:${projectId}:${note.id}`).row();
+  });
+  inline.text('⬅️ Back', `notes:categories:${projectId}`);
+  await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
+}
+
+async function renderNoteDetail(ctx, projectId, noteId, notice) {
+  const project = await getProjectById(projectId, ctx);
+  if (!project) return;
+  const note = await getNote(projectId, noteId);
+  if (!note) {
+    await renderOrEdit(ctx, 'Note not found.', { reply_markup: buildBackKeyboard(`notes:menu:${projectId}`) });
+    return;
+  }
+  const lines = [formatNoteDetail(note)];
+  if (notice) {
+    lines.unshift(notice, '');
+  }
+  const inline = new InlineKeyboard()
+    .text('✏️ Edit title', `notes:edit:${projectId}:${note.id}:title`)
+    .row()
+    .text('🏷 Edit category', `notes:edit:${projectId}:${note.id}:category`)
+    .row()
+    .text('📝 Edit text', `notes:edit:${projectId}:${note.id}:text`)
+    .row()
+    .text('🧭 Edit next action', `notes:edit:${projectId}:${note.id}:next`)
+    .row()
+    .text('📎 Add attachment', `notes:attach:${projectId}:${note.id}`)
+    .row();
+  if (note.attachments?.length) {
+    inline.text('🗑 Remove attachment', `notes:attach_remove:${projectId}:${note.id}`).row();
+  }
+  if (note.status === NOTE_STATUS.OPEN) {
+    inline.text('✅ Mark done', `notes:done:${projectId}:${note.id}`).row();
+  } else {
+    inline.text('♻️ Reopen', `notes:reopen:${projectId}:${note.id}`).row();
+  }
+  inline.text('⬅️ Back', `notes:menu:${projectId}`);
+  await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
+}
+
+async function renderNoteAttachmentRemoval(ctx, projectId, noteId) {
+  const note = await getNote(projectId, noteId);
+  if (!note) {
+    await renderOrEdit(ctx, 'Note not found.', { reply_markup: buildBackKeyboard(`notes:menu:${projectId}`) });
+    return;
+  }
+  const lines = [`🗑 Remove attachment — ${note.title}`, 'Select attachment:'];
+  const inline = new InlineKeyboard();
+  note.attachments.forEach((att, index) => {
+    inline.text(`🗑 ${index + 1}. ${att.type}`, `notes:attach_remove_pick:${projectId}:${noteId}:${att.id}`).row();
+  });
+  inline.text('⬅️ Back', `notes:view:${projectId}:${noteId}`);
+  await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
+}
+
+async function handleNotesCallback(ctx, data) {
+  await ensureAnswerCallback(ctx);
+  const parts = data.split(':');
+  const action = parts[1];
+  const projectId = parts[2];
+  let noteId = parts[3];
+  let extra = parts[4];
+  if (['list', 'category', 'category_pick', 'category_custom'].includes(action)) {
+    extra = parts[3];
+    noteId = null;
+  }
+
+  if (!projectId) {
+    await renderOrEdit(ctx, 'Project not found.');
+    return;
+  }
+
+  switch (action) {
+    case 'menu':
+      await renderNotesMenu(ctx, projectId);
+      break;
+    case 'create': {
+      const backupChannel = await ensureBackupChannelConfigured(ctx);
+      if (!backupChannel) return;
+      setUserState(ctx.from.id, {
+        type: 'note_create',
+        projectId,
+        step: 'title',
+      });
+      await renderOrEdit(ctx, '📝 Send note title.\n(Or press Cancel)', { reply_markup: buildCancelKeyboard() });
+      break;
+    }
+    case 'list':
+      await renderNotesList(ctx, projectId, extra === NOTE_STATUS.DONE ? NOTE_STATUS.DONE : NOTE_STATUS.OPEN);
+      break;
+    case 'view':
+      await renderNoteDetail(ctx, projectId, noteId);
+      break;
+    case 'search':
+      setUserState(ctx.from.id, { type: 'note_search', projectId });
+      await renderOrEdit(ctx, '🔎 Send search text for notes.\n(Or press Cancel)', { reply_markup: buildCancelKeyboard() });
+      break;
+    case 'categories':
+      await renderNotesCategories(ctx, projectId);
+      break;
+    case 'category':
+      await renderNotesByCategory(ctx, projectId, extra);
+      break;
+    case 'edit':
+      setUserState(ctx.from.id, {
+        type: 'note_edit_field',
+        projectId,
+        noteId,
+        field: extra,
+      });
+      await renderOrEdit(ctx, `✏️ Send new value for ${extra}.\n(Or press Cancel)`, {
+        reply_markup: buildCancelKeyboard(),
+      });
+      break;
+    case 'attach':
+      if (!(await ensureBackupChannelConfigured(ctx))) {
+        return;
+      }
+      setUserState(ctx.from.id, {
+        type: 'note_add_attachment',
+        projectId,
+        noteId,
+      });
+      await renderOrEdit(ctx, '📎 Send an attachment (photo/video/voice/file).\n(Or press Cancel)', {
+        reply_markup: buildCancelKeyboard(),
+      });
+      break;
+    case 'attach_remove':
+      await renderNoteAttachmentRemoval(ctx, projectId, noteId);
+      break;
+    case 'attach_remove_pick':
+      await removeNoteAttachment(projectId, noteId, extra);
+      {
+        const note = await getNote(projectId, noteId);
+        if (note) {
+          const project = await getProjectById(projectId, ctx);
+          try {
+            await sendNoteBackupMessage(project, note);
+          } catch (error) {
+            await renderNoteDetail(ctx, projectId, noteId, `⚠️ Backup failed: ${error.message}`);
+            return;
+          }
+        }
+      }
+      await renderNoteDetail(ctx, projectId, noteId, '🧹 Attachment removed.');
+      break;
+    case 'done': {
+      const note = await updateNote(projectId, noteId, {
+        status: NOTE_STATUS.DONE,
+        doneAt: new Date().toISOString(),
+      });
+      if (note) {
+        const project = await getProjectById(projectId, ctx);
+        try {
+          await sendNoteBackupMessage(project, note);
+        } catch (error) {
+          await renderNoteDetail(ctx, projectId, noteId, `⚠️ Backup failed: ${error.message}`);
+          return;
+        }
+      }
+      await renderNoteDetail(ctx, projectId, noteId, '✅ Marked as done.');
+      break;
+    }
+    case 'reopen': {
+      const note = await updateNote(projectId, noteId, {
+        status: NOTE_STATUS.OPEN,
+        doneAt: null,
+      });
+      if (note) {
+        const project = await getProjectById(projectId, ctx);
+        try {
+          await sendNoteBackupMessage(project, note);
+        } catch (error) {
+          await renderNoteDetail(ctx, projectId, noteId, `⚠️ Backup failed: ${error.message}`);
+          return;
+        }
+      }
+      await renderNoteDetail(ctx, projectId, noteId, '♻️ Reopened.');
+      break;
+    }
+    case 'category_pick': {
+      const state = getUserState(ctx.from.id);
+      if (!state || state.type !== 'note_create') {
+        await renderNotesMenu(ctx, projectId);
+        return;
+      }
+      setUserState(ctx.from.id, { ...state, step: 'next_action', category: extra });
+      await renderOrEdit(ctx, 'Send next action (short summary). Use "-" to skip.', { reply_markup: buildCancelKeyboard() });
+      break;
+    }
+    case 'category_custom': {
+      const state = getUserState(ctx.from.id);
+      if (!state || state.type !== 'note_create') {
+        await renderNotesMenu(ctx, projectId);
+        return;
+      }
+      setUserState(ctx.from.id, { ...state, step: 'category_custom' });
+      await renderOrEdit(ctx, 'Send custom category.\n(Or press Cancel)', { reply_markup: buildCancelKeyboard() });
+      break;
+    }
+    default:
+      break;
+  }
+}
+
+async function handleNoteCreateInput(ctx, state) {
+  const text = ctx.message?.text?.trim();
+  if (!text) {
+    await ctx.reply('Please send text.');
+    return;
+  }
+  if (text.toLowerCase() === 'cancel') {
+    resetUserState(ctx);
+    await renderNotesMenu(ctx, state.projectId, 'Operation cancelled.');
+    return;
+  }
+  if (state.step === 'title') {
+    setUserState(ctx.from.id, { ...state, step: 'category', title: text });
+    const inline = new InlineKeyboard();
+    NOTE_CATEGORIES.forEach((category) => {
+      if (category !== 'Custom') {
+        inline.text(`🏷 ${category}`, `notes:category_pick:${state.projectId}:${category}`).row();
+      }
+    });
+    inline.text('✍️ Custom', `notes:category_custom:${state.projectId}`).row();
+    inline.text('⬅️ Back', `notes:menu:${state.projectId}`);
+    await renderOrEdit(ctx, '🏷 Select a category:', { reply_markup: inline });
+    return;
+  }
+  if (state.step === 'category_custom') {
+    setUserState(ctx.from.id, { ...state, step: 'next_action', category: text });
+    await renderOrEdit(ctx, '🧭 Send next action (short summary). Use "-" to skip.', { reply_markup: buildCancelKeyboard() });
+    return;
+  }
+  if (state.step === 'next_action') {
+    setUserState(ctx.from.id, { ...state, step: 'body', nextAction: text === '-' ? '' : text });
+    await renderOrEdit(ctx, '📝 Send note body text. Use "-" to skip.', { reply_markup: buildCancelKeyboard() });
+    return;
+  }
+  if (state.step === 'body') {
+    const project = await getProjectById(state.projectId, ctx);
+    if (!project) {
+      clearUserState(ctx.from.id);
+      await renderOrEdit(ctx, 'Project not found.');
+      return;
+    }
+    const note = await createNote(state.projectId, {
+      title: state.title,
+      category: state.category || 'Custom',
+      text: text === '-' ? '' : text,
+      nextAction: state.nextAction || '',
+      status: NOTE_STATUS.OPEN,
+    });
+    try {
+      await sendNoteBackupMessage(project, note);
+    } catch (error) {
+      await renderNoteDetail(ctx, state.projectId, note.id, `⚠️ Backup failed: ${error.message}`);
+      clearUserState(ctx.from.id);
+      return;
+    }
+    clearUserState(ctx.from.id);
+    await renderNoteDetail(ctx, state.projectId, note.id, '✅ Note created.');
+  }
+}
+
+async function handleNoteEditInput(ctx, state) {
+  const text = ctx.message?.text?.trim();
+  if (!text) {
+    await ctx.reply('Please send text.');
+    return;
+  }
+  if (text.toLowerCase() === 'cancel') {
+    resetUserState(ctx);
+    await renderNoteDetail(ctx, state.projectId, state.noteId, 'Operation cancelled.');
+    return;
+  }
+  const updates = {};
+  if (state.field === 'title') updates.title = text;
+  if (state.field === 'category') updates.category = text;
+  if (state.field === 'text') updates.text = text === '-' ? '' : text;
+  if (state.field === 'next') updates.nextAction = text === '-' ? '' : text;
+  const note = await updateNote(state.projectId, state.noteId, updates);
+  if (note) {
+    const project = await getProjectById(state.projectId, ctx);
+    try {
+      await sendNoteBackupMessage(project, note);
+    } catch (error) {
+      await renderNoteDetail(ctx, state.projectId, state.noteId, `⚠️ Backup failed: ${error.message}`);
+      clearUserState(ctx.from.id);
+      return;
+    }
+  }
+  clearUserState(ctx.from.id);
+  await renderNoteDetail(ctx, state.projectId, state.noteId, '✅ Note updated.');
+}
+
+async function handleNoteSearchInput(ctx, state) {
+  const text = ctx.message?.text?.trim();
+  if (!text) {
+    await ctx.reply('Please send text.');
+    return;
+  }
+  if (text.toLowerCase() === 'cancel') {
+    resetUserState(ctx);
+    await renderNotesMenu(ctx, state.projectId, 'Operation cancelled.');
+    return;
+  }
+  const notes = await listNotes(state.projectId);
+  const query = text.toLowerCase();
+  const matches = notes.filter((note) => {
+    return (
+      note.title.toLowerCase().includes(query) ||
+      note.text.toLowerCase().includes(query) ||
+      (note.nextAction || '').toLowerCase().includes(query)
+    );
+  });
+  clearUserState(ctx.from.id);
+  const lines = [`🔎 Note search — ${state.projectId}`, `Query: ${text}`];
+  if (!matches.length) {
+    lines.push('', 'No notes found.');
+  } else {
+    lines.push('');
+    matches.forEach((note) => {
+      lines.push(`• ${note.title} (${note.category})`);
+    });
+  }
+  const inline = new InlineKeyboard();
+  matches.forEach((note) => {
+    inline.text(`📝 ${truncateText(note.title, 24)}`, `notes:view:${state.projectId}:${note.id}`).row();
+  });
+  inline.text('⬅️ Back', `notes:menu:${state.projectId}`);
+  await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
+}
+
+function extractNoteAttachmentFromMessage(ctx) {
+  const message = ctx.message || {};
+  if (message.photo?.length) {
+    const photo = message.photo[message.photo.length - 1];
+    return { type: 'photo', fileId: photo.file_id };
+  }
+  if (message.video) {
+    return { type: 'video', fileId: message.video.file_id, fileName: message.video.file_name };
+  }
+  if (message.voice) {
+    return { type: 'voice', fileId: message.voice.file_id };
+  }
+  if (message.document) {
+    return {
+      type: 'document',
+      fileId: message.document.file_id,
+      fileName: message.document.file_name,
+      mimeType: message.document.mime_type,
+    };
+  }
+  return null;
+}
+
+async function handleNoteAttachmentInput(ctx, state) {
+  const attachment = extractNoteAttachmentFromMessage(ctx);
+  if (!attachment) {
+    await ctx.reply('📎 Please send a supported attachment (photo/video/voice/file).');
+    return;
+  }
+  const project = await getProjectById(state.projectId, ctx);
+  if (!project) {
+    clearUserState(ctx.from.id);
+    await renderOrEdit(ctx, 'Project not found.');
+    return;
+  }
+  const note = await getNote(state.projectId, state.noteId);
+  if (!note) {
+    clearUserState(ctx.from.id);
+    await renderOrEdit(ctx, 'Note not found.');
+    return;
+  }
+  const updated = await addNoteAttachment(state.projectId, state.noteId, attachment);
+  const caption = formatBackupCaption(normalizeBackupSettings(await getCachedSettings()).captionTemplate, {
+    projectName: project.name || project.id,
+    projectId: project.id,
+    title: note.title,
+    category: note.category,
+    status: note.status,
+    createdAt: note.createdAt,
+    noteId: note.id,
+  });
+  if (updated) {
+    const added = updated.attachments[updated.attachments.length - 1];
+    try {
+      await sendNoteAttachmentBackup(project, state.noteId, added, caption);
+    } catch (error) {
+      await renderNoteDetail(ctx, state.projectId, state.noteId, `⚠️ Backup failed: ${error.message}`);
+      clearUserState(ctx.from.id);
+      return;
+    }
+  }
+  clearUserState(ctx.from.id);
+  await renderNoteDetail(ctx, state.projectId, state.noteId, '📎 Attachment added.');
+}
+
 async function handleProjectLogChatInput(ctx, state) {
   const value = ctx.message?.text?.trim();
   if (!value) {
-    await ctx.reply('Please provide a chat_id value.', { reply_markup: buildCancelKeyboard() });
+    await ctx.reply('📍 Please provide a chat_id value.', { reply_markup: buildCancelKeyboard() });
     return;
   }
   if (!/^-?\\d+$/.test(value)) {
-    await ctx.reply('Invalid chat_id format. Please send a numeric chat_id.', {
+    await ctx.reply('⚠️ Invalid chat_id format. Please send a numeric chat_id.', {
       reply_markup: buildCancelKeyboard(),
     });
     return;
@@ -10341,10 +11671,7 @@ async function handleProjectLogChatInput(ctx, state) {
   settings.destinationChatId = value;
   await upsertProjectLogSettings(state.projectId, settings);
   clearUserState(ctx.from.id);
-  await renderProjectLogAlertsForMessage(state.messageContext, state.projectId, '✅ Updated');
-  if (!state.messageContext) {
-    await renderProjectLogAlerts(ctx, state.projectId);
-  }
+  await renderProjectLogDestinationMenu(ctx, state.projectId);
 }
 
 async function renderProjectSettingsForMessage(messageContext, projectId, notice) {
@@ -10975,7 +12302,12 @@ function getMiniSitePool(dsn, sslSettings) {
   const poolKey = buildMiniSitePoolKey(dsn, sslSettings);
   if (!poolKey) return null;
   if (!miniSitePools.has(poolKey)) {
-    const poolConfig = { connectionString: dsn };
+    const poolConfig = {
+      connectionString: dsn,
+      connectionTimeoutMillis: MINI_SITE_CONNECTION_TIMEOUT_MS,
+      idleTimeoutMillis: 30_000,
+      max: 4,
+    };
     const sslOptions = buildPgSslOptions(sslSettings);
     if (sslOptions) {
       poolConfig.ssl = sslOptions;
@@ -10985,8 +12317,17 @@ function getMiniSitePool(dsn, sslSettings) {
   return miniSitePools.get(poolKey);
 }
 
+async function runMiniSiteQuery(pool, text, values) {
+  return pool.query({
+    text,
+    values,
+    query_timeout: MINI_SITE_QUERY_TIMEOUT_MS,
+  });
+}
+
 async function listMiniSiteTables(pool) {
-  const { rows } = await pool.query(
+  const { rows } = await runMiniSiteQuery(
+    pool,
     `
       SELECT table_schema, table_name
       FROM information_schema.tables
@@ -10999,7 +12340,8 @@ async function listMiniSiteTables(pool) {
 }
 
 async function fetchMiniSiteTableColumns(pool, schema, table) {
-  const { rows } = await pool.query(
+  const { rows } = await runMiniSiteQuery(
+    pool,
     `
       SELECT column_name, data_type
       FROM information_schema.columns
@@ -11013,7 +12355,8 @@ async function fetchMiniSiteTableColumns(pool, schema, table) {
 
 async function fetchMiniSitePrimaryKeys(pool, schema, table) {
   const qualified = `${quoteIdentifier(schema)}.${quoteIdentifier(table)}`;
-  const { rows } = await pool.query(
+  const { rows } = await runMiniSiteQuery(
+    pool,
     `
       SELECT a.attname
       FROM pg_index i
@@ -11093,7 +12436,7 @@ async function getMiniSiteSettingsState() {
 async function saveMiniSiteSettingsState(settings, miniSite) {
   const payload = { ...(settings || {}) };
   payload[MINI_SITE_SETTINGS_KEY] = miniSite;
-  await saveGlobalSettings(payload);
+  await saveGlobalSettingsAndCache(payload);
   return payload;
 }
 
@@ -11126,6 +12469,7 @@ async function markMiniSiteTokenShown(settings) {
 
 function resolveMiniSiteSessionTtlMinutes(settings) {
   const settingValue = Number(settings?.[MINI_SITE_SETTINGS_KEY]?.sessionTtlMinutes);
+  const globalSetting = Number(cachedSettings?.security?.miniSiteSessionTtlMinutes);
   const envValue = Number(
     process.env.DB_MINI_SITE_SESSION_TTL_MINUTES || process.env.MINI_SITE_SESSION_TTL_MINUTES,
   );
@@ -11133,7 +12477,9 @@ function resolveMiniSiteSessionTtlMinutes(settings) {
     ? envValue
     : Number.isFinite(settingValue) && settingValue > 0
       ? settingValue
-      : MINI_SITE_SESSION_DEFAULT_TTL_MINUTES;
+      : Number.isFinite(globalSetting) && globalSetting > 0
+        ? globalSetting
+        : MINI_SITE_SESSION_DEFAULT_TTL_MINUTES;
   return Math.max(MINI_SITE_SESSION_MIN_TTL_MINUTES, resolved);
 }
 
@@ -11160,7 +12506,7 @@ async function getWebDashboardSettingsState() {
 async function saveWebDashboardSettingsState(settings, web) {
   const payload = { ...(settings || {}) };
   payload[WEB_DASHBOARD_SETTINGS_KEY] = web;
-  await saveGlobalSettings(payload);
+  await saveGlobalSettingsAndCache(payload);
   return payload;
 }
 
@@ -12040,7 +13386,7 @@ async function toggleProjectCronAlertLevel(ctx, projectId, level) {
 }
 
 async function renderDataCenterMenu(ctx) {
-  const view = await buildDataCenterView(ctx);
+  const view = await buildDataCenterView();
   const keyboardRows = view.keyboard?.inline_keyboard?.length ?? 0;
   console.debug('[UI] Data center keyboard rows', { rows: keyboardRows, hasButtons: keyboardRows > 0 });
   await renderOrEdit(ctx, view.text, { reply_markup: view.keyboard });
@@ -12188,66 +13534,50 @@ async function resolveProjectDbCardInfo(project) {
   };
 }
 
-async function buildDataCenterView(ctx) {
+async function buildDataCenterView() {
   const projects = await loadProjects();
-  const lines = ['🗄️ Database', ''];
+  const lines = ['🗄️ Database', '', 'Select a project:'];
   const inline = new InlineKeyboard();
-  const cards = [];
-  const ensureCallbackData = (label, callbackData) => {
-    if (!callbackData || typeof callbackData !== 'string' || callbackData.trim() === '') {
-      console.error('[UI] Missing callback_data for data center button', { label, callbackData });
-      return 'noop';
-    }
-    return callbackData;
-  };
-
-  for (const project of projects) {
-    const info = await resolveProjectDbCardInfo(project);
-    const sslSettings = resolveProjectDbSslSettings(project);
-    const sslSummary = formatProjectDbSslSummary(sslSettings);
-    cards.push({ project, info, sslSummary });
-  }
-
-  if (!cards.length) {
-    lines.push('No projects configured yet.');
-    inline.text('Configure per-project DB', ensureCallbackData('Configure per-project DB', 'proj:list')).row();
+  if (!projects.length) {
+    lines.push('', 'No projects configured yet.');
+    inline.text('➕ Add project', 'proj:add').row();
   } else {
-    cards.forEach(({ project, info, sslSummary }, index) => {
-      const name = project.name || project.id;
-      lines.push(
-        `📦 ${name} (🆔 ${project.id})`,
-        `DB type: ${info.dbType}`,
-        `Source: ${info.source}`,
-        `Key: ${info.keyName} (${info.status})`,
-        `SSL: ${sslSummary}`,
-      );
-      inline
-        .text(`📦 ${name} (🆔 ${project.id})`, ensureCallbackData(`Project ${project.id}`, `proj:open:${project.id}`))
-        .row()
-        .text('🌐 Open mini-site', ensureCallbackData('🌐 Open mini-site', `proj:db_mini_open:${project.id}`))
-        .text('🛠️ Edit DB config', ensureCallbackData('🛠️ Edit DB config', `proj:db_config:${project.id}`))
-        .row()
-        .text('📊 Run DB overview', ensureCallbackData('📊 Run DB overview', `proj:db_insights:${project.id}:0:0`))
-        .text('🧾 SQL runner', ensureCallbackData('🧾 SQL runner', `proj:sql_menu:${project.id}`))
-        .row();
-      if (index < cards.length - 1) {
-        lines.push('');
-      }
+    projects.forEach((project) => {
+      const label = `📦 ${project.name || project.id}`;
+      inline.text(label, `dbmenu:open:${project.id}`).row();
     });
   }
-
-  inline.text('⬅️ Back', ensureCallbackData('⬅️ Back', 'main:back'));
-
+  inline.text('⬅️ Back', 'main:back');
   return { text: lines.join('\n'), keyboard: inline };
+}
+
+async function renderDatabaseProjectPanel(ctx, projectId, notice) {
+  const project = await getProjectById(projectId, ctx);
+  if (!project) return;
+  const lines = [
+    `🗄️ Database — ${project.name || project.id}`,
+    notice || null,
+    '',
+    'Choose an action:',
+  ].filter(Boolean);
+  const inline = new InlineKeyboard()
+    .text('🌐 Open mini-site', `proj:db_mini_open:${projectId}`)
+    .row()
+    .text('🛠️ Edit DB config', `proj:db_config:${projectId}`)
+    .row()
+    .text('📊 Run DB overview', `proj:db_insights:${projectId}:0:0`)
+    .row()
+    .text('🧾 SQL runner', `proj:sql_menu:${projectId}`)
+    .row()
+    .text('⬅️ Back', 'dbmenu:list');
+  await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
 }
 
 async function renderDataCenterMenuForMessage(messageContext) {
   if (!messageContext) {
     return;
   }
-  const view = await buildDataCenterView(null);
-  const keyboardRows = view.keyboard?.inline_keyboard?.length ?? 0;
-  console.debug('[UI] Data center keyboard rows', { rows: keyboardRows, hasButtons: keyboardRows > 0 });
+  const view = await buildDataCenterView();
   try {
     await bot.api.editMessageText(
       messageContext.chatId,
@@ -12258,6 +13588,51 @@ async function renderDataCenterMenuForMessage(messageContext) {
   } catch (error) {
     console.error('[UI] Failed to update data center message', error);
   }
+}
+
+async function renderLogsProjectList(ctx, notice) {
+  const projects = await loadProjects();
+  const lines = ['📣 Logs', notice || null, '', 'Select a project:'].filter(Boolean);
+  const inline = new InlineKeyboard();
+  if (!projects.length) {
+    lines.push('', 'No projects configured yet.');
+    inline.text('➕ Add project', 'proj:add').row();
+  } else {
+    projects.forEach((project) => {
+      const label = `📦 ${project.name || project.id}`;
+      inline.text(label, `logmenu:open:${project.id}`).row();
+    });
+  }
+  inline.text('⬅️ Back', 'main:back');
+  await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
+}
+
+async function handleDatabaseMenuCallback(ctx, data) {
+  await ensureAnswerCallback(ctx);
+  const [, action, projectId] = data.split(':');
+  if (action === 'list') {
+    await renderDataCenterMenu(ctx);
+    return;
+  }
+  if (action === 'open' && projectId) {
+    await renderDatabaseProjectPanel(ctx, projectId);
+    return;
+  }
+  await renderDataCenterMenu(ctx);
+}
+
+async function handleLogsMenuCallback(ctx, data) {
+  await ensureAnswerCallback(ctx);
+  const [, action, projectId] = data.split(':');
+  if (action === 'list') {
+    await renderLogsProjectList(ctx);
+    return;
+  }
+  if (action === 'open' && projectId) {
+    await renderProjectLogAlerts(ctx, projectId);
+    return;
+  }
+  await renderLogsProjectList(ctx);
 }
 
 async function renderDeleteConfirmation(ctx, projectId) {
@@ -12280,7 +13655,7 @@ async function deleteProject(ctx, projectId) {
   const settings = await loadGlobalSettings();
   if (settings.defaultProjectId === projectId) {
     settings.defaultProjectId = undefined;
-    await saveGlobalSettings(settings);
+    await saveGlobalSettingsAndCache(settings);
   }
   await renderOrEdit(ctx, `Project ${projectId} deleted.`);
   await renderProjectsList(ctx);
@@ -12557,12 +13932,23 @@ function buildGlobalSettingsView(settings, projects, notice) {
     ? findProjectById(projects, settings.defaultProjectId)
     : undefined;
   const selfLogForwarding = getEffectiveSelfLogForwarding(settings);
+  const uiCleanup = normalizeUiCleanupSettings(settings);
+  const security = normalizeSecuritySettings(settings);
+  const logsDefaults = normalizeLogDefaults(settings);
+  const integrations = normalizeIntegrationSettings(settings);
+  const backups = normalizeBackupSettings(settings);
   const lines = [
     notice || null,
     `defaultBaseBranch: ${settings.defaultBaseBranch || DEFAULT_BASE_BRANCH}`,
     `defaultProjectId: ${settings.defaultProjectId || '-'}` +
       (defaultProject ? ` (${defaultProject.name || defaultProject.id})` : ''),
     `selfLogForwarding: ${selfLogForwarding.enabled ? 'enabled' : 'disabled'} (${selfLogForwarding.levels.join('/')})`,
+    '',
+    `🧹 UI cleanup: ${uiCleanup.autoCleanMenus ? 'ON' : 'OFF'} · TTL ${uiCleanup.ephemeralTtlSec || 'OFF'}s · panels ${uiCleanup.keepLastPanels}`,
+    `🔐 Security: admins ${security.adminIds.length} · mini-site TTL ${security.miniSiteSessionTtlMinutes}m · mask ${security.envMaskPolicy}`,
+    `📣 Logs: defaults ${logsDefaults.defaultLevels.join('/')} · allowed ${logsDefaults.allowedProjectsMode}`,
+    `🌐 Integrations: base URL ${integrations.baseUrlOverride || 'env'} · ping ${integrations.healthPingIntervalMinutes}m`,
+    `📦 Backups: channel ${backups.channelId || 'not set'}`,
   ].filter(Boolean);
   return { text: lines.join('\n'), keyboard: buildSettingsKeyboard() };
 }
@@ -12593,6 +13979,16 @@ async function renderGlobalSettingsForMessage(messageContext, notice) {
 
 function buildSettingsKeyboard() {
   return new InlineKeyboard()
+    .text('🧹 UI & Cleanup', 'gsettings:ui')
+    .row()
+    .text('🔐 Security', 'gsettings:security')
+    .row()
+    .text('📣 Logs', 'gsettings:logs')
+    .row()
+    .text('🌐 Integrations', 'gsettings:integrations')
+    .row()
+    .text('📦 Backups', 'gsettings:backups')
+    .row()
     .text('📣 Bot log alerts', 'gsettings:bot_log_alerts')
     .row()
     .text('📶 Ping test', 'gsettings:ping_test')
@@ -12600,6 +13996,157 @@ function buildSettingsKeyboard() {
     .text('🧹 Clear default project', 'gsettings:clear_default_project')
     .row()
     .text('⬅️ Back', 'gsettings:back');
+}
+
+function buildUiCleanupSettingsView(settings) {
+  const ui = normalizeUiCleanupSettings(settings);
+  const lines = [
+    '🧹 UI & Cleanup',
+    '',
+    `Auto-clean menus: ${ui.autoCleanMenus ? 'ON' : 'OFF'}`,
+    `Ephemeral TTL: ${ui.ephemeralTtlSec ? `${ui.ephemeralTtlSec}s` : 'OFF'}`,
+    `Keep last panels: ${ui.keepLastPanels}`,
+  ];
+  const inline = new InlineKeyboard()
+    .text(ui.autoCleanMenus ? '✅ Auto-clean ON' : '🚫 Auto-clean OFF', 'gsettings:ui_toggle')
+    .row()
+    .text(`⏱ 30s ${ui.ephemeralTtlSec === 30 ? '✅' : ''}`, 'gsettings:ui_ttl:30')
+    .text(`⏱ 60s ${ui.ephemeralTtlSec === 60 ? '✅' : ''}`, 'gsettings:ui_ttl:60')
+    .text(`⏱ OFF ${ui.ephemeralTtlSec === 0 ? '✅' : ''}`, 'gsettings:ui_ttl:0')
+    .row()
+    .text(`🧾 Keep 1 ${ui.keepLastPanels === 1 ? '✅' : ''}`, 'gsettings:ui_keep:1')
+    .text(`🧾 Keep 3 ${ui.keepLastPanels === 3 ? '✅' : ''}`, 'gsettings:ui_keep:3')
+    .text(`🧾 Keep 5 ${ui.keepLastPanels === 5 ? '✅' : ''}`, 'gsettings:ui_keep:5')
+    .row()
+    .text('⬅️ Back', 'gsettings:menu');
+  return { text: lines.join('\n'), keyboard: inline };
+}
+
+function buildSecuritySettingsView(settings) {
+  const security = normalizeSecuritySettings(settings);
+  const adminList = [String(ADMIN_TELEGRAM_ID), ...security.adminIds.map(String)];
+  const lines = [
+    '🔐 Security',
+    '',
+    `Admins: ${adminList.filter(Boolean).join(', ') || 'none'}`,
+    `Mini-site session TTL: ${security.miniSiteSessionTtlMinutes} min`,
+    `Env masking policy: ${security.envMaskPolicy}`,
+  ];
+  const inline = new InlineKeyboard()
+    .text('🪪 Admin list', 'gsettings:admins')
+    .row()
+    .text('🪪 TTL 10m', 'gsettings:mini_ttl:10')
+    .text('🪪 TTL 20m', 'gsettings:mini_ttl:20')
+    .text('🪪 TTL 30m', 'gsettings:mini_ttl:30')
+    .row()
+    .text(`🧯 Strict ${security.envMaskPolicy === 'strict' ? '✅' : ''}`, 'gsettings:env_mask:strict')
+    .text(`🧯 Spoiler ${security.envMaskPolicy === 'spoiler' ? '✅' : ''}`, 'gsettings:env_mask:spoiler')
+    .row()
+    .text('⬅️ Back', 'gsettings:menu');
+  return { text: lines.join('\n'), keyboard: inline };
+}
+
+function buildAdminListView(settings) {
+  const security = normalizeSecuritySettings(settings);
+  const lines = ['🪪 Admin list', ''];
+  if (!security.adminIds.length) {
+    lines.push('No extra admins configured.');
+  } else {
+    security.adminIds.forEach((id) => lines.push(`• ${id}`));
+  }
+  const inline = new InlineKeyboard()
+    .text('➕ Add admin', 'gsettings:admin_add')
+    .row();
+  security.adminIds.forEach((id) => {
+    inline.text(`🗑 Remove ${id}`, `gsettings:admin_remove:${id}`).row();
+  });
+  inline.text('⬅️ Back', 'gsettings:security');
+  return { text: lines.join('\n'), keyboard: inline };
+}
+
+function buildLogsSettingsView(settings) {
+  const logsDefaults = normalizeLogDefaults(settings);
+  const lines = [
+    '📣 Logs settings',
+    '',
+    `Default levels: ${logsDefaults.defaultLevels.join(' / ')}`,
+    `Allowed projects mode: ${logsDefaults.allowedProjectsMode}`,
+  ];
+  const selected = new Set(logsDefaults.defaultLevels);
+  const inline = new InlineKeyboard()
+    .text(`❗ Errors ${selected.has('error') ? '✅' : 'OFF'}`, 'gsettings:log_default_level:error')
+    .text(`⚠️ Warn ${selected.has('warn') ? '✅' : 'OFF'}`, 'gsettings:log_default_level:warn')
+    .row()
+    .text(`ℹ️ Info ${selected.has('info') ? '✅' : 'OFF'}`, 'gsettings:log_default_level:info')
+    .row()
+    .text(
+      `✅ Allow all ${logsDefaults.allowedProjectsMode === 'allow-all' ? '✅' : ''}`,
+      'gsettings:log_allowed:allow-all',
+    )
+    .text(
+      `📌 Whitelist ${logsDefaults.allowedProjectsMode === 'whitelist' ? '✅' : ''}`,
+      'gsettings:log_allowed:whitelist',
+    )
+    .row()
+    .text('⬅️ Back', 'gsettings:menu');
+  return { text: lines.join('\n'), keyboard: inline };
+}
+
+function buildIntegrationsSettingsView(settings) {
+  const integrations = normalizeIntegrationSettings(settings);
+  const lines = [
+    '🌐 Integrations',
+    '',
+    `Base URL override: ${integrations.baseUrlOverride || '(env)'}`,
+    `Default base branch: ${settings.defaultBaseBranch || DEFAULT_BASE_BRANCH}`,
+    `Health ping interval: ${integrations.healthPingIntervalMinutes} min`,
+  ];
+  const inline = new InlineKeyboard()
+    .text('🌐 Set base URL', 'gsettings:base_url')
+    .text('🧹 Clear base URL', 'gsettings:base_url_clear')
+    .row()
+    .text('🌿 Set default base branch', 'gsettings:change_default_base')
+    .row()
+    .text('🔁 Ping 5m', 'gsettings:ping_interval:5')
+    .text('🔁 Ping 10m', 'gsettings:ping_interval:10')
+    .text('🔁 Ping 30m', 'gsettings:ping_interval:30')
+    .row()
+    .text('⬅️ Back', 'gsettings:menu');
+  return { text: lines.join('\n'), keyboard: inline };
+}
+
+function buildBackupsSettingsView(settings) {
+  const backups = normalizeBackupSettings(settings);
+  const preview = buildBackupCaptionPreview(settings, {
+    projectName: 'Example Project',
+    projectId: 'example-project',
+    title: 'Example Note',
+    category: 'Idea',
+    status: NOTE_STATUS.OPEN,
+    createdAt: new Date().toISOString(),
+    noteId: '00000000-0000-0000-0000-000000000000',
+  });
+  const lines = [
+    '📦 Backups',
+    '',
+    `Backup channel: ${backups.channelId || 'not set'}`,
+    '',
+    'Caption preview:',
+    preview,
+  ];
+  const inline = new InlineKeyboard()
+    .text('📦 Set backup channel', 'gsettings:backup_channel')
+    .row()
+    .text('🧾 Edit caption template', 'gsettings:backup_caption')
+    .row()
+    .text('⬅️ Back', 'gsettings:menu');
+  return { text: lines.join('\n'), keyboard: inline };
+}
+
+function buildBackupCaptionPreview(settings, payload) {
+  const backups = normalizeBackupSettings(settings);
+  const template = backups.captionTemplate || '';
+  return formatBackupCaption(template, payload);
 }
 
 function buildSelfLogAlertsView(settings) {
@@ -13330,19 +14877,19 @@ async function requestUrlWithHeaders(method, targetUrl, headers = {}) {
 async function setDefaultProject(projectId) {
   const settings = await loadGlobalSettings();
   settings.defaultProjectId = projectId;
-  await saveGlobalSettings(settings);
+  await saveGlobalSettingsAndCache(settings);
 }
 
 async function clearDefaultProject() {
   const settings = await loadGlobalSettings();
   settings.defaultProjectId = undefined;
-  await saveGlobalSettings(settings);
+  await saveGlobalSettingsAndCache(settings);
 }
 
 async function clearDefaultBaseBranch() {
   const settings = await loadGlobalSettings();
   delete settings.defaultBaseBranch;
-  await saveGlobalSettings(settings);
+  await saveGlobalSettingsAndCache(settings);
 }
 
 async function updateProjectField(projectId, field, value) {
@@ -13386,7 +14933,7 @@ async function migrateProjectId(oldProjectId, newProjectId) {
   const settings = await loadGlobalSettings();
   if (settings.defaultProjectId === oldProjectId) {
     settings.defaultProjectId = newProjectId;
-    await saveGlobalSettings(settings);
+    await saveGlobalSettingsAndCache(settings);
   }
   if (envScanCache.has(oldProjectId)) {
     envScanCache.set(newProjectId, envScanCache.get(oldProjectId));
@@ -13454,6 +15001,8 @@ function requestUrl(method, targetUrl, body) {
 }
 
 function getPublicBaseUrl() {
+  const override = cachedSettings?.integrations?.baseUrlOverride;
+  if (override) return override;
   return (
     process.env.PUBLIC_BASE_URL ||
     process.env.RENDER_EXTERNAL_URL ||
@@ -13622,6 +15171,8 @@ async function initializeConfig() {
 
 async function loadConfig() {
   await initializeConfig();
+  cachedSettings = await loadGlobalSettings();
+  cachedSettingsAt = Date.now();
 }
 
 async function initDb() {
@@ -14020,22 +15571,29 @@ async function handleMiniSiteRequest(req, res, url) {
     const projectId = pathParts[1] ? decodeURIComponent(pathParts[1]) : null;
 
     if (req.method === 'GET' && pathParts.length === 1) {
-      const projects = await loadProjects();
-      const cards = projects
-        .map((projectItem) => {
-          const label = escapeHtml(projectItem.name || projectItem.id);
-          return `
-            <div class="card">
-              <h3>${label}</h3>
-              <p class="muted">ID: ${escapeHtml(projectItem.id)}</p>
-              <a class="button" href="/db-mini/${encodeURIComponent(projectItem.id)}">Open project</a>
-            </div>
-          `;
-        })
-        .join('');
+      let cards = '';
+      let errorNotice = '';
+      try {
+        const projects = await loadProjects();
+        cards = projects
+          .map((projectItem) => {
+            const label = escapeHtml(projectItem.name || projectItem.id);
+            return `
+              <div class="card">
+                <h3>${label}</h3>
+                <p class="muted">ID: ${escapeHtml(projectItem.id)}</p>
+                <a class="button" href="/db-mini/${encodeURIComponent(projectItem.id)}">Open project</a>
+              </div>
+            `;
+          })
+          .join('');
+      } catch (error) {
+        console.error('[mini-site] failed to load projects list', error);
+        errorNotice = '<div class="card"><p>Failed to load projects.</p><p class="muted">Check logs and try again.</p></div>';
+      }
       const body = cards
         ? `<div class="grid two-col">${cards}</div>`
-        : '<p class="muted">No projects configured yet.</p>';
+        : errorNotice || '<p class="muted">No projects configured yet.</p>';
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
       res.end(renderMiniSiteLayout('Project list', body));
       return true;
@@ -14124,7 +15682,8 @@ async function handleMiniSiteRequest(req, res, url) {
       const orderBy = primaryKeys.length
         ? `ORDER BY ${primaryKeys.map((key) => quoteIdentifier(key)).join(', ')}`
         : '';
-      const { rows } = await pool.query(
+      const { rows } = await runMiniSiteQuery(
+        pool,
         `SELECT ctid, * FROM ${quoteIdentifier(schema)}.${quoteIdentifier(table)} ${orderBy} LIMIT $1 OFFSET $2`,
         [MINI_SITE_PAGE_SIZE + 1, offset],
       );
@@ -14188,13 +15747,15 @@ async function handleMiniSiteRequest(req, res, url) {
       if (keyData.mode === 'pk') {
         const whereParts = primaryKeys.map((key, index) => `${quoteIdentifier(key)} = $${index + 1}`);
         const values = primaryKeys.map((key) => keyData.values?.[key]);
-        const { rows } = await pool.query(
+        const { rows } = await runMiniSiteQuery(
+          pool,
           `SELECT * FROM ${quoteIdentifier(schema)}.${quoteIdentifier(table)} WHERE ${whereParts.join(' AND ')} LIMIT 1`,
           values,
         );
         row = rows[0] || null;
       } else if (keyData.mode === 'ctid') {
-        const { rows } = await pool.query(
+        const { rows } = await runMiniSiteQuery(
+          pool,
           `SELECT ctid, * FROM ${quoteIdentifier(schema)}.${quoteIdentifier(table)} WHERE ctid = $1 LIMIT 1`,
           [keyData.values?.ctid],
         );
@@ -14309,7 +15870,8 @@ async function handleMiniSiteRequest(req, res, url) {
       }
       const whereParts = primaryKeys.map((key, index) => `${quoteIdentifier(key)} = $${values.length + index + 1}`);
       const whereValues = primaryKeys.map((key) => keyData.values?.[key]);
-      await pool.query(
+      await runMiniSiteQuery(
+        pool,
         `UPDATE ${quoteIdentifier(schema)}.${quoteIdentifier(table)} SET ${updates.join(', ')} WHERE ${whereParts.join(' AND ')}`,
         [...values, ...whereValues],
       );
@@ -14338,9 +15900,14 @@ async function handleMiniSiteRequest(req, res, url) {
       isSelfSigned ||
       String(error?.message || '').toLowerCase().includes('ssl') ||
       String(error?.message || '').toLowerCase().includes('certificate');
+    const isTimeout =
+      errorCode === 'ETIMEDOUT' ||
+      String(error?.message || '').toLowerCase().includes('timeout');
     let adminHint = null;
     if (isSslError) {
       adminHint = `SSL error code: ${errorCode}. Suggestion: set dbSslVerify=false or provide CA.`;
+    } else if (isTimeout) {
+      adminHint = `Connection timed out. Check network/SSL settings or increase timeout.`;
     }
     res.writeHead(502, { 'Content-Type': 'text/html; charset=utf-8' });
     res.end(renderMiniSiteDbErrorPage({ requestId, adminHint }));
@@ -14529,14 +16096,22 @@ function startHttpServer() {
             return;
           }
 
-          const targetChatId = forwarding.destinationChatId;
-          if (!targetChatId) {
+          const targets = new Set();
+          const mode = forwarding.destinationMode || 'admin';
+          if (mode === 'admin' || mode === 'both') {
+            targets.add(ADMIN_TELEGRAM_ID);
+          }
+          if ((mode === 'channel' || mode === 'both') && forwarding.destinationChatId) {
+            targets.add(forwarding.destinationChatId);
+          }
+          const resolvedTargets = Array.from(targets).filter(Boolean);
+          if (!resolvedTargets.length) {
             res.writeHead(200, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ ok: true, forwarded: false, reason: 'no destination' }));
             return;
           }
           const message = formatProjectLogMessage(project, event);
-          await sendSafeMessage(BOT_TOKEN, targetChatId, message);
+          await Promise.all(resolvedTargets.map((chatId) => sendSafeMessage(BOT_TOKEN, chatId, message)));
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: true, forwarded: true }));
         } catch (error) {

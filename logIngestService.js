@@ -258,14 +258,24 @@ function createLogIngestService(options) {
       return { ok: true, status: 'level_filtered' };
     }
 
-    const targetChatId = settings.destinationChatId;
-    if (!targetChatId) {
+    const destinationMode = settings.destinationMode || 'admin';
+    const targets = new Set();
+    if (destinationMode === 'admin' || destinationMode === 'both') {
+      targets.add(process.env.ADMIN_TELEGRAM_ID || process.env.ADMIN_CHAT_ID);
+    }
+    if (destinationMode === 'channel' || destinationMode === 'both') {
+      if (settings.destinationChatId) {
+        targets.add(settings.destinationChatId);
+      }
+    }
+    const resolvedTargets = Array.from(targets).filter(Boolean);
+    if (!resolvedTargets.length) {
       return { ok: true, status: 'no_destination' };
     }
 
     try {
       const message = buildTelegramMessage(entry);
-      await sendTelegramMessage(targetChatId, message);
+      await Promise.all(resolvedTargets.map((chatId) => sendTelegramMessage(chatId, message)));
       return { ok: true, status: 'forwarded' };
     } catch (error) {
       logger.error('[log-ingest] Failed to forward to Telegram', {
