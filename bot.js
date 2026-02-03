@@ -247,6 +247,9 @@ const cronCreateRetryCache = new Map();
 const cronErrorDetailsCache = new Map();
 const panelMessageHistoryByChat = new Map();
 const activePanelMessageIdByChat = new Map();
+const navigationQueueByChat = new Map();
+const navigationLocksByChat = new Map();
+const navigationOperationByChat = new Map();
 const ephemeralMessageIdsByChat = new Map();
 const ephemeralTimersByChat = new Map();
 const webSessions = new Map();
@@ -562,6 +565,35 @@ function getChatIdFromCtx(ctx) {
   );
 }
 
+function getNavigationQueue(chatId) {
+  if (!navigationQueueByChat.has(chatId)) {
+    navigationQueueByChat.set(chatId, []);
+  }
+  return navigationQueueByChat.get(chatId);
+}
+
+function getNavigationOperationState(chatId) {
+  if (!navigationOperationByChat.has(chatId)) {
+    navigationOperationByChat.set(chatId, { inProgress: false, noticeMessageId: null });
+  }
+  return navigationOperationByChat.get(chatId);
+}
+
+function clearNavigationOperationState(chatId) {
+  if (!chatId) return;
+  navigationOperationByChat.delete(chatId);
+}
+
+async function withNavigationLock(chatId, handler) {
+  if (!chatId) {
+    return handler();
+  }
+  const current = navigationLocksByChat.get(chatId) || Promise.resolve();
+  const next = current.then(handler, handler);
+  navigationLocksByChat.set(chatId, next.catch(() => null));
+  return next;
+}
+
 async function safeDeleteMessage(ctx, chatId, messageId, reason) {
   if (!chatId || !messageId) return;
   const api = ctx?.api || bot.api;
@@ -653,6 +685,11 @@ function getPanelHistory(chatId) {
   return panelMessageHistoryByChat.get(chatId);
 }
 
+function setPanelHistoryForChat(chatId, history) {
+  if (!chatId) return;
+  panelMessageHistoryByChat.set(chatId, Array.isArray(history) ? [...history] : []);
+}
+
 function getActivePanelMessageId(chatId) {
   if (!chatId) return null;
   return activePanelMessageIdByChat.get(chatId) || null;
@@ -709,7 +746,11 @@ async function clearPanelMessages(ctx, reason) {
   const chatId = getChatIdFromCtx(ctx);
   if (!chatId) return;
   const history = getPanelHistory(chatId);
-  await Promise.all(history.map((messageId) => safeDeleteMessage(ctx, chatId, messageId, reason)));
+  const activePanelMessageId = getActivePanelMessageId(chatId);
+  const targets = activePanelMessageId && !history.includes(activePanelMessageId)
+    ? [...history, activePanelMessageId]
+    : history;
+  await Promise.all(targets.map((messageId) => safeDeleteMessage(ctx, chatId, messageId, reason)));
   panelMessageHistoryByChat.set(chatId, []);
   clearActivePanelMessageId(chatId);
 }
@@ -830,6 +871,120 @@ async function renderOrEdit(ctx, text, extra) {
     return renderPanel(ctx, text, extra);
   }
   return respond(ctx, text, extra);
+}
+
+function normalizeRoute(route) {
+  if (!route) return 'main';
+  return String(route).trim().toLowerCase();
+}
+
+function buildNavigationContext(chatId, userId, ctx) {
+  const resolvedChatId = chatId || getChatIdFromCtx(ctx);
+  const resolvedUserId = userId || ctx?.from?.id || null;
+  return {
+    ...ctx,
+    api: ctx?.api || bot.api,
+    chat: ctx?.chat || (resolvedChatId ? { id: resolvedChatId } : undefined),
+    from: ctx?.from || (resolvedUserId ? { id: resolvedUserId } : undefined),
+  };
+}
+
+function getNavigationHandlers() {
+  return {
+    main: async (ctx) => renderMainMenu(ctx),
+    projects: async (ctx) => renderProjectsList(ctx),
+    database: async (ctx) => renderDataCenterMenu(ctx),
+    cronjobs: async (ctx) => renderCronMenu(ctx),
+    settings: async (ctx) => renderGlobalSettings(ctx),
+    logs: async (ctx) => renderLogsProjectList(ctx, '📣 Logs'),
+    deploy: async (ctx) => renderDeploysProjectList(ctx),
+  };
+}
+
+async function enqueueNavigation(chatId, request) {
+  if (!chatId) return;
+  const queue = getNavigationQueue(chatId);
+  queue.push(request);
+}
+
+async function flushNavigationQueue(ctx, chatId) {
+  if (!chatId) return;
+  const queue = getNavigationQueue(chatId);
+  if (!queue.length) return;
+  const latest = queue.pop();
+  queue.length = 0;
+  await navigateTo(chatId, latest.userId, latest.route, { ...latest.options, ctx });
+}
+
+async function navigateTo(chatId, userId, route, options = {}) {
+  const normalizedRoute = normalizeRoute(route);
+  const handlers = options.handlers || getNavigationHandlers();
+  const ctx = buildNavigationContext(chatId, userId, options.ctx);
+  const targetChatId = getChatIdFromCtx(ctx);
+  const targetUserId = ctx?.from?.id || userId || null;
+  const handler = handlers[normalizedRoute] || handlers.main;
+
+  if (options.resetState !== false) {
+    if (targetUserId) {
+      userState.delete(targetUserId);
+      clearUserState(targetUserId);
+      clearPatchSession(targetUserId);
+    }
+  }
+
+  if (options.deleteIncomingMessage) {
+    await safeDeleteMessage(ctx, ctx.message?.chat?.id, ctx.message?.message_id, 'nav_delete_incoming');
+  }
+
+  if (options.resetMenus) {
+    await clearPanelMessages(ctx, 'nav_reset');
+  }
+
+  const operationState = targetChatId ? getNavigationOperationState(targetChatId) : null;
+  if (operationState?.inProgress && options.allowDuringOperation !== true) {
+    await enqueueNavigation(targetChatId, {
+      route: normalizedRoute,
+      userId: targetUserId,
+      options: { ...options, deleteIncomingMessage: false },
+    });
+    if (!operationState.noticeMessageId && targetChatId) {
+      try {
+        const notice = await replySafely(ctx, '⏳ Operation in progress…');
+        if (notice?.message_id) {
+          operationState.noticeMessageId = notice.message_id;
+        }
+      } catch (error) {
+        console.warn('[navigation] Failed to send operation notice', error?.message);
+      }
+    }
+    return { queued: true };
+  }
+
+  return withNavigationLock(targetChatId, async () => {
+    await handler(ctx);
+    return { queued: false };
+  });
+}
+
+function setBotApiForTests(api) {
+  if (!api) return;
+  Object.assign(bot.api, api);
+}
+
+function setNavigationOperationInProgress(chatId, inProgress) {
+  if (!chatId) return;
+  const state = getNavigationOperationState(chatId);
+  state.inProgress = Boolean(inProgress);
+  if (!inProgress) {
+    state.noticeMessageId = null;
+  }
+}
+
+function resetNavigationState(chatId) {
+  if (!chatId) return;
+  navigationQueueByChat.delete(chatId);
+  navigationLocksByChat.delete(chatId);
+  clearNavigationOperationState(chatId);
 }
 
 function buildCronCorrelationId() {
@@ -1376,11 +1531,13 @@ async function resetToMainMenu(ctx, notice, options = {}) {
   await renderMainMenu(ctx);
 }
 
-async function handleReplyKeyboardNavigation(ctx, handler) {
+async function handleReplyKeyboardNavigation(ctx, route) {
   resetUserState(ctx);
   await safeDeleteMessage(ctx, ctx.message?.chat?.id, ctx.message?.message_id, 'reply_keyboard_nav');
   await clearEphemeralMessages(ctx, 'reply_keyboard_nav');
-  return handler();
+  const chatId = getChatIdFromCtx(ctx);
+  const userId = ctx.from?.id;
+  return navigateTo(chatId, userId, route, { ctx });
 }
 
 function buildMainMenuInlineKeyboard() {
@@ -1545,43 +1702,129 @@ const mainKeyboard = new Keyboard()
   .text('🚀 Deploys')
   .resized();
 
+const GLOBAL_COMMANDS = [
+  { command: 'project', description: '📦 Projects (Manage projects)' },
+  { command: 'database', description: '🗄️ Database (Project databases & env vault)' },
+  { command: 'cronjobs', description: '⏱ Cronjobs (Scheduled jobs)' },
+  { command: 'setting', description: '⚙️ Settings (Bot & workspace settings)' },
+  { command: 'logs', description: '📣 Logs (Logs & log tests)' },
+  { command: 'deploy', description: '🚀 Deploys (Deploy status & alerts)' },
+];
+
+const GLOBAL_COMMAND_SCOPE = { type: 'all_private_chats' };
+
 const GLOBAL_COMMAND_ALIASES = {
   '/setting': '/settings',
   '/settings': '/settings',
   '/project': '/projects',
   '/projects': '/projects',
   '/database': '/database',
-  '/cronjob': '/cronjob',
-  '/cronjobs': '/cronjob',
-  '/cronjob': '/cronjob',
+  '/cronjob': '/cronjobs',
+  '/cronjobs': '/cronjobs',
+  '/deploy': '/deploy',
   '/logs': '/logs',
   '/start': '/start',
 };
 
-async function handleGlobalCommand(ctx, command) {
-  resetUserState(ctx);
-  clearPatchSession(ctx.from.id);
-  switch (command) {
-    case '/start':
-      await resetToMainMenu(ctx, null, { freshPanel: true, deleteIncomingMessage: true });
-      return true;
-    case '/settings':
-      await renderGlobalSettings(ctx);
-      return true;
-    case '/logs':
-      await renderLogsProjectList(ctx, '📣 Logs');
-      return true;
-    case '/projects':
-      await renderProjectsList(ctx);
-      return true;
-    case '/database':
-      await renderDataCenterMenu(ctx);
-      return true;
-    case '/cronjob':
-      await renderCronMenu(ctx);
-      return true;
-    default:
-      return false;
+const GLOBAL_COMMAND_ROUTES = {
+  '/settings': 'settings',
+  '/projects': 'projects',
+  '/database': 'database',
+  '/cronjobs': 'cronjobs',
+  '/logs': 'logs',
+  '/deploy': 'deploy',
+};
+
+const START_PAYLOAD_ROUTES = new Map([
+  ['main', 'main'],
+  ['projects', 'projects'],
+  ['project', 'projects'],
+  ['p', 'projects'],
+  ['database', 'database'],
+  ['db', 'database'],
+  ['cronjobs', 'cronjobs'],
+  ['cronjob', 'cronjobs'],
+  ['cj', 'cronjobs'],
+  ['settings', 'settings'],
+  ['setting', 'settings'],
+  ['s', 'settings'],
+  ['logs', 'logs'],
+  ['log', 'logs'],
+  ['l', 'logs'],
+  ['deploy', 'deploy'],
+  ['deploys', 'deploy'],
+  ['d', 'deploy'],
+]);
+
+function parseStartPayload(payload) {
+  const normalized = normalizeRoute(payload);
+  if (!normalized) return 'main';
+  return START_PAYLOAD_ROUTES.get(normalized) || 'main';
+}
+
+async function handleStartCommand(ctx, payload) {
+  const payloadText = payload ? String(payload).trim() : '';
+  const route = parseStartPayload(payloadText);
+  const normalizedPayload = normalizeRoute(payloadText);
+  if (payloadText && route === 'main' && normalizedPayload !== 'main') {
+    console.warn('[navigation] Unknown start payload', { payload: payloadText });
+  }
+  await safeDeleteMessage(ctx, ctx.message?.chat?.id, ctx.message?.message_id, 'start_command');
+  const chatId = getChatIdFromCtx(ctx);
+  const userId = ctx.from?.id;
+  await navigateTo(chatId, userId, route, { ctx, resetMenus: true });
+  return true;
+}
+
+async function handleGlobalCommand(ctx, command, payload) {
+  if (command === '/start') {
+    await handleStartCommand(ctx, payload);
+    return true;
+  }
+  const route = GLOBAL_COMMAND_ROUTES[command];
+  if (!route) return false;
+  await safeDeleteMessage(ctx, ctx.message?.chat?.id, ctx.message?.message_id, 'slash_command');
+  const chatId = getChatIdFromCtx(ctx);
+  const userId = ctx.from?.id;
+  await navigateTo(chatId, userId, route, { ctx });
+  return true;
+}
+
+function normalizeCommandList(commands) {
+  if (!Array.isArray(commands)) return [];
+  return commands
+    .map((entry) => ({
+      command: String(entry.command || '').trim(),
+      description: String(entry.description || '').trim(),
+    }))
+    .filter((entry) => entry.command);
+}
+
+function commandsMatch(current, desired) {
+  const currentNorm = normalizeCommandList(current);
+  const desiredNorm = normalizeCommandList(desired);
+  if (currentNorm.length !== desiredNorm.length) return false;
+  const sortByCommand = (a, b) => a.command.localeCompare(b.command);
+  currentNorm.sort(sortByCommand);
+  desiredNorm.sort(sortByCommand);
+  return currentNorm.every(
+    (entry, index) =>
+      entry.command === desiredNorm[index].command &&
+      entry.description === desiredNorm[index].description,
+  );
+}
+
+async function registerGlobalCommands() {
+  try {
+    const existing = await bot.api.getMyCommands({ scope: GLOBAL_COMMAND_SCOPE });
+    if (commandsMatch(existing, GLOBAL_COMMANDS)) {
+      console.log('[boot] Global commands already configured.');
+      return;
+    }
+    await bot.api.setMyCommands(GLOBAL_COMMANDS, { scope: GLOBAL_COMMAND_SCOPE });
+    console.log('[boot] Global commands registered.');
+  } catch (error) {
+    console.error('[boot] Failed to register global commands', error?.message || error);
   }
 }
 
@@ -1611,11 +1854,12 @@ bot.on('message:text', async (ctx, next) => {
       });
       resetUserState(ctx);
     }
-    const command = text.split(/\s+/)[0].toLowerCase();
+    const [commandToken, ...rest] = text.split(/\s+/);
+    const command = commandToken.toLowerCase();
     const normalizedCommand = command.split('@')[0];
-    const mapped = GLOBAL_COMMAND_ALIASES[normalizedCommand];
+    const mapped = GLOBAL_COMMAND_ALIASES[normalizedCommand] || normalizedCommand;
     if (mapped) {
-      const handled = await handleGlobalCommand(ctx, mapped);
+      const handled = await handleGlobalCommand(ctx, mapped, rest.join(' '));
       if (handled) {
         return;
       }
@@ -1690,31 +1934,31 @@ bot.on('message', async (ctx, next) => {
 });
 
 bot.command('start', async (ctx) => {
-  await resetToMainMenu(ctx, null, { freshPanel: true, deleteIncomingMessage: true });
+  await handleStartCommand(ctx, ctx.match || '');
 });
 
 bot.hears('📦 Projects', async (ctx) => {
-  await handleReplyKeyboardNavigation(ctx, () => renderProjectsList(ctx));
+  await handleReplyKeyboardNavigation(ctx, 'projects');
 });
 
 bot.hears('🗄️ Database', async (ctx) => {
-  await handleReplyKeyboardNavigation(ctx, () => renderDataCenterMenu(ctx));
+  await handleReplyKeyboardNavigation(ctx, 'database');
 });
 
 bot.hears('⚙️ Settings', async (ctx) => {
-  await handleReplyKeyboardNavigation(ctx, () => renderGlobalSettings(ctx));
+  await handleReplyKeyboardNavigation(ctx, 'settings');
 });
 
 bot.hears('⏱️ Cronjobs', async (ctx) => {
-  await handleReplyKeyboardNavigation(ctx, () => renderCronMenu(ctx));
+  await handleReplyKeyboardNavigation(ctx, 'cronjobs');
 });
 
 bot.hears('📣 Logs', async (ctx) => {
-  await handleReplyKeyboardNavigation(ctx, () => renderLogsProjectList(ctx));
+  await handleReplyKeyboardNavigation(ctx, 'logs');
 });
 
 bot.hears('🚀 Deploys', async (ctx) => {
-  await handleReplyKeyboardNavigation(ctx, () => renderDeploysProjectList(ctx));
+  await handleReplyKeyboardNavigation(ctx, 'deploy');
 });
 
 bot.callbackQuery('cancel_input', wrapCallbackHandler(async (ctx) => {
@@ -2113,25 +2357,25 @@ async function handleMainCallback(ctx, data) {
   const [, action] = data.split(':');
   switch (action) {
     case 'back':
-      await resetToMainMenu(ctx);
+      await navigateTo(getChatIdFromCtx(ctx), ctx.from?.id, 'main', { ctx });
       break;
     case 'projects':
-      await renderProjectsList(ctx);
+      await navigateTo(getChatIdFromCtx(ctx), ctx.from?.id, 'projects', { ctx });
       break;
     case 'database':
-      await renderDataCenterMenu(ctx);
+      await navigateTo(getChatIdFromCtx(ctx), ctx.from?.id, 'database', { ctx });
       break;
     case 'cronjobs':
-      await renderCronMenu(ctx);
+      await navigateTo(getChatIdFromCtx(ctx), ctx.from?.id, 'cronjobs', { ctx });
       break;
     case 'settings':
-      await renderGlobalSettings(ctx);
+      await navigateTo(getChatIdFromCtx(ctx), ctx.from?.id, 'settings', { ctx });
       break;
     case 'logs':
-      await renderLogsProjectList(ctx, '📣 Logs');
+      await navigateTo(getChatIdFromCtx(ctx), ctx.from?.id, 'logs', { ctx });
       break;
     case 'deploys':
-      await renderDeploysProjectList(ctx);
+      await navigateTo(getChatIdFromCtx(ctx), ctx.from?.id, 'deploy', { ctx });
       break;
     default:
       break;
@@ -12601,6 +12845,12 @@ async function updateProgressMessage(ctx, progress, payload) {
       console.error('[log-test] Failed to update progress message', sendError);
     }
   }
+  if (status === 'success' || status === 'failed') {
+    const operationState = getNavigationOperationState(progress.chatId);
+    operationState.inProgress = false;
+    operationState.noticeMessageId = null;
+    await flushNavigationQueue(ctx, progress.chatId);
+  }
 }
 
 function createLogTestProgress(ctx, header, steps) {
@@ -12613,8 +12863,13 @@ function createLogTestProgress(ctx, header, steps) {
 }
 
 function createOperationProgress(ctx, header, totalSteps) {
+  const chatId = ctx.chat?.id;
+  if (chatId) {
+    const operationState = getNavigationOperationState(chatId);
+    operationState.inProgress = true;
+  }
   return {
-    chatId: ctx.chat?.id,
+    chatId,
     messageId: null,
     totalSteps,
     header,
@@ -20525,6 +20780,7 @@ async function startBot() {
   } catch (error) {
     console.error('[Project Manager] Failed to delete webhook:', error?.stack || error);
   }
+  await registerGlobalCommands();
   await startBotPolling();
   scheduleLogTestDailyReminder();
   scheduleRenderPolling();
@@ -20543,6 +20799,20 @@ module.exports = {
   classifyDiagnosticsError,
   maskEnvValue,
   evaluateEnvValueStatus,
+  navigateTo,
+  parseStartPayload,
+  handleGlobalCommand,
+  handleStartCommand,
+  handleReplyKeyboardNavigation,
+  __test: {
+    setBotApiForTests,
+    resetNavigationState,
+    setNavigationOperationInProgress,
+    setActivePanelMessageId,
+    getActivePanelMessageId,
+    clearActivePanelMessageId,
+    setPanelHistoryForChat,
+  },
 };
 
 async function main() {
