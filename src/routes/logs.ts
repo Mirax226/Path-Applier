@@ -235,6 +235,7 @@ function createLogsRouter(options) {
     token,
     adminChatId,
     allowedProjects,
+    getAllowedProjectsMode,
     logger = console,
     sendTelegramMessage,
     now = () => Date.now(),
@@ -322,7 +323,8 @@ function createLogsRouter(options) {
 
     const entry = validation.value;
     const projectKey = entry.project.toLowerCase();
-    const allowAllProjects = allowedSet.size === 0;
+    const mode = typeof getAllowedProjectsMode === 'function' ? getAllowedProjectsMode() : null;
+    const allowAllProjects = mode === 'allow-all' || allowedSet.size === 0;
     if (!allowAllProjects && !allowedSet.has(projectKey)) {
       logger.error('[LOG_API] rejected: project not allowed', { project: entry.project });
       res.writeHead(403, { 'Content-Type': 'application/json' });

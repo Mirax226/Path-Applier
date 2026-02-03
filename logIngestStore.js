@@ -11,6 +11,7 @@ const DEFAULT_SETTINGS = {
   enabled: true,
   levels: ['error'],
   destinationChatId: null,
+  destinationMode: 'admin',
 };
 
 async function ensureLogTables(db) {
@@ -21,9 +22,13 @@ async function ensureLogTables(db) {
       enabled BOOLEAN NOT NULL DEFAULT TRUE,
       levels TEXT[] NOT NULL DEFAULT ARRAY['error']::TEXT[],
       destination_chat_id TEXT NULL,
+      destination_mode TEXT NOT NULL DEFAULT 'admin',
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
   `);
+  await db.query(
+    `ALTER TABLE project_log_settings ADD COLUMN IF NOT EXISTS destination_mode TEXT NOT NULL DEFAULT 'admin'`
+  );
   await db.query(`
     CREATE TABLE IF NOT EXISTS project_recent_logs (
       id UUID PRIMARY KEY,
@@ -60,10 +65,14 @@ function normalizeLevels(levels) {
 
 function normalizeSettings(settings) {
   const payload = settings || {};
+  const mode = ['admin', 'channel', 'both'].includes(payload.destinationMode)
+    ? payload.destinationMode
+    : DEFAULT_SETTINGS.destinationMode;
   return {
     enabled: typeof payload.enabled === 'boolean' ? payload.enabled : DEFAULT_SETTINGS.enabled,
     levels: normalizeLevels(payload.levels),
     destinationChatId: payload.destinationChatId ? String(payload.destinationChatId) : null,
+    destinationMode: mode,
   };
 }
 
@@ -80,7 +89,7 @@ async function getProjectLogSettings(projectId) {
     return memory.settings.get(projectId) || null;
   }
   const { rows } = await db.query(
-    'SELECT enabled, levels, destination_chat_id FROM project_log_settings WHERE project_id = $1 LIMIT 1',
+    'SELECT enabled, levels, destination_chat_id, destination_mode FROM project_log_settings WHERE project_id = $1 LIMIT 1',
     [projectId],
   );
   if (!rows.length) return null;
@@ -88,6 +97,7 @@ async function getProjectLogSettings(projectId) {
     enabled: rows[0].enabled,
     levels: rows[0].levels,
     destinationChatId: rows[0].destination_chat_id,
+    destinationMode: rows[0].destination_mode,
   });
 }
 
@@ -101,16 +111,17 @@ async function upsertProjectLogSettings(projectId, settings) {
   try {
     await db.query(
       `
-        INSERT INTO project_log_settings (project_id, enabled, levels, destination_chat_id)
-        VALUES ($1, $2, $3, $4)
+        INSERT INTO project_log_settings (project_id, enabled, levels, destination_chat_id, destination_mode)
+        VALUES ($1, $2, $3, $4, $5)
         ON CONFLICT (project_id)
         DO UPDATE SET
           enabled = EXCLUDED.enabled,
           levels = EXCLUDED.levels,
           destination_chat_id = EXCLUDED.destination_chat_id,
+          destination_mode = EXCLUDED.destination_mode,
           updated_at = NOW()
       `,
-      [projectId, normalized.enabled, normalized.levels, normalized.destinationChatId],
+      [projectId, normalized.enabled, normalized.levels, normalized.destinationChatId, normalized.destinationMode],
     );
   } catch (error) {
     console.error('[log-settings] Failed to upsert log settings', error);
