@@ -21,9 +21,9 @@ function sanitizePathSegment(value) {
 
 function makePatchBranchName(projectId) {
   const slug = slugifyProjectId(projectId || 'project');
-  const ts = new Date().toISOString().replace(/[:.]/g, '-');
-  const rand = Math.random().toString(36).slice(2, 8);
-  return `patch/${slug}/${ts}-${rand}`;
+  const date = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+  const rand = Math.random().toString(36).slice(2, 6);
+  return `pm/${slug}/${date}-${rand}`;
 }
 
 function getDefaultWorkingDir(repoSlug) {
@@ -206,4 +206,5 @@ module.exports = {
   slugifyProjectId,
   resolveWorkingDir,
   getRepoSlug,
+  applyGitTokenToUrl,
 };
