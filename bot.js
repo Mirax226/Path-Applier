@@ -292,6 +292,22 @@ const LOG_TEST_CALL_TIMEOUTS_MS = {
 };
 const LOG_TEST_REMINDER_SNOOZE_DAYS = [1, 3, 7];
 const LOG_TEST_DAILY_REMINDER_ENABLED = String(process.env.LOG_TEST_DAILY_REMINDER || '').toLowerCase() === 'true';
+const LOG_TEST_PROGRESS_STEPS = [
+  'Resolve project config',
+  'Diagnostics gate (/pm/diagnostics)',
+  'Verify PM log ingestion endpoint reachable',
+  'Trigger client log test',
+  'Wait for log arrival',
+  'Validate log format + project tag correctness',
+  'Summarize results + next actions',
+];
+const LOG_TEST_DIAGNOSTICS_TIMEOUT_MS = 12_000;
+const REPO_INSPECTION_RATE_LIMIT = { limit: 3, windowMs: 60 * 60 * 1000 };
+const REPO_PR_RATE_LIMIT = { limit: 1, windowMs: 60 * 60 * 1000 };
+
+const repoInspectionRateLimits = new Map();
+const repoPrRateLimits = new Map();
+const repoInspectionCache = new Map();
 
 const CRON_RATE_LIMIT_MESSAGE = 'Cron API rate limit reached. Please wait a bit and try again.';
 const CRON_JOBS_CACHE_TTL_MS = 30_000;
@@ -2599,7 +2615,8 @@ async function handleLogTestCallback(ctx, data) {
       return;
     }
     const logTest = normalizeLogTestSettings(project);
-    if (!logTest.diagnosticsEndpointUrl) {
+    const diagnosticsUrl = resolveDiagnosticsEndpoint(project, logTest);
+    if (!diagnosticsUrl) {
       await renderProjectLogAlerts(ctx, projectId, '⚠️ Diagnostics endpoint not configured.');
       return;
     }
@@ -2613,6 +2630,7 @@ async function handleLogTestCallback(ctx, data) {
       await renderProjectLogAlerts(ctx, projectId, `❌ Diagnostics failed.\n${diag.error}`);
       return;
     }
+    await storeLogDiagnosticsSnapshot(projectId, diag.payload);
     await renderProjectLogAlerts(ctx, projectId, buildLogTestDiagnosticsReport(diag.payload));
     return;
   }
@@ -2653,7 +2671,7 @@ async function handleLogTestCallback(ctx, data) {
 
   if (action === 'generate_task' && projectId) {
     const task = [
-      '🧩 Codex task: add PM log test + diagnostics',
+      '🧩 Codex task: add diagnostics + test endpoint + log sender',
       '',
       'Implement:',
       '- POST /pm/test-log (alias /__pm/test-log) with PM_TEST_TOKEN auth.',
@@ -2663,6 +2681,46 @@ async function handleLogTestCallback(ctx, data) {
       'Include correlationId in meta, add interceptors + process hooks, and keep secrets masked.',
     ].join('\n');
     await renderOrEdit(ctx, task, { reply_markup: buildBackKeyboard(`projlog:menu:${projectId}`) });
+    return;
+  }
+
+  if (action === 'inspect_repo' && projectId) {
+    await runRepoInspection(ctx, projectId);
+    return;
+  }
+
+  if (action === 'generate_repo_task' && projectId) {
+    const cached = repoInspectionCache.get(projectId);
+    if (!cached) {
+      await renderProjectLogAlerts(ctx, projectId, 'No repo inspection report available yet.');
+      return;
+    }
+    await renderOrEdit(ctx, cached.codexTask, {
+      reply_markup: buildBackKeyboard(`projlog:menu:${projectId}`),
+    });
+    return;
+  }
+
+  if (action === 'create_pr' && projectId) {
+    const cached = repoInspectionCache.get(projectId);
+    if (!cached) {
+      await renderProjectLogAlerts(ctx, projectId, 'No repo inspection report available yet.');
+      return;
+    }
+    const rateStatus = checkRateLimit(repoPrRateLimits, projectId, REPO_PR_RATE_LIMIT);
+    if (rateStatus.blocked) {
+      await renderProjectLogAlerts(
+        ctx,
+        projectId,
+        `⏳ PR creation is rate-limited. Try again in ${formatRetryAfter(rateStatus.retryAfterMs)}.`,
+      );
+      return;
+    }
+    await renderProjectLogAlerts(
+      ctx,
+      projectId,
+      '🛠 PR creation requires an explicit patch plan. Use "🧩 Generate Codex task for client repo" to apply fixes manually, then re-run tests.',
+    );
     return;
   }
 
@@ -8387,12 +8445,16 @@ async function applyChangesInRepo(ctx, projectId, change) {
         new Set(results.map((result) => result.entry?.filePath).filter(Boolean)),
       );
       const message = buildStructuredSuccessMessage(change.plan.length, modifiedFiles, diffPreview);
-      await ctx.reply(`Elapsed: ~${elapsed}s\n\n${message}`, { reply_markup: inline });
+      await ctx.reply(
+        `✅ Pull Request created.\nPR: ${pr.html_url}\nPlease review and merge manually.\nElapsed: ~${elapsed}s\n\n${message}`,
+        { reply_markup: inline },
+      );
     } else {
       const message = buildChangeSummaryMessage(summary, failureLines, diffPreview);
-      await ctx.reply(`Changes applied successfully.\nElapsed: ~${elapsed}s\n\n${message}`, {
-        reply_markup: inline,
-      });
+      await ctx.reply(
+        `✅ Pull Request created.\nPR: ${pr.html_url}\nPlease review and merge manually.\nElapsed: ~${elapsed}s\n\n${message}`,
+        { reply_markup: inline },
+      );
     }
   } catch (error) {
     console.error('Failed to apply changes', error);
@@ -8460,7 +8522,10 @@ async function finalizeStructuredChangeSession(ctx, session, results) {
   );
   const message = buildStructuredSuccessMessage(session.plan.length, modifiedFiles, diffPreview);
   const inline = new InlineKeyboard().url('View PR', pr.html_url);
-  await ctx.reply(`Elapsed: ~${elapsed}s\n\n${message}`, { reply_markup: inline });
+  await ctx.reply(
+    `✅ Pull Request created.\nPR: ${pr.html_url}\nPlease review and merge manually.\nElapsed: ~${elapsed}s\n\n${message}`,
+    { reply_markup: inline },
+  );
 }
 
 async function handleStructuredFixBlockInput(ctx, state) {
@@ -11018,7 +11083,9 @@ function normalizeLogTestSettings(project) {
     diagnosticsEndpointUrl: logTest.diagnosticsEndpointUrl || null,
     tokenKeyInEnvVault: logTest.tokenKeyInEnvVault || null,
     lastTest: {
-      status: ['never', 'pass', 'fail', 'partial'].includes(lastTest.status)
+      status: ['never', 'pass', 'fail', 'partial', 'blocked_missing_diagnostics'].includes(
+        lastTest.status,
+      )
         ? lastTest.status
         : 'never',
       lastRunAt: lastTest.lastRunAt || null,
@@ -11026,6 +11093,12 @@ function normalizeLogTestSettings(project) {
       lastCorrelationIds: Array.isArray(lastTest.lastCorrelationIds)
         ? lastTest.lastCorrelationIds.filter(Boolean).map(String)
         : [],
+    },
+    lastDiagnostics: {
+      timestamp: logTest.lastDiagnostics?.timestamp || null,
+      logger: logTest.lastDiagnostics?.logger || null,
+      pmConfig: logTest.lastDiagnostics?.pmConfig || null,
+      lastSend: logTest.lastDiagnostics?.lastSend || null,
     },
     reminder: {
       needsTest:
@@ -11062,6 +11135,9 @@ function formatLogTestStatusLine(logTest) {
   }
   if (status === 'fail') {
     return `Log test: ❌ failed${lastRunAt ? ` (${lastRunAt})` : ''}`;
+  }
+  if (status === 'blocked_missing_diagnostics') {
+    return `Log test: 🧩 blocked (missing diagnostics)${lastRunAt ? ` (${lastRunAt})` : ''}`;
   }
   return 'Log test: ⚠️ not run yet';
 }
@@ -11118,11 +11194,15 @@ function buildProjectLogAlertsView(project, settings, notice) {
   const reminderLine = formatLogTestReminderLine(logTest);
   const levelsLabel = forwarding.levels.length ? forwarding.levels.join(' / ') : 'error';
   const destinationLabel = forwarding.destinationChatId || 'not set';
+  const canInspect = canInspectRepo(project);
+  const hasInspection = repoInspectionCache.has(project.id);
+  const diagnosticsUrl = resolveDiagnosticsEndpoint(project, logTest);
   const lines = [
     `📣 Logs — ${project.name || project.id}`,
     notice || null,
     '',
     formatLogTestStatusLine(logTest),
+    `Last diagnostics: ${logTest.lastDiagnostics?.timestamp || '-'}`,
     reminderLine,
     '',
     `Status: ${forwarding.enabled ? '✅ enabled' : '🚫 disabled'}`,
@@ -11135,15 +11215,22 @@ function buildProjectLogAlertsView(project, settings, notice) {
     .row()
     .text('🧪 Run ALL tests', `logtest:all:${project.id}`)
     .row()
-    .text(logTest.diagnosticsEndpointUrl ? '🔎 Diagnostics' : '🔎 Diagnostics (set URL)', `logtest:diagnostics:${project.id}`)
-    .row()
+    .text(diagnosticsUrl ? '🔎 Diagnostics' : '🔎 Diagnostics (set URL)', `logtest:diagnostics:${project.id}`);
+  if (canInspect) {
+    inline.row().text('🔍 Inspect repo', `logtest:inspect_repo:${project.id}`);
+    if (hasInspection) {
+      inline.row().text('🧩 Generate Codex task for client repo', `logtest:generate_repo_task:${project.id}`);
+      inline.row().text('🛠 Create PR with fixes', `logtest:create_pr:${project.id}`);
+    }
+  }
+  inline
     .text('⚙️ Configure test endpoints', `logtest:config:${project.id}`)
     .row()
     .text('📌 Test status & last results', `logtest:status:${project.id}`)
     .row()
     .text('⏰ Snooze reminder', `logtest:snooze:${project.id}`)
     .row()
-    .text('🧩 Generate Codex Task', `logtest:generate_task:${project.id}`)
+    .text('🧩 Generate Codex task: Add diagnostics + test endpoint + log sender', `logtest:generate_task:${project.id}`)
     .row()
     .text(forwarding.enabled ? '🟢 Disable forwarding' : '🟢 Enable forwarding', `projlog:toggle:${project.id}`)
     .row()
@@ -11247,11 +11334,13 @@ function formatLogTestSummary(logTest) {
 }
 
 function buildLogTestStatusView(project, logTest) {
+  const diagnosticsUrl = resolveDiagnosticsEndpoint(project, logTest);
   const lines = [
     `📌 Log test status — ${project.name || project.id}`,
     '',
     formatLogTestStatusLine(logTest),
     formatLogTestReminderLine(logTest),
+    `Last diagnostics: ${logTest.lastDiagnostics?.timestamp || '-'}`,
     '',
     formatLogTestSummary(logTest),
   ];
@@ -11259,7 +11348,7 @@ function buildLogTestStatusView(project, logTest) {
     .text('🧪 Run log test', `logtest:mode_menu:${project.id}`)
     .text('🧪 Run ALL tests', `logtest:all:${project.id}`)
     .row()
-    .text('🔎 Diagnostics', `logtest:diagnostics:${project.id}`)
+    .text(diagnosticsUrl ? '🔎 Diagnostics' : '🔎 Diagnostics (set URL)', `logtest:diagnostics:${project.id}`)
     .row()
     .text('⬅️ Back', `projlog:menu:${project.id}`);
   return { text: lines.join('\n'), keyboard: inline };
@@ -11347,13 +11436,14 @@ async function handleLogTestConfigInput(ctx, state) {
       await ctx.reply('URL must include http:// or https://');
       return;
     }
-    const { testEndpointUrl, diagnosticsEndpointUrl } = resolveLogTestEndpoints(parsedUrl.toString());
+    const { baseUrl, testEndpointUrl, diagnosticsEndpointUrl } = resolveLogTestEndpoints(parsedUrl.toString());
     const updated = await updateProjectLogTest(state.projectId, (current) => ({
       ...current,
       enabled: true,
       testEndpointUrl,
       diagnosticsEndpointUrl,
     }));
+    await updateProjectField(state.projectId, 'baseUrl', baseUrl);
     if (!updated) {
       clearUserState(ctx.from.id);
       await renderOrEdit(ctx, 'Project not found.');
@@ -11506,6 +11596,21 @@ function buildLogTestFailureHint(error, response) {
   return error?.message || 'Request failed.';
 }
 
+function classifyFailureCategory(errorMessage, response) {
+  if (response) {
+    if (response.status === 401 || response.status === 403) return 'auth';
+    if (response.status === 404) return 'notfound';
+    if (response.status >= 500) return 'server';
+  }
+  const text = String(errorMessage || '').toLowerCase();
+  if (text.includes('timed out')) return 'timeout';
+  if (text.includes('timeout')) return 'timeout';
+  if (text.includes('unauthorized') || text.includes('forbidden')) return 'auth';
+  if (text.includes('not found') || text.includes('404')) return 'notfound';
+  if (text.includes('invalid') || text.includes('parse')) return 'parse';
+  return 'unknown';
+}
+
 function buildLogTestReceiptHint() {
   return [
     'Client call succeeded but no log arrived.',
@@ -11544,16 +11649,187 @@ function buildLogTestDiagnosticsReport(diagnostics) {
   return lines.join('\n');
 }
 
+function formatRetryAfter(retryAfterMs) {
+  const seconds = Math.max(1, Math.ceil(retryAfterMs / 1000));
+  const minutes = Math.floor(seconds / 60);
+  if (minutes >= 1) {
+    return `${minutes}m ${seconds % 60}s`;
+  }
+  return `${seconds}s`;
+}
+
+function checkRateLimit(rateMap, key, rateLimit) {
+  const now = Date.now();
+  const windowMs = rateLimit.windowMs;
+  const limit = rateLimit.limit;
+  const previous = rateMap.get(key) || [];
+  const recent = previous.filter((timestamp) => now - timestamp < windowMs);
+  if (recent.length >= limit) {
+    const retryAfterMs = windowMs - (now - Math.min(...recent));
+    rateMap.set(key, recent);
+    return { blocked: true, retryAfterMs };
+  }
+  recent.push(now);
+  rateMap.set(key, recent);
+  return { blocked: false, retryAfterMs: 0 };
+}
+
+function buildLogTestProgressText({
+  header,
+  status,
+  percent,
+  completedSteps,
+  totalSteps,
+  currentStep,
+  nextStep,
+  remainingSteps,
+  reason,
+}) {
+  const lines = [];
+  if (header) lines.push(header);
+  if (status === 'success') {
+    lines.push(`✅ Completed (100%)`);
+  } else if (status === 'failed') {
+    lines.push(`❌ Failed at step ${completedSteps}/${totalSteps}`);
+  } else {
+    lines.push(`⏳ progressing... (${percent}%)`);
+  }
+  lines.push(`Completed: ${completedSteps}/${totalSteps}`);
+  if (currentStep) lines.push(`Current: ${currentStep}`);
+  if (nextStep) lines.push(`Next: ${nextStep}`);
+  lines.push(`Remaining: ${remainingSteps}`);
+  if (reason) lines.push('', `Reason: ${reason}`);
+  return lines.join('\n');
+}
+
+async function updateProgressMessage(ctx, progress, payload) {
+  const { completedSteps, currentStep, nextStep, status, reason } = payload;
+  const totalSteps = progress.totalSteps;
+  const remainingSteps = Math.max(0, totalSteps - completedSteps);
+  const percent = status === 'success' ? 100 : Math.floor((completedSteps / totalSteps) * 100);
+  const text = buildLogTestProgressText({
+    header: progress.header,
+    status,
+    percent,
+    completedSteps,
+    totalSteps,
+    currentStep,
+    nextStep,
+    remainingSteps,
+    reason,
+  });
+  if (!progress.chatId) return;
+  if (!progress.messageId) {
+    const message = await bot.api.sendMessage(progress.chatId, text, {
+      disable_web_page_preview: true,
+    });
+    progress.messageId = message.message_id;
+    return;
+  }
+  try {
+    await bot.api.editMessageText(progress.chatId, progress.messageId, text, {
+      disable_web_page_preview: true,
+    });
+  } catch (error) {
+    try {
+      const message = await bot.api.sendMessage(progress.chatId, text, {
+        disable_web_page_preview: true,
+      });
+      progress.messageId = message.message_id;
+    } catch (sendError) {
+      console.error('[log-test] Failed to update progress message', sendError);
+    }
+  }
+}
+
+function createLogTestProgress(ctx, header) {
+  return {
+    chatId: ctx.chat?.id,
+    messageId: null,
+    totalSteps: LOG_TEST_PROGRESS_STEPS.length,
+    header,
+  };
+}
+
+function resolveProjectBaseUrl(project, logTest) {
+  if (project?.baseUrl) {
+    return String(project.baseUrl).replace(/\/+$/, '');
+  }
+  if (logTest?.testEndpointUrl) {
+    return String(logTest.testEndpointUrl).replace(/\/(__pm|pm)\/test-log$/, '').replace(/\/+$/, '');
+  }
+  return null;
+}
+
+function resolveDiagnosticsEndpoint(project, logTest) {
+  if (project?.diagnosticsUrl) {
+    return String(project.diagnosticsUrl).replace(/\/+$/, '');
+  }
+  const baseUrl = resolveProjectBaseUrl(project, logTest);
+  if (baseUrl) {
+    return `${baseUrl}/pm/diagnostics`;
+  }
+  return logTest?.diagnosticsEndpointUrl || null;
+}
+
+function normalizeDiagnosticsPayload(payload) {
+  if (!payload || typeof payload !== 'object') {
+    return { ok: false, error: 'Diagnostics response invalid.' };
+  }
+  const logger = payload.logger;
+  const pmConfig = payload.pmConfig;
+  const lastSend = payload.lastSend || {};
+  const loggerKeys = [
+    'hasPmLogger',
+    'hasAxiosInterceptor',
+    'hasFetchInterceptor',
+    'hasUnhandledRejectionHook',
+    'hasUncaughtExceptionHook',
+  ];
+  const pmKeys = ['hasPmUrl', 'hasPmToken'];
+  const missingLogger = !logger || loggerKeys.some((key) => typeof logger[key] !== 'boolean');
+  const missingPm = !pmConfig || pmKeys.some((key) => typeof pmConfig[key] !== 'boolean');
+  if (missingLogger || missingPm) {
+    return { ok: false, error: 'Diagnostics response missing required flags.' };
+  }
+  return {
+    ok: true,
+    payload: {
+      projectId: payload.projectId || null,
+      logger: loggerKeys.reduce((acc, key) => ({ ...acc, [key]: Boolean(logger[key]) }), {}),
+      pmConfig: pmKeys.reduce((acc, key) => ({ ...acc, [key]: Boolean(pmConfig[key]) }), {}),
+      lastSend: {
+        status: lastSend.status || null,
+        lastErrorCode: lastSend.lastErrorCode || null,
+        lastErrorAt: lastSend.lastErrorAt || null,
+      },
+    },
+  };
+}
+
+async function storeLogDiagnosticsSnapshot(projectId, diagnostics) {
+  await updateProjectLogTest(projectId, (current) => ({
+    ...current,
+    lastDiagnostics: {
+      timestamp: new Date().toISOString(),
+      logger: diagnostics.logger,
+      pmConfig: diagnostics.pmConfig,
+      lastSend: diagnostics.lastSend,
+    },
+  }));
+}
+
 async function requestLogDiagnostics(project, logTest, token) {
-  if (!logTest.diagnosticsEndpointUrl) {
+  const targetUrl = resolveDiagnosticsEndpoint(project, logTest);
+  if (!targetUrl) {
     return { ok: false, error: 'Diagnostics endpoint not configured.' };
   }
   try {
     const response = await requestUrlWithBodyAndHeaders({
       method: 'GET',
-      targetUrl: logTest.diagnosticsEndpointUrl,
+      targetUrl,
       headers: { Authorization: `Bearer ${token}` },
-      timeoutMs: 12_000,
+      timeoutMs: LOG_TEST_DIAGNOSTICS_TIMEOUT_MS,
     });
     if (response.status < 200 || response.status >= 300) {
       return { ok: false, error: `Diagnostics request failed (${response.status}).` };
@@ -11564,13 +11840,358 @@ async function requestLogDiagnostics(project, logTest, token) {
     } catch (error) {
       payload = null;
     }
-    if (!payload || typeof payload !== 'object') {
-      return { ok: false, error: 'Diagnostics response invalid.' };
+    const normalized = normalizeDiagnosticsPayload(payload);
+    if (!normalized.ok) {
+      return { ok: false, error: normalized.error };
     }
-    return { ok: true, payload };
+    return { ok: true, payload: normalized.payload };
   } catch (error) {
     return { ok: false, error: buildLogTestFailureHint(error) };
   }
+}
+
+function ensureGitSuffix(repoUrl) {
+  if (!repoUrl) return repoUrl;
+  return repoUrl.endsWith('.git') ? repoUrl : `${repoUrl}.git`;
+}
+
+function tryParseRepoSlug(repoUrl) {
+  try {
+    const parsed = new URL(repoUrl);
+    if (!parsed.hostname.includes('github.com')) return null;
+    const parts = parsed.pathname.replace(/\.git$/, '').split('/').filter(Boolean);
+    if (parts.length >= 2) {
+      return `${parts[0]}/${parts[1]}`;
+    }
+  } catch (error) {
+    return null;
+  }
+  return null;
+}
+
+function resolveRepoInspectionTarget(project) {
+  if (project?.repoUrl) {
+    const repoUrl = ensureGitSuffix(project.repoUrl);
+    const repoSlug = project.repoSlug || tryParseRepoSlug(repoUrl);
+    return { repoUrl, repoSlug };
+  }
+  try {
+    const info = getRepoInfo(project);
+    return { repoUrl: info.repoUrl, repoSlug: info.repoSlug };
+  } catch (error) {
+    return null;
+  }
+}
+
+function canInspectRepo(project) {
+  const target = resolveRepoInspectionTarget(project);
+  if (!target?.repoUrl) return false;
+  return Boolean(getGithubToken(project));
+}
+
+async function fileExists(filePath) {
+  try {
+    await fs.access(filePath);
+    return true;
+  } catch (error) {
+    return false;
+  }
+}
+
+async function readJsonFile(filePath) {
+  try {
+    const raw = await fs.readFile(filePath, 'utf8');
+    return JSON.parse(raw);
+  } catch (error) {
+    return null;
+  }
+}
+
+async function runRipgrep(repoDir, pattern) {
+  try {
+    const { stdout } = await execFileAsync(
+      'rg',
+      ['-n', '--no-heading', '--with-filename', '-S', '--glob', '!.git', '--glob', '!node_modules', pattern, '.'],
+      { cwd: repoDir, maxBuffer: 1024 * 1024 },
+    );
+    if (!stdout) return [];
+    return stdout
+      .split('\n')
+      .map((line) => {
+        const match = line.match(/^(.+?):(\d+):/);
+        if (!match) return null;
+        return { file: match[1], line: Number(match[2]) };
+      })
+      .filter(Boolean);
+  } catch (error) {
+    if (typeof error.code === 'number' && error.code === 1) {
+      return [];
+    }
+    console.error('[repo-inspect] ripgrep failed', error?.message || error);
+    return [];
+  }
+}
+
+function buildMatchSummary(matches, limit = 6) {
+  if (!matches.length) return [];
+  return matches.slice(0, limit).map((match) => `${match.file}:${match.line}`);
+}
+
+async function detectRepoStack(repoDir) {
+  const signals = [];
+  const hasPackageJson = await fileExists(path.join(repoDir, 'package.json'));
+  const hasTsConfig = await fileExists(path.join(repoDir, 'tsconfig.json'));
+  const hasPnpm = await fileExists(path.join(repoDir, 'pnpm-lock.yaml'));
+  const hasYarn = await fileExists(path.join(repoDir, 'yarn.lock'));
+  const hasRequirements = await fileExists(path.join(repoDir, 'requirements.txt'));
+  const hasPyProject = await fileExists(path.join(repoDir, 'pyproject.toml'));
+  const hasPoetry = await fileExists(path.join(repoDir, 'poetry.lock'));
+  const hasGoMod = await fileExists(path.join(repoDir, 'go.mod'));
+  const hasPom = await fileExists(path.join(repoDir, 'pom.xml'));
+  const hasGradle =
+    (await fileExists(path.join(repoDir, 'build.gradle'))) ||
+    (await fileExists(path.join(repoDir, 'build.gradle.kts')));
+
+  if (hasPackageJson) signals.push({ stack: 'node', weight: 0.6 });
+  if (hasTsConfig) signals.push({ stack: 'node', weight: 0.2 });
+  if (hasPnpm || hasYarn) signals.push({ stack: 'node', weight: 0.1 });
+  if (hasRequirements || hasPyProject || hasPoetry) signals.push({ stack: 'python', weight: 0.7 });
+  if (hasGoMod) signals.push({ stack: 'go', weight: 0.8 });
+  if (hasPom || hasGradle) signals.push({ stack: 'java', weight: 0.8 });
+
+  const scores = signals.reduce((acc, signal) => {
+    acc[signal.stack] = (acc[signal.stack] || 0) + signal.weight;
+    return acc;
+  }, {});
+  const entries = Object.entries(scores).sort((a, b) => b[1] - a[1]);
+  const primary = entries[0];
+  if (!primary) {
+    return { stack: 'unknown', confidence: 0, signals };
+  }
+  const confidence = Math.min(100, Math.round(primary[1] * 100));
+  return { stack: primary[0], confidence, signals };
+}
+
+async function detectRepoEntrypoint(repoDir, stack) {
+  if (stack === 'node') {
+    const pkg = await readJsonFile(path.join(repoDir, 'package.json'));
+    if (pkg?.main) {
+      return { file: pkg.main, reason: 'package.json main' };
+    }
+    if (pkg?.scripts?.start) {
+      return { file: pkg.scripts.start, reason: 'package.json start script' };
+    }
+    const candidates = [
+      'src/index.ts',
+      'src/index.js',
+      'src/server.ts',
+      'src/server.js',
+      'src/app.ts',
+      'src/app.js',
+      'index.js',
+      'server.js',
+      'app.js',
+    ];
+    for (const candidate of candidates) {
+      if (await fileExists(path.join(repoDir, candidate))) {
+        return { file: candidate, reason: 'heuristic' };
+      }
+    }
+  }
+  if (stack === 'python') {
+    const candidates = ['app.py', 'main.py', 'src/app.py', 'src/main.py'];
+    for (const candidate of candidates) {
+      if (await fileExists(path.join(repoDir, candidate))) {
+        return { file: candidate, reason: 'heuristic' };
+      }
+    }
+  }
+  return null;
+}
+
+function buildRepoInspectionReportText(report) {
+  const lines = [
+    '🔍 Repo inspection report',
+    `Repo: ${report.repoSlug || report.repoUrl || '-'}`,
+    `Detected stack: ${report.stack} (${report.confidence}%)`,
+  ];
+  if (report.entrypoint) {
+    lines.push(`Entrypoint: ${report.entrypoint.file} (${report.entrypoint.reason})`);
+  }
+  lines.push('', 'Findings:');
+  report.findings.forEach((finding) => {
+    lines.push(`- ${finding.label}: ${finding.found ? '✅' : '❌'}${finding.refs?.length ? ` (${finding.refs.join(', ')})` : ''}`);
+  });
+  if (report.missing.length) {
+    lines.push('', `Missing: ${report.missing.join(', ')}`);
+  }
+  if (report.rootCauses.length) {
+    lines.push('', 'Root cause candidates:');
+    report.rootCauses.forEach((candidate, index) => {
+      lines.push(`${index + 1}. ${candidate}`);
+    });
+  }
+  if (report.patchPlan.length) {
+    lines.push('', 'Recommended patch plan:');
+    report.patchPlan.forEach((step) => lines.push(`- ${step}`));
+  }
+  return lines.join('\n');
+}
+
+function buildRepoCodexTask(report) {
+  const stackLine = report.stack !== 'unknown' ? `Detected stack: ${report.stack} (${report.confidence}%).` : 'Detected stack: unknown.';
+  return [
+    '🧩 Codex task for client repo',
+    '',
+    stackLine,
+    '',
+    'Implement:',
+    '- POST /pm/test-log (alias /__pm/test-log) secured by PM_TEST_TOKEN + PM_TEST_ENABLED.',
+    '- GET /pm/diagnostics (alias /__pm/diagnostics) returning only boolean flags + lastSend metadata.',
+    '- Central PM logger module that sends to PM_URL + "/api/logs" with PM_INGEST_TOKEN.',
+    '- Axios interceptor + fetch wrapper (when applicable).',
+    '- Process hooks for unhandledRejection + uncaughtException.',
+    '',
+    'Notes:',
+    '- Never print secrets; read tokens from env.',
+    '- Include correlationId in log meta.',
+    '- Add minimal tests or a test hook for /pm/test-log and /pm/diagnostics.',
+    '',
+    'Suggested insertion points:',
+    report.entrypoint ? `- Entrypoint: ${report.entrypoint.file} (${report.entrypoint.reason})` : '- Entrypoint: detect main server entry.',
+  ].join('\n');
+}
+
+async function inspectRepository(project) {
+  const target = resolveRepoInspectionTarget(project);
+  if (!target?.repoUrl) {
+    return { ok: false, error: 'Repo URL not configured.' };
+  }
+  const githubToken = getGithubToken(project);
+  if (!githubToken) {
+    return { ok: false, error: 'GitHub token not configured.' };
+  }
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'pm-repo-inspect-'));
+  const cloneUrl = applyGitTokenToUrl(target.repoUrl, githubToken);
+  try {
+    await execFileAsync('git', ['clone', '--depth=1', cloneUrl, tempDir], { maxBuffer: 1024 * 1024 });
+    const stack = await detectRepoStack(tempDir);
+    const entrypoint = await detectRepoEntrypoint(tempDir, stack.stack);
+    const matchGroups = {
+      logEndpoint: await runRipgrep(tempDir, '/api/logs'),
+      pmUrl: await runRipgrep(tempDir, 'PM_URL|PATH_APPLIER_URL'),
+      pmToken: await runRipgrep(tempDir, 'PM_TOKEN|PM_INGEST_TOKEN|PATH_APPLIER_TOKEN'),
+      axiosInterceptor: await runRipgrep(tempDir, 'axios\\.interceptors'),
+      fetchWrapper: await runRipgrep(tempDir, '\\bfetch\\s*\\('),
+      unhandledRejection: await runRipgrep(tempDir, 'unhandledRejection'),
+      uncaughtException: await runRipgrep(tempDir, 'uncaughtException'),
+      diagnosticsRoute: await runRipgrep(tempDir, '/pm/diagnostics'),
+      testLogRoute: await runRipgrep(tempDir, '/pm/test-log'),
+    };
+    const findings = [
+      { key: 'logEndpoint', label: 'PM log forwarder (/api/logs)', matches: matchGroups.logEndpoint },
+      { key: 'pmUrl', label: 'PM_URL/PATH_APPLIER_URL usage', matches: matchGroups.pmUrl },
+      { key: 'pmToken', label: 'PM_TOKEN/PM_INGEST_TOKEN usage', matches: matchGroups.pmToken },
+      { key: 'axiosInterceptor', label: 'Axios interceptor', matches: matchGroups.axiosInterceptor },
+      { key: 'fetchWrapper', label: 'Fetch wrapper', matches: matchGroups.fetchWrapper },
+      { key: 'unhandledRejection', label: 'unhandledRejection hook', matches: matchGroups.unhandledRejection },
+      { key: 'uncaughtException', label: 'uncaughtException hook', matches: matchGroups.uncaughtException },
+      { key: 'diagnosticsRoute', label: '/pm/diagnostics route', matches: matchGroups.diagnosticsRoute },
+      { key: 'testLogRoute', label: '/pm/test-log route', matches: matchGroups.testLogRoute },
+    ];
+    const enrichedFindings = findings.map((finding) => ({
+      label: finding.label,
+      found: finding.matches.length > 0,
+      refs: buildMatchSummary(finding.matches),
+    }));
+    const missing = [];
+    if (!matchGroups.diagnosticsRoute.length) missing.push('/pm/diagnostics endpoint');
+    if (!matchGroups.testLogRoute.length) missing.push('/pm/test-log endpoint');
+    if (!matchGroups.logEndpoint.length) missing.push('PM log forwarder');
+    if (!matchGroups.pmUrl.length) missing.push('PM_URL env usage');
+    if (!matchGroups.pmToken.length) missing.push('PM_TOKEN/PM_INGEST_TOKEN env usage');
+    if (!matchGroups.axiosInterceptor.length && !matchGroups.fetchWrapper.length)
+      missing.push('Axios interceptor or fetch wrapper');
+    if (!matchGroups.unhandledRejection.length) missing.push('unhandledRejection hook');
+    if (!matchGroups.uncaughtException.length) missing.push('uncaughtException hook');
+    const rootCauses = [];
+    if (!matchGroups.logEndpoint.length) rootCauses.push('PM logger not installed or not wired to /api/logs.');
+    if (!matchGroups.pmUrl.length) rootCauses.push('PM_URL/PATH_APPLIER_URL not configured or referenced.');
+    if (!matchGroups.pmToken.length) rootCauses.push('PM_TOKEN/PM_INGEST_TOKEN not configured or referenced.');
+    if (!matchGroups.diagnosticsRoute.length) rootCauses.push('/pm/diagnostics endpoint missing.');
+    if (!matchGroups.testLogRoute.length) rootCauses.push('/pm/test-log endpoint missing.');
+    const patchPlan = [
+      'Add /pm/diagnostics (GET) + /pm/test-log (POST) routes with PM_TEST_TOKEN auth.',
+      'Add PM logger module that posts to PM_URL + /api/logs using PM_INGEST_TOKEN.',
+      'Add axios interceptor and fetch wrapper to include correlationId + request metadata.',
+      'Register unhandledRejection + uncaughtException hooks to forward errors.',
+    ];
+    return {
+      ok: true,
+      report: {
+        repoUrl: target.repoUrl,
+        repoSlug: target.repoSlug,
+        stack: stack.stack,
+        confidence: stack.confidence,
+        entrypoint,
+        findings: enrichedFindings,
+        missing,
+        rootCauses,
+        patchPlan,
+      },
+    };
+  } catch (error) {
+    return { ok: false, error: error?.message || 'Repo inspection failed.' };
+  } finally {
+    try {
+      await fs.rm(tempDir, { recursive: true, force: true });
+    } catch (cleanupError) {
+      console.error('[repo-inspect] failed to clean temp dir', cleanupError);
+    }
+  }
+}
+
+async function runRepoInspection(ctx, projectId) {
+  const projects = await loadProjects();
+  const project = findProjectById(projects, projectId);
+  if (!project) {
+    await renderOrEdit(ctx, 'Project not found.');
+    return;
+  }
+  if (!canInspectRepo(project)) {
+    await renderProjectLogAlerts(ctx, projectId, 'Repo inspection requires repoUrl and GitHub token.');
+    return;
+  }
+  const rateStatus = checkRateLimit(repoInspectionRateLimits, projectId, REPO_INSPECTION_RATE_LIMIT);
+  if (rateStatus.blocked) {
+    await renderProjectLogAlerts(
+      ctx,
+      projectId,
+      `⏳ Repo inspection is rate-limited. Try again in ${formatRetryAfter(rateStatus.retryAfterMs)}.`,
+    );
+    return;
+  }
+  await renderProjectLogAlerts(ctx, projectId, '🔍 Inspecting repo (read-only)…');
+  const result = await inspectRepository(project);
+  if (!result.ok) {
+    await renderProjectLogAlerts(ctx, projectId, `❌ Repo inspection failed.\nReason: ${result.error}`);
+    return;
+  }
+  const reportText = buildRepoInspectionReportText(result.report);
+  const codexTask = buildRepoCodexTask(result.report);
+  repoInspectionCache.set(projectId, {
+    createdAt: new Date().toISOString(),
+    report: result.report,
+    reportText,
+    codexTask,
+  });
+  const inline = new InlineKeyboard()
+    .text('🧩 Generate Codex task for client repo', `logtest:generate_repo_task:${projectId}`)
+    .row()
+    .text('🛠 Create PR with fixes', `logtest:create_pr:${projectId}`)
+    .row()
+    .text('⬅️ Back', `projlog:menu:${projectId}`);
+  await renderOrEdit(ctx, reportText, { reply_markup: inline });
 }
 
 function createPendingLogTestEntry({ correlationId, projectId, mode, chatId, requestId, timeoutMs }) {
@@ -11669,11 +12290,117 @@ async function runSingleLogTest(ctx, projectId, mode) {
     return;
   }
 
+  const progress = createLogTestProgress(ctx, `🧪 Log test — ${project.name || project.id}`);
+  let completedSteps = 0;
+  await updateProgressMessage(ctx, progress, {
+    status: 'progressing',
+    completedSteps,
+    currentStep: LOG_TEST_PROGRESS_STEPS[0],
+    nextStep: LOG_TEST_PROGRESS_STEPS[1],
+  });
+
   const tokenResult = await fetchLogTestToken(projectId, logTest);
   if (!tokenResult.ok) {
-    await renderProjectLogAlerts(ctx, projectId, `⚠️ ${tokenResult.error}`);
+    await updateProgressMessage(ctx, progress, {
+      status: 'failed',
+      completedSteps: 1,
+      currentStep: LOG_TEST_PROGRESS_STEPS[0],
+      nextStep: LOG_TEST_PROGRESS_STEPS[1],
+      reason: `token (${tokenResult.error})`,
+    });
+    await renderProjectLogAlerts(
+      ctx,
+      projectId,
+      `⚠️ Token unavailable.\nStep: Resolve project config\nCategory: config\nReason: ${tokenResult.error}\nNext: configure PM_TEST_TOKEN in Env Vault.`,
+    );
     return;
   }
+  completedSteps = 1;
+  await updateProgressMessage(ctx, progress, {
+    status: 'progressing',
+    completedSteps,
+    currentStep: LOG_TEST_PROGRESS_STEPS[1],
+    nextStep: LOG_TEST_PROGRESS_STEPS[2],
+  });
+
+  const diagnosticsUrl = resolveDiagnosticsEndpoint(project, logTest);
+  if (!diagnosticsUrl) {
+    await updateProjectLogTestResult(projectId, {
+      status: 'blocked_missing_diagnostics',
+      summary: 'Diagnostics endpoint not configured.',
+      correlationIds: [],
+    });
+    await updateProgressMessage(ctx, progress, {
+      status: 'failed',
+      completedSteps: 2,
+      currentStep: LOG_TEST_PROGRESS_STEPS[1],
+      nextStep: LOG_TEST_PROGRESS_STEPS[2],
+      reason: 'missing diagnostics endpoint',
+    });
+    await renderProjectLogAlerts(
+      ctx,
+      projectId,
+      '❌ Diagnostics gate failed.\nStep: Diagnostics gate (/pm/diagnostics)\nCategory: notfound\nReason: diagnostics URL missing.\nNext: add /pm/diagnostics and /pm/test-log.',
+    );
+    return;
+  }
+  const diagnostics = await requestLogDiagnostics(project, logTest, tokenResult.token);
+  if (!diagnostics.ok) {
+    const category = classifyFailureCategory(diagnostics.error);
+    await updateProjectLogTestResult(projectId, {
+      status: 'blocked_missing_diagnostics',
+      summary: diagnostics.error,
+      correlationIds: [],
+    });
+    await updateProgressMessage(ctx, progress, {
+      status: 'failed',
+      completedSteps: 2,
+      currentStep: LOG_TEST_PROGRESS_STEPS[1],
+      nextStep: LOG_TEST_PROGRESS_STEPS[2],
+      reason: `diagnostics (${diagnostics.error})`,
+    });
+    await renderProjectLogAlerts(
+      ctx,
+      projectId,
+      `❌ Diagnostics gate failed.\nStep: Diagnostics gate (/pm/diagnostics)\nCategory: ${category}\nReason: ${diagnostics.error}\nNext: add /pm/diagnostics and /pm/test-log.`,
+    );
+    return;
+  }
+  await storeLogDiagnosticsSnapshot(projectId, diagnostics.payload);
+  completedSteps = 2;
+  await updateProgressMessage(ctx, progress, {
+    status: 'progressing',
+    completedSteps,
+    currentStep: LOG_TEST_PROGRESS_STEPS[2],
+    nextStep: LOG_TEST_PROGRESS_STEPS[3],
+  });
+
+  let pingStatus = 'skipped';
+  try {
+    const baseUrl = getPublicBaseUrl().replace(/\/+$/, '');
+    const pingResponse = await requestUrlWithBodyAndHeaders({
+      method: 'GET',
+      targetUrl: `${baseUrl}/api/logs/ping`,
+      timeoutMs: 5000,
+    });
+    if (pingResponse?.status >= 200 && pingResponse?.status < 300) {
+      pingStatus = 'ok';
+    } else if (pingResponse?.status === 404) {
+      pingStatus = 'skipped';
+    } else {
+      pingStatus = 'failed';
+    }
+  } catch (error) {
+    pingStatus = 'failed';
+  }
+  completedSteps = 3;
+  await updateProgressMessage(ctx, progress, {
+    status: 'progressing',
+    completedSteps,
+    currentStep: `${LOG_TEST_PROGRESS_STEPS[3]} (${mode})`,
+    nextStep: LOG_TEST_PROGRESS_STEPS[4],
+  });
+
   const correlationId = crypto.randomUUID();
   const requestId = crypto.randomUUID();
   const payload = buildLogTestPayload(project, mode, correlationId);
@@ -11700,15 +12427,23 @@ async function runSingleLogTest(ctx, projectId, mode) {
     });
   } catch (error) {
     cancelPendingLogTest(correlationId, 'call_failed');
+    const hint = buildLogTestFailureHint(error);
+    const category = classifyFailureCategory(hint);
     await updateProjectLogTestResult(projectId, {
       status: 'fail',
-      summary: buildLogTestFailureHint(error),
+      summary: hint,
       correlationIds: [correlationId],
     });
-    let notice = `❌ Test call failed.\n${buildLogTestFailureHint(error)}`;
-    if (!logTest.diagnosticsEndpointUrl) {
-      notice +=
-        '\n\nI can only see network behavior. Enable /pm/diagnostics or upload the client repo for code inspection.';
+    await updateProgressMessage(ctx, progress, {
+      status: 'failed',
+      completedSteps: 4,
+      currentStep: LOG_TEST_PROGRESS_STEPS[3],
+      nextStep: LOG_TEST_PROGRESS_STEPS[4],
+      reason: hint,
+    });
+    let notice = `❌ Test call failed.\nStep: Trigger client log test\nCategory: ${category}\nReason: ${hint}`;
+    if (canInspectRepo(project)) {
+      notice += '\nNext: Inspect repo or generate Codex task.';
     }
     await renderProjectLogAlerts(ctx, projectId, notice);
     return;
@@ -11717,20 +12452,33 @@ async function runSingleLogTest(ctx, projectId, mode) {
   if (!response || response.status < 200 || response.status >= 300) {
     cancelPendingLogTest(correlationId, 'call_failed');
     const hint = buildLogTestFailureHint(null, response);
+    const category = classifyFailureCategory(hint, response);
     await updateProjectLogTestResult(projectId, {
       status: 'fail',
       summary: hint,
       correlationIds: [correlationId],
     });
-    let notice = `❌ Test call failed.\n${hint}\nStatus: ${response?.status || 'unknown'}`;
-    if (!logTest.diagnosticsEndpointUrl) {
-      notice +=
-        '\n\nI can only see network behavior. Enable /pm/diagnostics or upload the client repo for code inspection.';
+    await updateProgressMessage(ctx, progress, {
+      status: 'failed',
+      completedSteps: 4,
+      currentStep: LOG_TEST_PROGRESS_STEPS[3],
+      nextStep: LOG_TEST_PROGRESS_STEPS[4],
+      reason: hint,
+    });
+    let notice = `❌ Test call failed.\nStep: Trigger client log test\nCategory: ${category}\nReason: ${hint}\nStatus: ${response?.status || 'unknown'}`;
+    if (canInspectRepo(project)) {
+      notice += '\nNext: Inspect repo or generate Codex task.';
     }
     await renderProjectLogAlerts(ctx, projectId, notice);
     return;
   }
 
+  await updateProgressMessage(ctx, progress, {
+    status: 'progressing',
+    completedSteps: 4,
+    currentStep: LOG_TEST_PROGRESS_STEPS[4],
+    nextStep: LOG_TEST_PROGRESS_STEPS[5],
+  });
   const receipt = await receiptPromise;
   if (!receipt.ok) {
     const hint = buildLogTestReceiptHint();
@@ -11739,12 +12487,40 @@ async function runSingleLogTest(ctx, projectId, mode) {
       summary: hint,
       correlationIds: [correlationId],
     });
-    let notice = `⚠️ Test call succeeded but no log received.\n${hint}`;
-    if (!logTest.diagnosticsEndpointUrl) {
-      notice +=
-        '\n\nI can only see network behavior. Enable /pm/diagnostics or upload the client repo for code inspection.';
+    await updateProgressMessage(ctx, progress, {
+      status: 'failed',
+      completedSteps: 5,
+      currentStep: LOG_TEST_PROGRESS_STEPS[4],
+      nextStep: LOG_TEST_PROGRESS_STEPS[5],
+      reason: hint,
+    });
+    let notice = `⚠️ Test call succeeded but no log received.\nStep: Wait for log arrival\nCategory: missing_log\nReason: ${hint}`;
+    if (canInspectRepo(project)) {
+      notice += '\nNext: Inspect repo for missing PM logger or tokens.';
     }
     await renderProjectLogAlerts(ctx, projectId, notice);
+    return;
+  }
+
+  const entryProjectId = receipt.entry?.projectId ? String(receipt.entry.projectId) : null;
+  if (entryProjectId && entryProjectId !== String(project.id)) {
+    await updateProjectLogTestResult(projectId, {
+      status: 'fail',
+      summary: `Log tagged with unexpected projectId (${entryProjectId}).`,
+      correlationIds: [correlationId],
+    });
+    await updateProgressMessage(ctx, progress, {
+      status: 'failed',
+      completedSteps: 6,
+      currentStep: LOG_TEST_PROGRESS_STEPS[5],
+      nextStep: LOG_TEST_PROGRESS_STEPS[6],
+      reason: 'projectId mismatch',
+    });
+    await renderProjectLogAlerts(
+      ctx,
+      projectId,
+      `❌ Log received but tagged to a different project.\nStep: Validate log format + project tag correctness\nCategory: invalid_payload\nReason: expected ${project.id}, got ${entryProjectId}.`,
+    );
     return;
   }
 
@@ -11753,7 +12529,15 @@ async function runSingleLogTest(ctx, projectId, mode) {
     summary: `Mode ${mode} received.`,
     correlationIds: [correlationId],
   });
-  await renderProjectLogAlerts(ctx, projectId, `✅ ${mode} test passed.`);
+  completedSteps = 7;
+  const summaryNote = `✅ ${mode} test passed.${pingStatus === 'failed' ? ' (PM ingest ping failed)' : ''}`;
+  await updateProgressMessage(ctx, progress, {
+    status: 'success',
+    completedSteps,
+    currentStep: LOG_TEST_PROGRESS_STEPS[6],
+    nextStep: null,
+  });
+  await renderProjectLogAlerts(ctx, projectId, summaryNote);
 }
 
 async function runAllLogTests(ctx, projectId) {
@@ -11768,14 +12552,124 @@ async function runAllLogTests(ctx, projectId) {
     await renderProjectLogAlerts(ctx, projectId, '⚠️ Configure test endpoints first.');
     return;
   }
+  const progress = createLogTestProgress(ctx, `🧪 Log test suite — ${project.name || project.id}`);
+  let completedSteps = 0;
+  await updateProgressMessage(ctx, progress, {
+    status: 'progressing',
+    completedSteps,
+    currentStep: LOG_TEST_PROGRESS_STEPS[0],
+    nextStep: LOG_TEST_PROGRESS_STEPS[1],
+  });
   const tokenResult = await fetchLogTestToken(projectId, logTest);
   if (!tokenResult.ok) {
-    await renderProjectLogAlerts(ctx, projectId, `⚠️ ${tokenResult.error}`);
+    await updateProgressMessage(ctx, progress, {
+      status: 'failed',
+      completedSteps: 1,
+      currentStep: LOG_TEST_PROGRESS_STEPS[0],
+      nextStep: LOG_TEST_PROGRESS_STEPS[1],
+      reason: `token (${tokenResult.error})`,
+    });
+    await renderProjectLogAlerts(
+      ctx,
+      projectId,
+      `⚠️ Token unavailable.\nStep: Resolve project config\nCategory: config\nReason: ${tokenResult.error}\nNext: configure PM_TEST_TOKEN in Env Vault.`,
+    );
     return;
   }
+  completedSteps = 1;
+  await updateProgressMessage(ctx, progress, {
+    status: 'progressing',
+    completedSteps,
+    currentStep: LOG_TEST_PROGRESS_STEPS[1],
+    nextStep: LOG_TEST_PROGRESS_STEPS[2],
+  });
+
+  const diagnosticsUrl = resolveDiagnosticsEndpoint(project, logTest);
+  if (!diagnosticsUrl) {
+    await updateProjectLogTestResult(projectId, {
+      status: 'blocked_missing_diagnostics',
+      summary: 'Diagnostics endpoint not configured.',
+      correlationIds: [],
+    });
+    await updateProgressMessage(ctx, progress, {
+      status: 'failed',
+      completedSteps: 2,
+      currentStep: LOG_TEST_PROGRESS_STEPS[1],
+      nextStep: LOG_TEST_PROGRESS_STEPS[2],
+      reason: 'missing diagnostics endpoint',
+    });
+    await renderProjectLogAlerts(
+      ctx,
+      projectId,
+      '❌ Diagnostics gate failed.\nStep: Diagnostics gate (/pm/diagnostics)\nCategory: notfound\nReason: diagnostics URL missing.\nNext: add /pm/diagnostics and /pm/test-log.',
+    );
+    return;
+  }
+  const diagnostics = await requestLogDiagnostics(project, logTest, tokenResult.token);
+  if (!diagnostics.ok) {
+    const category = classifyFailureCategory(diagnostics.error);
+    await updateProjectLogTestResult(projectId, {
+      status: 'blocked_missing_diagnostics',
+      summary: diagnostics.error,
+      correlationIds: [],
+    });
+    await updateProgressMessage(ctx, progress, {
+      status: 'failed',
+      completedSteps: 2,
+      currentStep: LOG_TEST_PROGRESS_STEPS[1],
+      nextStep: LOG_TEST_PROGRESS_STEPS[2],
+      reason: `diagnostics (${diagnostics.error})`,
+    });
+    await renderProjectLogAlerts(
+      ctx,
+      projectId,
+      `❌ Diagnostics gate failed.\nStep: Diagnostics gate (/pm/diagnostics)\nCategory: ${category}\nReason: ${diagnostics.error}\nNext: add /pm/diagnostics and /pm/test-log.`,
+    );
+    return;
+  }
+  await storeLogDiagnosticsSnapshot(projectId, diagnostics.payload);
+  completedSteps = 2;
+  await updateProgressMessage(ctx, progress, {
+    status: 'progressing',
+    completedSteps,
+    currentStep: LOG_TEST_PROGRESS_STEPS[2],
+    nextStep: LOG_TEST_PROGRESS_STEPS[3],
+  });
+
+  let pingStatus = 'skipped';
+  try {
+    const baseUrl = getPublicBaseUrl().replace(/\/+$/, '');
+    const pingResponse = await requestUrlWithBodyAndHeaders({
+      method: 'GET',
+      targetUrl: `${baseUrl}/api/logs/ping`,
+      timeoutMs: 5000,
+    });
+    if (pingResponse?.status >= 200 && pingResponse?.status < 300) {
+      pingStatus = 'ok';
+    } else if (pingResponse?.status === 404) {
+      pingStatus = 'skipped';
+    } else {
+      pingStatus = 'failed';
+    }
+  } catch (error) {
+    pingStatus = 'failed';
+  }
+  completedSteps = 3;
+  await updateProgressMessage(ctx, progress, {
+    status: 'progressing',
+    completedSteps,
+    currentStep: LOG_TEST_PROGRESS_STEPS[3],
+    nextStep: LOG_TEST_PROGRESS_STEPS[4],
+  });
 
   const results = [];
   for (const mode of LOG_TEST_MODES) {
+    await updateProgressMessage(ctx, progress, {
+      status: 'progressing',
+      completedSteps,
+      currentStep: `${LOG_TEST_PROGRESS_STEPS[3]} (${mode})`,
+      nextStep: `${LOG_TEST_PROGRESS_STEPS[4]} (${mode})`,
+    });
     const correlationId = crypto.randomUUID();
     const requestId = crypto.randomUUID();
     const payload = buildLogTestPayload(project, mode, correlationId);
@@ -11808,6 +12702,13 @@ async function runAllLogTests(ctx, projectId) {
         error: buildLogTestFailureHint(error),
         correlationId,
       });
+      await updateProgressMessage(ctx, progress, {
+        status: 'failed',
+        completedSteps: 4,
+        currentStep: LOG_TEST_PROGRESS_STEPS[3],
+        nextStep: LOG_TEST_PROGRESS_STEPS[4],
+        reason: buildLogTestFailureHint(error),
+      });
       break;
     }
 
@@ -11821,9 +12722,22 @@ async function runAllLogTests(ctx, projectId) {
         correlationId,
         callDurationMs: response?.durationMs || null,
       });
+      await updateProgressMessage(ctx, progress, {
+        status: 'failed',
+        completedSteps: 4,
+        currentStep: LOG_TEST_PROGRESS_STEPS[3],
+        nextStep: LOG_TEST_PROGRESS_STEPS[4],
+        reason: buildLogTestFailureHint(null, response),
+      });
       break;
     }
 
+    await updateProgressMessage(ctx, progress, {
+      status: 'progressing',
+      completedSteps: 4,
+      currentStep: `${LOG_TEST_PROGRESS_STEPS[4]} (${mode})`,
+      nextStep: LOG_TEST_PROGRESS_STEPS[5],
+    });
     const receipt = await receiptPromise;
     if (!receipt.ok) {
       results.push({
@@ -11832,6 +12746,31 @@ async function runAllLogTests(ctx, projectId) {
         error: buildLogTestReceiptHint(),
         correlationId,
         callDurationMs: response?.durationMs || null,
+      });
+      await updateProgressMessage(ctx, progress, {
+        status: 'failed',
+        completedSteps: 5,
+        currentStep: LOG_TEST_PROGRESS_STEPS[4],
+        nextStep: LOG_TEST_PROGRESS_STEPS[5],
+        reason: buildLogTestReceiptHint(),
+      });
+      break;
+    }
+    const entryProjectId = receipt.entry?.projectId ? String(receipt.entry.projectId) : null;
+    if (entryProjectId && entryProjectId !== String(project.id)) {
+      results.push({
+        mode,
+        status: 'invalid_log',
+        error: `Unexpected projectId ${entryProjectId}`,
+        correlationId,
+        callDurationMs: response?.durationMs || null,
+      });
+      await updateProgressMessage(ctx, progress, {
+        status: 'failed',
+        completedSteps: 5,
+        currentStep: LOG_TEST_PROGRESS_STEPS[5],
+        nextStep: LOG_TEST_PROGRESS_STEPS[6],
+        reason: 'projectId mismatch',
       });
       break;
     }
@@ -11859,6 +12798,10 @@ async function runAllLogTests(ctx, projectId) {
       summaryLines.push(
         `❌ ${result.mode}: client call failed (${result.error})${result.callDurationMs ? ` in ${result.callDurationMs}ms` : ''}`,
       );
+    } else if (result.status === 'invalid_log') {
+      summaryLines.push(
+        `❌ ${result.mode}: invalid log (${result.error})${result.callDurationMs ? ` (call ${result.callDurationMs}ms)` : ''}`,
+      );
     } else {
       summaryLines.push(
         `⚠️ ${result.mode}: log missing (${result.error})${result.callDurationMs ? ` (call ${result.callDurationMs}ms)` : ''}`,
@@ -11867,7 +12810,7 @@ async function runAllLogTests(ctx, projectId) {
   });
 
   const allPassed = results.length === LOG_TEST_MODES.length && results.every((r) => r.status === 'ok');
-  const anyCallFailed = results.some((r) => r.status === 'call_failed');
+  const anyCallFailed = results.some((r) => r.status === 'call_failed' || r.status === 'invalid_log');
   const status = allPassed ? 'pass' : anyCallFailed ? 'fail' : 'partial';
   const summary = summaryLines.slice(0, 4).join(' ');
   await updateProjectLogTestResult(projectId, {
@@ -11876,17 +12819,48 @@ async function runAllLogTests(ctx, projectId) {
     correlationIds: results.map((result) => result.correlationId).filter(Boolean),
   });
 
+  completedSteps = 6;
+  await updateProgressMessage(ctx, progress, {
+    status: 'progressing',
+    completedSteps,
+    currentStep: LOG_TEST_PROGRESS_STEPS[5],
+    nextStep: LOG_TEST_PROGRESS_STEPS[6],
+  });
+  completedSteps = 7;
+  await updateProgressMessage(ctx, progress, {
+    status: allPassed ? 'success' : 'failed',
+    completedSteps,
+    currentStep: LOG_TEST_PROGRESS_STEPS[6],
+    nextStep: null,
+    reason: allPassed ? null : summary,
+  });
+
   let notice = summaryLines.join('\n');
-  if (!allPassed && logTest.diagnosticsEndpointUrl) {
-    const diag = await requestLogDiagnostics(project, logTest, tokenResult.token);
-    if (diag.ok) {
-      notice += `\n\n${buildLogTestDiagnosticsReport(diag.payload)}`;
-    } else {
-      notice += `\n\nDiagnostics failed: ${diag.error}`;
+  if (!allPassed) {
+    const firstFailure = results.find((result) => result.status !== 'ok');
+    if (firstFailure) {
+      let stepName = LOG_TEST_PROGRESS_STEPS[3];
+      let category = 'unknown';
+      if (firstFailure.status === 'log_missing') {
+        stepName = LOG_TEST_PROGRESS_STEPS[4];
+        category = 'missing_log';
+      } else if (firstFailure.status === 'invalid_log') {
+        stepName = LOG_TEST_PROGRESS_STEPS[5];
+        category = 'invalid_payload';
+      } else if (firstFailure.status === 'call_failed') {
+        stepName = LOG_TEST_PROGRESS_STEPS[3];
+        category = classifyFailureCategory(firstFailure.error, {
+          status: firstFailure.statusCode || undefined,
+        });
+      }
+      notice += `\n\nStep: ${stepName}\nCategory: ${category}\nReason: ${firstFailure.error || 'unknown'}`;
     }
-  } else if (!allPassed && !logTest.diagnosticsEndpointUrl) {
-    notice +=
-      '\n\nI can only see network behavior. Enable /pm/diagnostics or upload the client repo for code inspection.';
+  }
+  if (!allPassed && canInspectRepo(project)) {
+    notice += '\n\nNext: Inspect repo or generate Codex task for missing logging hooks.';
+  }
+  if (pingStatus === 'failed') {
+    notice += '\n\n⚠️ PM log ingestion ping failed.';
   }
   await renderProjectLogAlerts(ctx, projectId, notice);
 }
@@ -13960,6 +14934,7 @@ async function applyWebPatchSpec({ projectId, specText }) {
       summary,
       diffPreview,
       prUrl: pr.html_url,
+      prSummary: `Pull Request created: ${pr.html_url}. Please review and merge manually.`,
       elapsedSec: Math.round((Date.now() - startTime) / 1000),
     },
   };
@@ -16242,7 +17217,28 @@ function downloadTelegramFile(ctx, fileId) {
 
 function buildPrBody(previewText) {
   const preview = String(previewText || '').split('\n').slice(0, 20).join('\n');
-  return `Automated change at ${new Date().toISOString()}\n\nPreview:\n\n${preview}`;
+  return [
+    `Automated change at ${new Date().toISOString()}`,
+    '',
+    'Summary:',
+    '- Added PM diagnostics + log test + logger hooks (as applicable).',
+    '',
+    'Configuration:',
+    '- PM_TEST_TOKEN, PM_TEST_ENABLED',
+    '- PM_URL, PM_INGEST_TOKEN',
+    '',
+    'How to re-run PM log tests:',
+    '- POST /pm/test-log with PM_TEST_TOKEN',
+    '- GET /pm/diagnostics to verify logger flags',
+    '',
+    'Safety notes:',
+    '- No secrets logged or printed.',
+    '- Tokens remain environment-based.',
+    '',
+    'Preview:',
+    '',
+    preview,
+  ].join('\n');
 }
 
 bot.catch(async (err) => {
