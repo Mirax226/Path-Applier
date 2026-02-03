@@ -1,0 +1,174 @@
+const assert = require('node:assert/strict');
+const test = require('node:test');
+
+const {
+  navigateTo,
+  parseStartPayload,
+  handleGlobalCommand,
+  handleStartCommand,
+  handleReplyKeyboardNavigation,
+  __test,
+} = require('../bot');
+
+function createMockApi() {
+  const calls = {
+    deleteMessage: [],
+    editMessageText: [],
+    editMessageReplyMarkup: [],
+    sendMessage: [],
+  };
+  const api = {
+    deleteMessage: async (...args) => {
+      calls.deleteMessage.push(args);
+    },
+    editMessageText: async (...args) => {
+      calls.editMessageText.push(args);
+    },
+    editMessageReplyMarkup: async (...args) => {
+      calls.editMessageReplyMarkup.push(args);
+    },
+    sendMessage: async (...args) => {
+      calls.sendMessage.push(args);
+      return { chat: { id: args[0] }, message_id: 200 };
+    },
+  };
+  return { api, calls };
+}
+
+test('parseStartPayload maps payloads and falls back to main', () => {
+  assert.equal(parseStartPayload('logs'), 'logs');
+  assert.equal(parseStartPayload('db'), 'database');
+  assert.equal(parseStartPayload('unknown'), 'main');
+  assert.equal(parseStartPayload(''), 'main');
+});
+
+test('navigateTo dispatches to route handlers', async () => {
+  const called = [];
+  const handlers = {
+    main: async () => called.push('main'),
+    logs: async () => called.push('logs'),
+    database: async () => called.push('database'),
+    cronjobs: async () => called.push('cronjobs'),
+    settings: async () => called.push('settings'),
+    projects: async () => called.push('projects'),
+    deploy: async () => called.push('deploy'),
+  };
+
+  await navigateTo(1, 2, 'logs', { handlers });
+  await navigateTo(1, 2, 'database', { handlers });
+  await navigateTo(1, 2, 'unknown', { handlers });
+
+  assert.deepEqual(called, ['logs', 'database', 'main']);
+});
+
+test('slash command deletes message and edits active menu', async () => {
+  const { api, calls } = createMockApi();
+  __test.setBotApiForTests(api);
+  __test.resetNavigationState(1);
+  __test.setActivePanelMessageId(1, 42);
+
+  const ctx = {
+    chat: { id: 1 },
+    message: { chat: { id: 1 }, message_id: 111, text: '/logs' },
+    from: { id: 2 },
+    api,
+  };
+
+  const handled = await handleGlobalCommand(ctx, '/logs', '');
+
+  assert.equal(handled, true);
+  assert.equal(calls.deleteMessage.length, 1);
+  assert.deepEqual(calls.deleteMessage[0], [1, 111]);
+  assert.equal(calls.editMessageText.length, 1);
+  assert.equal(calls.editMessageText[0][0], 1);
+  assert.equal(calls.editMessageText[0][1], 42);
+  assert.equal(calls.sendMessage.length, 0);
+});
+
+test('reply keyboard tap deletes user message and keeps active menu', async () => {
+  const { api, calls } = createMockApi();
+  __test.setBotApiForTests(api);
+  __test.resetNavigationState(10);
+  __test.setActivePanelMessageId(10, 99);
+
+  const ctx = {
+    chat: { id: 10 },
+    message: { chat: { id: 10 }, message_id: 120, text: '📣 Logs' },
+    from: { id: 77 },
+    api,
+  };
+
+  await handleReplyKeyboardNavigation(ctx, 'logs');
+
+  assert.equal(calls.deleteMessage.length, 1);
+  assert.deepEqual(calls.deleteMessage[0], [10, 120]);
+  assert.equal(calls.editMessageText.length, 1);
+  assert.equal(calls.editMessageText[0][1], 99);
+});
+
+test('/start with payload cleans menus and routes', async () => {
+  const { api, calls } = createMockApi();
+  __test.setBotApiForTests(api);
+  __test.resetNavigationState(5);
+  __test.setPanelHistoryForChat(5, [55]);
+  __test.setActivePanelMessageId(5, 55);
+
+  const ctx = {
+    chat: { id: 5 },
+    message: { chat: { id: 5 }, message_id: 222, text: '/start logs' },
+    from: { id: 9 },
+    api,
+  };
+
+  await handleStartCommand(ctx, 'logs');
+
+  assert.equal(calls.deleteMessage.length, 2);
+  assert.ok(calls.deleteMessage.some((entry) => entry[0] === 5 && entry[1] === 222));
+  assert.ok(calls.deleteMessage.some((entry) => entry[0] === 5 && entry[1] === 55));
+  assert.equal(calls.sendMessage.length, 1);
+  assert.equal(__test.getActivePanelMessageId(5), 200);
+});
+
+test('/start without payload routes to main and cleans menus', async () => {
+  const { api, calls } = createMockApi();
+  __test.setBotApiForTests(api);
+  __test.resetNavigationState(6);
+  __test.setPanelHistoryForChat(6, [66]);
+  __test.setActivePanelMessageId(6, 66);
+
+  const ctx = {
+    chat: { id: 6 },
+    message: { chat: { id: 6 }, message_id: 333, text: '/start' },
+    from: { id: 10 },
+    api,
+  };
+
+  await handleStartCommand(ctx, '');
+
+  assert.equal(calls.deleteMessage.length, 2);
+  assert.ok(calls.deleteMessage.some((entry) => entry[0] === 6 && entry[1] === 333));
+  assert.ok(calls.deleteMessage.some((entry) => entry[0] === 6 && entry[1] === 66));
+  assert.equal(calls.sendMessage.length, 1);
+  assert.equal(__test.getActivePanelMessageId(6), 200);
+});
+
+test('navigation queues during operation in progress', async () => {
+  const { api, calls } = createMockApi();
+  __test.setBotApiForTests(api);
+  __test.resetNavigationState(20);
+  __test.setNavigationOperationInProgress(20, true);
+  __test.setActivePanelMessageId(20, 500);
+
+  const ctx = {
+    chat: { id: 20 },
+    message: { chat: { id: 20 }, message_id: 401, text: '/logs' },
+    from: { id: 88 },
+    api,
+  };
+
+  await handleGlobalCommand(ctx, '/logs', '');
+
+  assert.equal(calls.deleteMessage.length, 1);
+  assert.equal(calls.editMessageText.length, 0);
+  assert.equal(calls.sendMessage.length, 1);
+});
