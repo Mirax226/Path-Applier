@@ -292,14 +292,27 @@ const LOG_TEST_CALL_TIMEOUTS_MS = {
 };
 const LOG_TEST_REMINDER_SNOOZE_DAYS = [1, 3, 7];
 const LOG_TEST_DAILY_REMINDER_ENABLED = String(process.env.LOG_TEST_DAILY_REMINDER || '').toLowerCase() === 'true';
-const LOG_TEST_PROGRESS_STEPS = [
+const LOG_TEST_SINGLE_PROGRESS_STEPS = [
   'Resolve project config',
   'Diagnostics gate (/pm/diagnostics)',
-  'Verify PM log ingestion endpoint reachable',
   'Trigger client log test',
-  'Wait for log arrival',
-  'Validate log format + project tag correctness',
-  'Summarize results + next actions',
+  'Wait for log receipt (correlationId)',
+  'Validate payload formatting and project tagging',
+  'Summarize',
+];
+const LOG_TEST_SUITE_PROGRESS_STEPS = [
+  'Resolve project config',
+  'Diagnostics gate (/pm/diagnostics)',
+  'Trigger client test: info',
+  'Wait for log receipt (correlationId)',
+  'Trigger client test: warn',
+  'Wait for log receipt (correlationId)',
+  'Trigger client test: error',
+  'Wait for log receipt (correlationId)',
+  'Trigger client test: timeout',
+  'Wait for log receipt (correlationId)',
+  'Validate payload formatting and project tagging',
+  'Summarize',
 ];
 const LOG_TEST_DIAGNOSTICS_TIMEOUT_MS = 12_000;
 const REPO_INSPECTION_RATE_LIMIT = { limit: 3, windowMs: 60 * 60 * 1000 };
@@ -314,6 +327,14 @@ const CRON_JOBS_CACHE_TTL_MS = 30_000;
 let lastCronJobsCache = null;
 let lastCronJobsFetchedAt = 0;
 const TELEGRAM_WEBHOOK_PATH_PREFIX = '/webhook';
+const RENDER_API_KEY = process.env.RENDER_API_KEY;
+const RENDER_API_BASE_URL = 'https://api.render.com/v1';
+const RENDER_WEBHOOK_EVENTS_DEFAULT = ['deploy_started', 'deploy_ended'];
+const RENDER_WEBHOOK_RATE_LIMIT = { limit: 12, windowMs: 60 * 1000 };
+const RENDER_WEBHOOK_DEDUP_TTL_MS = 6 * 60 * 60 * 1000;
+const renderWebhookRateLimits = new Map();
+const renderWebhookEventCache = new Map();
+const renderWebhookUnknownServiceNotices = new Map();
 
 function normalizeLogLevels(levels) {
   if (!Array.isArray(levels)) return [];
@@ -1322,6 +1343,17 @@ async function resetToMainMenu(ctx, notice, options = {}) {
   if (options.deleteIncomingMessage) {
     await safeDeleteMessage(ctx, ctx.message?.chat?.id, ctx.message?.message_id, 'start_command');
   }
+  const chatId = getChatIdFromCtx(ctx);
+  const activePanelMessageId = getActivePanelMessageId(chatId);
+  if (chatId && activePanelMessageId) {
+    await safeDeleteMessage(ctx, chatId, activePanelMessageId, 'start_reset');
+    clearActivePanelMessageId(chatId);
+    const history = getPanelHistory(chatId);
+    panelMessageHistoryByChat.set(
+      chatId,
+      history.filter((messageId) => messageId !== activePanelMessageId),
+    );
+  }
   await clearEphemeralMessages(ctx, 'main_menu');
   if (options.freshPanel) {
     await clearPanelMessages(ctx, 'main_menu');
@@ -1347,7 +1379,8 @@ function buildMainMenuInlineKeyboard() {
     .text('⏱️ Cronjobs', 'main:cronjobs')
     .text('⚙️ Settings', 'main:settings')
     .row()
-    .text('📣 Logs', 'main:logs');
+    .text('📣 Logs', 'main:logs')
+    .text('🚀 Deploys', 'main:deploys');
 }
 
 function buildCancelKeyboard() {
@@ -1497,6 +1530,7 @@ const mainKeyboard = new Keyboard()
   .text('⚙️ Settings')
   .row()
   .text('📣 Logs')
+  .text('🚀 Deploys')
   .resized();
 
 const GLOBAL_COMMAND_ALIASES = {
@@ -1665,6 +1699,10 @@ bot.hears('⏱️ Cronjobs', async (ctx) => {
 
 bot.hears('📣 Logs', async (ctx) => {
   await handleReplyKeyboardNavigation(ctx, () => renderLogsProjectList(ctx));
+});
+
+bot.hears('🚀 Deploys', async (ctx) => {
+  await handleReplyKeyboardNavigation(ctx, () => renderDeploysProjectList(ctx));
 });
 
 bot.callbackQuery('cancel_input', wrapCallbackHandler(async (ctx) => {
@@ -1846,6 +1884,10 @@ bot.on('callback_query:data', wrapCallbackHandler(async (ctx) => {
     await handleLogsMenuCallback(ctx, data);
     return;
   }
+  if (data.startsWith('deploy:')) {
+    await handleDeployCallback(ctx, data);
+    return;
+  }
   if (data.startsWith('notes:')) {
     await handleNotesCallback(ctx, data);
     return;
@@ -1959,6 +2001,9 @@ async function handleStatefulMessage(ctx, state) {
     case 'cron_edit_timezone':
       await handleCronEditTimezoneMessage(ctx, state);
       break;
+    case 'deploy_service_id':
+      await handleDeployServiceIdInput(ctx, state);
+      break;
     case 'projcron_keepalive_schedule':
     case 'projcron_keepalive_recreate':
     case 'projcron_deploy_schedule':
@@ -2069,6 +2114,9 @@ async function handleMainCallback(ctx, data) {
       break;
     case 'logs':
       await renderLogsProjectList(ctx, '📣 Logs');
+      break;
+    case 'deploys':
+      await renderDeploysProjectList(ctx);
       break;
     default:
       break;
@@ -8326,8 +8374,16 @@ async function applyChangesInRepo(ctx, projectId, change) {
   const startTime = Date.now();
   const globalSettings = await loadGlobalSettings();
   let shouldClearUserState = true;
+  const progress = createOperationProgress(ctx, `🛠 Create PR — ${project.name || project.id}`, 4);
+  let completedSteps = 0;
 
   try {
+    await updateProgressMessage(ctx, progress, {
+      status: 'progressing',
+      completedSteps,
+      currentStep: 'Update repository',
+      nextStep: 'Apply changes',
+    });
     const effectiveBaseBranch = project.baseBranch || globalSettings.defaultBaseBranch || DEFAULT_BASE_BRANCH;
     let repoInfo;
     try {
@@ -8342,9 +8398,15 @@ async function applyChangesInRepo(ctx, projectId, change) {
       throw error;
     }
 
-    await ctx.reply('Updating repository…');
     const { git, repoDir } = await prepareRepository(project, effectiveBaseBranch);
     const branchName = makePatchBranchName(project.id);
+    completedSteps = 1;
+    await updateProgressMessage(ctx, progress, {
+      status: 'progressing',
+      completedSteps,
+      currentStep: 'Apply changes',
+      nextStep: 'Commit + push',
+    });
 
     if (change.mode === 'structured') {
       const pathErrors = validateStructuredFilePaths(repoDir, change.plan || []);
@@ -8360,16 +8422,13 @@ async function applyChangesInRepo(ctx, projectId, change) {
     let results = [];
     let structuredFailure = null;
     if (change.mode === 'patch') {
-      await ctx.reply('Applying patch…');
       await applyPatchToRepo(git, repoDir, change.patchText);
       results = [{ entry: { filePath: '(patch)' }, status: 'applied' }];
     } else if (change.mode === 'structured') {
-      await ctx.reply('Applying structured changes…');
       const structuredResult = await applyStructuredChangePlan(repoDir, change.plan);
       results = structuredResult.results;
       structuredFailure = structuredResult.failure;
     } else {
-      await ctx.reply('Applying inferred changes…');
       results = await applyUnstructuredPlan(repoDir, change.plan);
     }
 
@@ -8401,6 +8460,13 @@ async function applyChangesInRepo(ctx, projectId, change) {
       });
       setUserState(ctx.from.id, { type: 'structured_fix_block' });
       shouldClearUserState = false;
+      await updateProgressMessage(ctx, progress, {
+        status: 'failed',
+        completedSteps,
+        currentStep: 'Apply changes',
+        nextStep: null,
+        reason: 'Structured change needs input',
+      });
       await ctx.reply(failureMessage, { reply_markup: inline });
       return;
     }
@@ -8409,7 +8475,13 @@ async function applyChangesInRepo(ctx, projectId, change) {
     const failureLines = formatChangeFailures(results);
     const diffPreview = await buildDiffPreview(git);
 
-    await ctx.reply('Committing and pushing…');
+    completedSteps = 2;
+    await updateProgressMessage(ctx, progress, {
+      status: 'progressing',
+      completedSteps,
+      currentStep: 'Commit + push',
+      nextStep: 'Create PR',
+    });
     const identityResult = await configureGitIdentity(git);
     if (!identityResult.ok) {
       const stderr = identityResult.error?.stderr || identityResult.error?.message || 'Unknown error';
@@ -8424,7 +8496,13 @@ async function applyChangesInRepo(ctx, projectId, change) {
       return;
     }
 
-    await ctx.reply('Creating Pull Request…');
+    completedSteps = 3;
+    await updateProgressMessage(ctx, progress, {
+      status: 'progressing',
+      completedSteps,
+      currentStep: 'Create PR',
+      nextStep: null,
+    });
     const prBody = buildPrBody(diffPreview || change.patchText || '');
     const [owner, repo] = repoInfo.repoSlug.split('/');
     const githubToken = getGithubToken(project);
@@ -8436,6 +8514,13 @@ async function applyChangesInRepo(ctx, projectId, change) {
       title: `Automated patch: ${project.id}`,
       body: prBody,
       token: githubToken,
+    });
+    completedSteps = 4;
+    await updateProgressMessage(ctx, progress, {
+      status: 'success',
+      completedSteps,
+      currentStep: 'Create PR',
+      nextStep: null,
     });
 
     const elapsed = Math.round((Date.now() - startTime) / 1000);
@@ -8458,6 +8543,13 @@ async function applyChangesInRepo(ctx, projectId, change) {
     }
   } catch (error) {
     console.error('Failed to apply changes', error);
+    await updateProgressMessage(ctx, progress, {
+      status: 'failed',
+      completedSteps,
+      currentStep: 'Create PR',
+      nextStep: null,
+      reason: error.message,
+    });
     await ctx.reply(`Failed to apply changes: ${error.message}`);
   } finally {
     if (shouldClearUserState) {
@@ -8473,6 +8565,8 @@ async function finalizeStructuredChangeSession(ctx, session, results) {
     await ctx.reply('Project not found.');
     return;
   }
+  const progress = createOperationProgress(ctx, `🛠 Create PR — ${project.name || project.id}`, 2);
+  let completedSteps = 0;
 
   let repoInfo;
   try {
@@ -8488,7 +8582,12 @@ async function finalizeStructuredChangeSession(ctx, session, results) {
   }
 
   const diffPreview = await buildDiffPreview(session.git);
-  await ctx.reply('Committing and pushing…');
+  await updateProgressMessage(ctx, progress, {
+    status: 'progressing',
+    completedSteps,
+    currentStep: 'Commit + push',
+    nextStep: 'Create PR',
+  });
   const identityResult = await configureGitIdentity(session.git);
   if (!identityResult.ok) {
     const stderr = identityResult.error?.stderr || identityResult.error?.message || 'Unknown error';
@@ -8502,7 +8601,13 @@ async function finalizeStructuredChangeSession(ctx, session, results) {
     return;
   }
 
-  await ctx.reply('Creating Pull Request…');
+  completedSteps = 1;
+  await updateProgressMessage(ctx, progress, {
+    status: 'progressing',
+    completedSteps,
+    currentStep: 'Create PR',
+    nextStep: null,
+  });
   const prBody = buildPrBody(diffPreview || '');
   const [owner, repo] = repoInfo.repoSlug.split('/');
   const githubToken = getGithubToken(project);
@@ -8514,6 +8619,13 @@ async function finalizeStructuredChangeSession(ctx, session, results) {
     title: `Automated patch: ${project.id}`,
     body: prBody,
     token: githubToken,
+  });
+  completedSteps = 2;
+  await updateProgressMessage(ctx, progress, {
+    status: 'success',
+    completedSteps,
+    currentStep: 'Create PR',
+    nextStep: null,
   });
 
   const elapsed = Math.round((Date.now() - session.startTime) / 1000);
@@ -9228,6 +9340,26 @@ async function handleEditRenderUrl(ctx, state) {
   if (!state.messageContext) {
     await renderProjectSettings(ctx, state.projectId, '✅ Updated');
   }
+}
+
+async function handleDeployServiceIdInput(ctx, state) {
+  const text = ctx.message.text?.trim();
+  if (!text) {
+    await ctx.reply('Please send a valid Render serviceId.');
+    return;
+  }
+  if (text.toLowerCase() === 'cancel') {
+    clearUserState(ctx.from.id);
+    await renderDeployProjectPanel(ctx, state.projectId, 'Operation cancelled.');
+    return;
+  }
+  await updateProjectDeploySettings(state.projectId, (current) => ({
+    ...current,
+    deployProvider: 'render',
+    render: { ...current.render, serviceId: text },
+  }));
+  clearUserState(ctx.from.id);
+  await renderDeployProjectPanel(ctx, state.projectId, '✅ Render serviceId updated.');
 }
 
 async function handleSupabaseBindingInput(ctx, state) {
@@ -11110,6 +11242,44 @@ function normalizeLogTestSettings(project) {
   };
 }
 
+function normalizeRenderWebhookSettings(settings) {
+  const webhook = settings?.renderWebhook || {};
+  const events = Array.isArray(webhook.events)
+    ? webhook.events.filter(Boolean)
+    : RENDER_WEBHOOK_EVENTS_DEFAULT.slice();
+  return {
+    webhookId: webhook.webhookId || null,
+    targetUrl: webhook.targetUrl || '',
+    events: events.length ? events : RENDER_WEBHOOK_EVENTS_DEFAULT.slice(),
+    lastVerifiedAt: webhook.lastVerifiedAt || null,
+  };
+}
+
+function normalizeProjectDeploySettings(project) {
+  const render = project?.render || {};
+  const deployNotifications = project?.deployNotifications || {};
+  return {
+    deployProvider: project?.deployProvider || (render.serviceId ? 'render' : null),
+    render: {
+      serviceId: render.serviceId || project?.renderServiceId || null,
+      eventsEnabled: Array.isArray(render.eventsEnabled) ? render.eventsEnabled.filter(Boolean) : null,
+    },
+    notifications: {
+      enabled: typeof deployNotifications.enabled === 'boolean' ? deployNotifications.enabled : false,
+      lastEvent: deployNotifications.lastEvent || null,
+      lastStatus: deployNotifications.lastStatus || null,
+    },
+  };
+}
+
+function isRenderEventEnabled(deploySettings, webhookSettings, eventType) {
+  const projectEvents = deploySettings.render?.eventsEnabled;
+  if (Array.isArray(projectEvents) && projectEvents.length) {
+    return projectEvents.includes(eventType);
+  }
+  return webhookSettings.events.includes(eventType);
+}
+
 function resolveLogTestReminderState(logTest, nowMs = Date.now()) {
   const snoozedUntil = logTest.reminder?.snoozedUntil
     ? new Date(logTest.reminder.snoozedUntil).getTime()
@@ -11140,6 +11310,17 @@ function formatLogTestStatusLine(logTest) {
     return `Log test: 🧩 blocked (missing diagnostics)${lastRunAt ? ` (${lastRunAt})` : ''}`;
   }
   return 'Log test: ⚠️ not run yet';
+}
+
+function formatLogTestBadgeLine(logTest) {
+  const status = logTest.lastTest?.status || 'never';
+  if (status === 'pass') {
+    return '✅ Log test: passed';
+  }
+  if (status === 'fail' || status === 'partial') {
+    return '❌ Log test: last failed';
+  }
+  return '⚠️ Log test: NOT DONE';
 }
 
 function formatLogTestReminderLine(logTest) {
@@ -11186,6 +11367,28 @@ async function updateProjectLogTestResult(projectId, result) {
     };
   });
   return outcome;
+}
+
+async function updateProjectDeploySettings(projectId, updater) {
+  const projects = await loadProjects();
+  const project = findProjectById(projects, projectId);
+  if (!project) return null;
+  const current = normalizeProjectDeploySettings(project);
+  const next = typeof updater === 'function' ? updater(current) : { ...current, ...updater };
+  project.deployProvider = next.deployProvider || project.deployProvider;
+  project.render = {
+    ...(project.render || {}),
+    serviceId: next.render?.serviceId || null,
+    eventsEnabled: next.render?.eventsEnabled || null,
+  };
+  project.deployNotifications = {
+    ...(project.deployNotifications || {}),
+    enabled: Boolean(next.notifications?.enabled),
+    lastEvent: next.notifications?.lastEvent || null,
+    lastStatus: next.notifications?.lastStatus || null,
+  };
+  await saveProjects(projects);
+  return { project, settings: next };
 }
 
 function buildProjectLogAlertsView(project, settings, notice) {
@@ -11567,6 +11770,144 @@ function requestUrlWithBodyAndHeaders(options) {
   });
 }
 
+async function requestRenderApi({ method, path, body }) {
+  if (!RENDER_API_KEY) {
+    throw new Error('RENDER_API_KEY not configured.');
+  }
+  const targetUrl = `${RENDER_API_BASE_URL}${path}`;
+  const response = await requestUrlWithBodyAndHeaders({
+    method,
+    targetUrl,
+    headers: {
+      Authorization: `Bearer ${RENDER_API_KEY}`,
+    },
+    body,
+    timeoutMs: 15000,
+  });
+  if (!response || response.status < 200 || response.status >= 300) {
+    throw new Error(`Render API failed (${response?.status || 'unknown'}).`);
+  }
+  if (!response.body) return null;
+  try {
+    return JSON.parse(response.body);
+  } catch (error) {
+    return null;
+  }
+}
+
+async function listRenderWebhooks() {
+  const payload = await requestRenderApi({ method: 'GET', path: '/webhooks' });
+  if (Array.isArray(payload)) return payload;
+  if (payload?.data && Array.isArray(payload.data)) return payload.data;
+  return [];
+}
+
+async function createRenderWebhook({ name, url, events }) {
+  const payload = await requestRenderApi({
+    method: 'POST',
+    path: '/webhooks',
+    body: {
+      name,
+      url,
+      events,
+    },
+  });
+  return payload;
+}
+
+function buildRenderWebhookTargetUrl() {
+  const baseUrl = getPublicBaseUrl().replace(/\/+$/, '');
+  return `${baseUrl}/api/render/webhook`;
+}
+
+function isDuplicateRenderEvent(eventKey, now = Date.now()) {
+  if (!eventKey) return false;
+  const lastSeen = renderWebhookEventCache.get(eventKey);
+  if (lastSeen && now - lastSeen < RENDER_WEBHOOK_DEDUP_TTL_MS) {
+    return true;
+  }
+  renderWebhookEventCache.set(eventKey, now);
+  for (const [key, timestamp] of renderWebhookEventCache.entries()) {
+    if (now - timestamp > RENDER_WEBHOOK_DEDUP_TTL_MS) {
+      renderWebhookEventCache.delete(key);
+    }
+  }
+  return false;
+}
+
+async function ensureRenderWebhookConfigured({ events, progress } = {}) {
+  const settings = await getCachedSettings(true);
+  const webhookSettings = normalizeRenderWebhookSettings(settings);
+  const targetUrl = buildRenderWebhookTargetUrl();
+  const desiredEvents = Array.isArray(events) && events.length ? events : webhookSettings.events;
+
+  if (progress) {
+    await updateProgressMessage(null, progress, {
+      status: 'progressing',
+      completedSteps: 1,
+      currentStep: 'Checking Render webhooks',
+      nextStep: 'Creating or reusing webhook',
+    });
+  }
+
+  const existing = await listRenderWebhooks();
+  const matching = existing.find((hook) => {
+    const hookUrl = hook.url || hook.targetUrl || hook.webhookUrl || '';
+    const hookEvents = Array.isArray(hook.events) ? hook.events : [];
+    const hasAllEvents = desiredEvents.every((eventName) => hookEvents.includes(eventName));
+    return hookUrl === targetUrl && hasAllEvents;
+  });
+
+  if (matching) {
+    const updated = {
+      ...settings,
+      renderWebhook: {
+        webhookId: matching.id || matching.webhookId || webhookSettings.webhookId,
+        targetUrl,
+        events: desiredEvents,
+        lastVerifiedAt: new Date().toISOString(),
+      },
+    };
+    await saveGlobalSettingsAndCache(updated);
+    if (progress) {
+      await updateProgressMessage(null, progress, {
+        status: 'progressing',
+        completedSteps: 2,
+        currentStep: 'Webhook ready',
+        nextStep: 'Finalizing',
+      });
+    }
+    return updated.renderWebhook;
+  }
+
+  const created = await createRenderWebhook({
+    name: 'PM Deploy Alerts (workspace)',
+    url: targetUrl,
+    events: desiredEvents,
+  });
+
+  const webhookId = created?.id || created?.webhookId || null;
+  const updated = {
+    ...settings,
+    renderWebhook: {
+      webhookId,
+      targetUrl,
+      events: desiredEvents,
+      lastVerifiedAt: new Date().toISOString(),
+    },
+  };
+  await saveGlobalSettingsAndCache(updated);
+  if (progress) {
+    await updateProgressMessage(null, progress, {
+      status: 'progressing',
+      completedSteps: 2,
+      currentStep: 'Webhook created',
+      nextStep: 'Finalizing',
+    });
+  }
+  return updated.renderWebhook;
+}
+
 function buildLogTestFailureHint(error, response) {
   if (response) {
     if (response.status === 404) {
@@ -11618,6 +11959,28 @@ function buildLogTestReceiptHint() {
     'Ensure correlationId is included in log payload meta.',
     'Check outbound connectivity from client to PM.',
   ].join('\n');
+}
+
+function validateLogTestReceipt(entry, projectId, correlationId) {
+  if (!entry || typeof entry !== 'object') {
+    return { ok: false, error: 'Log payload missing.' };
+  }
+  const entryProjectId = entry.projectId ? String(entry.projectId) : null;
+  if (entryProjectId && entryProjectId !== String(projectId)) {
+    return { ok: false, error: `projectId mismatch (expected ${projectId}, got ${entryProjectId}).` };
+  }
+  const meta = entry.meta || {};
+  const metaCorrelationId = meta.correlationId || meta.correlation_id || null;
+  if (correlationId && metaCorrelationId && metaCorrelationId !== correlationId) {
+    return { ok: false, error: 'correlationId mismatch in log payload.' };
+  }
+  if (!metaCorrelationId) {
+    return { ok: false, error: 'correlationId missing in log payload meta.' };
+  }
+  if (!entry.level) {
+    return { ok: false, error: 'log level missing.' };
+  }
+  return { ok: true };
 }
 
 function buildLogTestDiagnosticsReport(diagnostics) {
@@ -11742,11 +12105,20 @@ async function updateProgressMessage(ctx, progress, payload) {
   }
 }
 
-function createLogTestProgress(ctx, header) {
+function createLogTestProgress(ctx, header, steps) {
   return {
     chatId: ctx.chat?.id,
     messageId: null,
-    totalSteps: LOG_TEST_PROGRESS_STEPS.length,
+    totalSteps: steps.length,
+    header,
+  };
+}
+
+function createOperationProgress(ctx, header, totalSteps) {
+  return {
+    chatId: ctx.chat?.id,
+    messageId: null,
+    totalSteps,
     header,
   };
 }
@@ -12171,12 +12543,40 @@ async function runRepoInspection(ctx, projectId) {
     );
     return;
   }
-  await renderProjectLogAlerts(ctx, projectId, '🔍 Inspecting repo (read-only)…');
+  const progress = createOperationProgress(ctx, `🔍 Repo inspection — ${project.name || project.id}`, 3);
+  let completedSteps = 0;
+  await updateProgressMessage(ctx, progress, {
+    status: 'progressing',
+    completedSteps,
+    currentStep: 'Resolve repo config',
+    nextStep: 'Clone + scan repo',
+  });
+  completedSteps = 1;
+  await updateProgressMessage(ctx, progress, {
+    status: 'progressing',
+    completedSteps,
+    currentStep: 'Clone + scan repo',
+    nextStep: 'Summarize',
+  });
   const result = await inspectRepository(project);
   if (!result.ok) {
+    await updateProgressMessage(ctx, progress, {
+      status: 'failed',
+      completedSteps,
+      currentStep: 'Clone + scan repo',
+      nextStep: null,
+      reason: result.error,
+    });
     await renderProjectLogAlerts(ctx, projectId, `❌ Repo inspection failed.\nReason: ${result.error}`);
     return;
   }
+  completedSteps = 2;
+  await updateProgressMessage(ctx, progress, {
+    status: 'progressing',
+    completedSteps,
+    currentStep: 'Summarize',
+    nextStep: null,
+  });
   const reportText = buildRepoInspectionReportText(result.report);
   const codexTask = buildRepoCodexTask(result.report);
   repoInspectionCache.set(projectId, {
@@ -12184,6 +12584,12 @@ async function runRepoInspection(ctx, projectId) {
     report: result.report,
     reportText,
     codexTask,
+  });
+  await updateProgressMessage(ctx, progress, {
+    status: 'success',
+    completedSteps: 3,
+    currentStep: 'Summarize',
+    nextStep: null,
   });
   const inline = new InlineKeyboard()
     .text('🧩 Generate Codex task for client repo', `logtest:generate_repo_task:${projectId}`)
@@ -12290,13 +12696,13 @@ async function runSingleLogTest(ctx, projectId, mode) {
     return;
   }
 
-  const progress = createLogTestProgress(ctx, `🧪 Log test — ${project.name || project.id}`);
+  const progress = createLogTestProgress(ctx, `🧪 Log test — ${project.name || project.id}`, LOG_TEST_SINGLE_PROGRESS_STEPS);
   let completedSteps = 0;
   await updateProgressMessage(ctx, progress, {
     status: 'progressing',
     completedSteps,
-    currentStep: LOG_TEST_PROGRESS_STEPS[0],
-    nextStep: LOG_TEST_PROGRESS_STEPS[1],
+    currentStep: LOG_TEST_SINGLE_PROGRESS_STEPS[0],
+    nextStep: LOG_TEST_SINGLE_PROGRESS_STEPS[1],
   });
 
   const tokenResult = await fetchLogTestToken(projectId, logTest);
@@ -12304,8 +12710,8 @@ async function runSingleLogTest(ctx, projectId, mode) {
     await updateProgressMessage(ctx, progress, {
       status: 'failed',
       completedSteps: 1,
-      currentStep: LOG_TEST_PROGRESS_STEPS[0],
-      nextStep: LOG_TEST_PROGRESS_STEPS[1],
+      currentStep: LOG_TEST_SINGLE_PROGRESS_STEPS[0],
+      nextStep: LOG_TEST_SINGLE_PROGRESS_STEPS[1],
       reason: `token (${tokenResult.error})`,
     });
     await renderProjectLogAlerts(
@@ -12319,8 +12725,8 @@ async function runSingleLogTest(ctx, projectId, mode) {
   await updateProgressMessage(ctx, progress, {
     status: 'progressing',
     completedSteps,
-    currentStep: LOG_TEST_PROGRESS_STEPS[1],
-    nextStep: LOG_TEST_PROGRESS_STEPS[2],
+    currentStep: LOG_TEST_SINGLE_PROGRESS_STEPS[1],
+    nextStep: LOG_TEST_SINGLE_PROGRESS_STEPS[2],
   });
 
   const diagnosticsUrl = resolveDiagnosticsEndpoint(project, logTest);
@@ -12333,8 +12739,8 @@ async function runSingleLogTest(ctx, projectId, mode) {
     await updateProgressMessage(ctx, progress, {
       status: 'failed',
       completedSteps: 2,
-      currentStep: LOG_TEST_PROGRESS_STEPS[1],
-      nextStep: LOG_TEST_PROGRESS_STEPS[2],
+      currentStep: LOG_TEST_SINGLE_PROGRESS_STEPS[1],
+      nextStep: LOG_TEST_SINGLE_PROGRESS_STEPS[2],
       reason: 'missing diagnostics endpoint',
     });
     await renderProjectLogAlerts(
@@ -12355,8 +12761,8 @@ async function runSingleLogTest(ctx, projectId, mode) {
     await updateProgressMessage(ctx, progress, {
       status: 'failed',
       completedSteps: 2,
-      currentStep: LOG_TEST_PROGRESS_STEPS[1],
-      nextStep: LOG_TEST_PROGRESS_STEPS[2],
+      currentStep: LOG_TEST_SINGLE_PROGRESS_STEPS[1],
+      nextStep: LOG_TEST_SINGLE_PROGRESS_STEPS[2],
       reason: `diagnostics (${diagnostics.error})`,
     });
     await renderProjectLogAlerts(
@@ -12371,8 +12777,8 @@ async function runSingleLogTest(ctx, projectId, mode) {
   await updateProgressMessage(ctx, progress, {
     status: 'progressing',
     completedSteps,
-    currentStep: LOG_TEST_PROGRESS_STEPS[2],
-    nextStep: LOG_TEST_PROGRESS_STEPS[3],
+    currentStep: LOG_TEST_SINGLE_PROGRESS_STEPS[2],
+    nextStep: LOG_TEST_SINGLE_PROGRESS_STEPS[3],
   });
 
   let pingStatus = 'skipped';
@@ -12397,8 +12803,8 @@ async function runSingleLogTest(ctx, projectId, mode) {
   await updateProgressMessage(ctx, progress, {
     status: 'progressing',
     completedSteps,
-    currentStep: `${LOG_TEST_PROGRESS_STEPS[3]} (${mode})`,
-    nextStep: LOG_TEST_PROGRESS_STEPS[4],
+    currentStep: `${LOG_TEST_SINGLE_PROGRESS_STEPS[2]} (${mode})`,
+    nextStep: LOG_TEST_SINGLE_PROGRESS_STEPS[3],
   });
 
   const correlationId = crypto.randomUUID();
@@ -12437,8 +12843,8 @@ async function runSingleLogTest(ctx, projectId, mode) {
     await updateProgressMessage(ctx, progress, {
       status: 'failed',
       completedSteps: 4,
-      currentStep: LOG_TEST_PROGRESS_STEPS[3],
-      nextStep: LOG_TEST_PROGRESS_STEPS[4],
+      currentStep: LOG_TEST_SINGLE_PROGRESS_STEPS[2],
+      nextStep: LOG_TEST_SINGLE_PROGRESS_STEPS[3],
       reason: hint,
     });
     let notice = `❌ Test call failed.\nStep: Trigger client log test\nCategory: ${category}\nReason: ${hint}`;
@@ -12461,8 +12867,8 @@ async function runSingleLogTest(ctx, projectId, mode) {
     await updateProgressMessage(ctx, progress, {
       status: 'failed',
       completedSteps: 4,
-      currentStep: LOG_TEST_PROGRESS_STEPS[3],
-      nextStep: LOG_TEST_PROGRESS_STEPS[4],
+      currentStep: LOG_TEST_SINGLE_PROGRESS_STEPS[2],
+      nextStep: LOG_TEST_SINGLE_PROGRESS_STEPS[3],
       reason: hint,
     });
     let notice = `❌ Test call failed.\nStep: Trigger client log test\nCategory: ${category}\nReason: ${hint}\nStatus: ${response?.status || 'unknown'}`;
@@ -12476,8 +12882,8 @@ async function runSingleLogTest(ctx, projectId, mode) {
   await updateProgressMessage(ctx, progress, {
     status: 'progressing',
     completedSteps: 4,
-    currentStep: LOG_TEST_PROGRESS_STEPS[4],
-    nextStep: LOG_TEST_PROGRESS_STEPS[5],
+    currentStep: LOG_TEST_SINGLE_PROGRESS_STEPS[3],
+    nextStep: LOG_TEST_SINGLE_PROGRESS_STEPS[4],
   });
   const receipt = await receiptPromise;
   if (!receipt.ok) {
@@ -12490,8 +12896,8 @@ async function runSingleLogTest(ctx, projectId, mode) {
     await updateProgressMessage(ctx, progress, {
       status: 'failed',
       completedSteps: 5,
-      currentStep: LOG_TEST_PROGRESS_STEPS[4],
-      nextStep: LOG_TEST_PROGRESS_STEPS[5],
+      currentStep: LOG_TEST_SINGLE_PROGRESS_STEPS[3],
+      nextStep: LOG_TEST_SINGLE_PROGRESS_STEPS[4],
       reason: hint,
     });
     let notice = `⚠️ Test call succeeded but no log received.\nStep: Wait for log arrival\nCategory: missing_log\nReason: ${hint}`;
@@ -12502,24 +12908,30 @@ async function runSingleLogTest(ctx, projectId, mode) {
     return;
   }
 
-  const entryProjectId = receipt.entry?.projectId ? String(receipt.entry.projectId) : null;
-  if (entryProjectId && entryProjectId !== String(project.id)) {
+  await updateProgressMessage(ctx, progress, {
+    status: 'progressing',
+    completedSteps: 4,
+    currentStep: LOG_TEST_SINGLE_PROGRESS_STEPS[4],
+    nextStep: LOG_TEST_SINGLE_PROGRESS_STEPS[5],
+  });
+  const validation = validateLogTestReceipt(receipt.entry, project.id, correlationId);
+  if (!validation.ok) {
     await updateProjectLogTestResult(projectId, {
       status: 'fail',
-      summary: `Log tagged with unexpected projectId (${entryProjectId}).`,
+      summary: validation.error,
       correlationIds: [correlationId],
     });
     await updateProgressMessage(ctx, progress, {
       status: 'failed',
-      completedSteps: 6,
-      currentStep: LOG_TEST_PROGRESS_STEPS[5],
-      nextStep: LOG_TEST_PROGRESS_STEPS[6],
-      reason: 'projectId mismatch',
+      completedSteps: 4,
+      currentStep: LOG_TEST_SINGLE_PROGRESS_STEPS[4],
+      nextStep: LOG_TEST_SINGLE_PROGRESS_STEPS[5],
+      reason: validation.error,
     });
     await renderProjectLogAlerts(
       ctx,
       projectId,
-      `❌ Log received but tagged to a different project.\nStep: Validate log format + project tag correctness\nCategory: invalid_payload\nReason: expected ${project.id}, got ${entryProjectId}.`,
+      `❌ Log received but invalid.\nStep: Validate payload formatting and project tagging\nCategory: invalid_payload\nReason: ${validation.error}`,
     );
     return;
   }
@@ -12529,12 +12941,12 @@ async function runSingleLogTest(ctx, projectId, mode) {
     summary: `Mode ${mode} received.`,
     correlationIds: [correlationId],
   });
-  completedSteps = 7;
+  completedSteps = 6;
   const summaryNote = `✅ ${mode} test passed.${pingStatus === 'failed' ? ' (PM ingest ping failed)' : ''}`;
   await updateProgressMessage(ctx, progress, {
     status: 'success',
     completedSteps,
-    currentStep: LOG_TEST_PROGRESS_STEPS[6],
+    currentStep: LOG_TEST_SINGLE_PROGRESS_STEPS[5],
     nextStep: null,
   });
   await renderProjectLogAlerts(ctx, projectId, summaryNote);
@@ -12552,21 +12964,25 @@ async function runAllLogTests(ctx, projectId) {
     await renderProjectLogAlerts(ctx, projectId, '⚠️ Configure test endpoints first.');
     return;
   }
-  const progress = createLogTestProgress(ctx, `🧪 Log test suite — ${project.name || project.id}`);
+  const progress = createLogTestProgress(
+    ctx,
+    `🧪 Log test suite — ${project.name || project.id}`,
+    LOG_TEST_SUITE_PROGRESS_STEPS,
+  );
   let completedSteps = 0;
   await updateProgressMessage(ctx, progress, {
     status: 'progressing',
     completedSteps,
-    currentStep: LOG_TEST_PROGRESS_STEPS[0],
-    nextStep: LOG_TEST_PROGRESS_STEPS[1],
+    currentStep: LOG_TEST_SUITE_PROGRESS_STEPS[0],
+    nextStep: LOG_TEST_SUITE_PROGRESS_STEPS[1],
   });
   const tokenResult = await fetchLogTestToken(projectId, logTest);
   if (!tokenResult.ok) {
     await updateProgressMessage(ctx, progress, {
       status: 'failed',
       completedSteps: 1,
-      currentStep: LOG_TEST_PROGRESS_STEPS[0],
-      nextStep: LOG_TEST_PROGRESS_STEPS[1],
+      currentStep: LOG_TEST_SUITE_PROGRESS_STEPS[0],
+      nextStep: LOG_TEST_SUITE_PROGRESS_STEPS[1],
       reason: `token (${tokenResult.error})`,
     });
     await renderProjectLogAlerts(
@@ -12580,8 +12996,8 @@ async function runAllLogTests(ctx, projectId) {
   await updateProgressMessage(ctx, progress, {
     status: 'progressing',
     completedSteps,
-    currentStep: LOG_TEST_PROGRESS_STEPS[1],
-    nextStep: LOG_TEST_PROGRESS_STEPS[2],
+    currentStep: LOG_TEST_SUITE_PROGRESS_STEPS[1],
+    nextStep: LOG_TEST_SUITE_PROGRESS_STEPS[2],
   });
 
   const diagnosticsUrl = resolveDiagnosticsEndpoint(project, logTest);
@@ -12594,8 +13010,8 @@ async function runAllLogTests(ctx, projectId) {
     await updateProgressMessage(ctx, progress, {
       status: 'failed',
       completedSteps: 2,
-      currentStep: LOG_TEST_PROGRESS_STEPS[1],
-      nextStep: LOG_TEST_PROGRESS_STEPS[2],
+      currentStep: LOG_TEST_SUITE_PROGRESS_STEPS[1],
+      nextStep: LOG_TEST_SUITE_PROGRESS_STEPS[2],
       reason: 'missing diagnostics endpoint',
     });
     await renderProjectLogAlerts(
@@ -12616,8 +13032,8 @@ async function runAllLogTests(ctx, projectId) {
     await updateProgressMessage(ctx, progress, {
       status: 'failed',
       completedSteps: 2,
-      currentStep: LOG_TEST_PROGRESS_STEPS[1],
-      nextStep: LOG_TEST_PROGRESS_STEPS[2],
+      currentStep: LOG_TEST_SUITE_PROGRESS_STEPS[1],
+      nextStep: LOG_TEST_SUITE_PROGRESS_STEPS[2],
       reason: `diagnostics (${diagnostics.error})`,
     });
     await renderProjectLogAlerts(
@@ -12632,8 +13048,8 @@ async function runAllLogTests(ctx, projectId) {
   await updateProgressMessage(ctx, progress, {
     status: 'progressing',
     completedSteps,
-    currentStep: LOG_TEST_PROGRESS_STEPS[2],
-    nextStep: LOG_TEST_PROGRESS_STEPS[3],
+    currentStep: LOG_TEST_SUITE_PROGRESS_STEPS[2],
+    nextStep: LOG_TEST_SUITE_PROGRESS_STEPS[3],
   });
 
   let pingStatus = 'skipped';
@@ -12654,21 +13070,16 @@ async function runAllLogTests(ctx, projectId) {
   } catch (error) {
     pingStatus = 'failed';
   }
-  completedSteps = 3;
-  await updateProgressMessage(ctx, progress, {
-    status: 'progressing',
-    completedSteps,
-    currentStep: LOG_TEST_PROGRESS_STEPS[3],
-    nextStep: LOG_TEST_PROGRESS_STEPS[4],
-  });
-
   const results = [];
-  for (const mode of LOG_TEST_MODES) {
+  const receipts = [];
+  for (const [index, mode] of LOG_TEST_MODES.entries()) {
+    const triggerStepIndex = 2 + index * 2;
+    const waitStepIndex = triggerStepIndex + 1;
     await updateProgressMessage(ctx, progress, {
       status: 'progressing',
       completedSteps,
-      currentStep: `${LOG_TEST_PROGRESS_STEPS[3]} (${mode})`,
-      nextStep: `${LOG_TEST_PROGRESS_STEPS[4]} (${mode})`,
+      currentStep: LOG_TEST_SUITE_PROGRESS_STEPS[triggerStepIndex],
+      nextStep: LOG_TEST_SUITE_PROGRESS_STEPS[waitStepIndex],
     });
     const correlationId = crypto.randomUUID();
     const requestId = crypto.randomUUID();
@@ -12704,9 +13115,9 @@ async function runAllLogTests(ctx, projectId) {
       });
       await updateProgressMessage(ctx, progress, {
         status: 'failed',
-        completedSteps: 4,
-        currentStep: LOG_TEST_PROGRESS_STEPS[3],
-        nextStep: LOG_TEST_PROGRESS_STEPS[4],
+        completedSteps,
+        currentStep: LOG_TEST_SUITE_PROGRESS_STEPS[triggerStepIndex],
+        nextStep: LOG_TEST_SUITE_PROGRESS_STEPS[waitStepIndex],
         reason: buildLogTestFailureHint(error),
       });
       break;
@@ -12724,19 +13135,20 @@ async function runAllLogTests(ctx, projectId) {
       });
       await updateProgressMessage(ctx, progress, {
         status: 'failed',
-        completedSteps: 4,
-        currentStep: LOG_TEST_PROGRESS_STEPS[3],
-        nextStep: LOG_TEST_PROGRESS_STEPS[4],
+        completedSteps,
+        currentStep: LOG_TEST_SUITE_PROGRESS_STEPS[triggerStepIndex],
+        nextStep: LOG_TEST_SUITE_PROGRESS_STEPS[waitStepIndex],
         reason: buildLogTestFailureHint(null, response),
       });
       break;
     }
 
+    completedSteps = triggerStepIndex + 1;
     await updateProgressMessage(ctx, progress, {
       status: 'progressing',
-      completedSteps: 4,
-      currentStep: `${LOG_TEST_PROGRESS_STEPS[4]} (${mode})`,
-      nextStep: LOG_TEST_PROGRESS_STEPS[5],
+      completedSteps,
+      currentStep: LOG_TEST_SUITE_PROGRESS_STEPS[waitStepIndex],
+      nextStep: LOG_TEST_SUITE_PROGRESS_STEPS[waitStepIndex + 1] || LOG_TEST_SUITE_PROGRESS_STEPS[10],
     });
     const receipt = await receiptPromise;
     if (!receipt.ok) {
@@ -12749,28 +13161,10 @@ async function runAllLogTests(ctx, projectId) {
       });
       await updateProgressMessage(ctx, progress, {
         status: 'failed',
-        completedSteps: 5,
-        currentStep: LOG_TEST_PROGRESS_STEPS[4],
-        nextStep: LOG_TEST_PROGRESS_STEPS[5],
+        completedSteps,
+        currentStep: LOG_TEST_SUITE_PROGRESS_STEPS[waitStepIndex],
+        nextStep: LOG_TEST_SUITE_PROGRESS_STEPS[waitStepIndex + 1] || LOG_TEST_SUITE_PROGRESS_STEPS[10],
         reason: buildLogTestReceiptHint(),
-      });
-      break;
-    }
-    const entryProjectId = receipt.entry?.projectId ? String(receipt.entry.projectId) : null;
-    if (entryProjectId && entryProjectId !== String(project.id)) {
-      results.push({
-        mode,
-        status: 'invalid_log',
-        error: `Unexpected projectId ${entryProjectId}`,
-        correlationId,
-        callDurationMs: response?.durationMs || null,
-      });
-      await updateProgressMessage(ctx, progress, {
-        status: 'failed',
-        completedSteps: 5,
-        currentStep: LOG_TEST_PROGRESS_STEPS[5],
-        nextStep: LOG_TEST_PROGRESS_STEPS[6],
-        reason: 'projectId mismatch',
       });
       break;
     }
@@ -12786,6 +13180,15 @@ async function runAllLogTests(ctx, projectId) {
       callDurationMs: response?.durationMs || null,
       logDelayMs,
     });
+    receipts.push({ receipt, correlationId, mode });
+    completedSteps = waitStepIndex + 1;
+    await updateProgressMessage(ctx, progress, {
+      status: 'progressing',
+      completedSteps,
+      currentStep:
+        LOG_TEST_SUITE_PROGRESS_STEPS[waitStepIndex + 1] || LOG_TEST_SUITE_PROGRESS_STEPS[10],
+      nextStep: LOG_TEST_SUITE_PROGRESS_STEPS[waitStepIndex + 2] || LOG_TEST_SUITE_PROGRESS_STEPS[11],
+    });
   }
 
   const summaryLines = ['🧪 Log test suite results', `Project: ${project.name || project.id}`, ''];
@@ -12798,10 +13201,6 @@ async function runAllLogTests(ctx, projectId) {
       summaryLines.push(
         `❌ ${result.mode}: client call failed (${result.error})${result.callDurationMs ? ` in ${result.callDurationMs}ms` : ''}`,
       );
-    } else if (result.status === 'invalid_log') {
-      summaryLines.push(
-        `❌ ${result.mode}: invalid log (${result.error})${result.callDurationMs ? ` (call ${result.callDurationMs}ms)` : ''}`,
-      );
     } else {
       summaryLines.push(
         `⚠️ ${result.mode}: log missing (${result.error})${result.callDurationMs ? ` (call ${result.callDurationMs}ms)` : ''}`,
@@ -12810,52 +13209,94 @@ async function runAllLogTests(ctx, projectId) {
   });
 
   const allPassed = results.length === LOG_TEST_MODES.length && results.every((r) => r.status === 'ok');
-  const anyCallFailed = results.some((r) => r.status === 'call_failed' || r.status === 'invalid_log');
+  const anyCallFailed = results.some((r) => r.status === 'call_failed');
+  const anyLogMissing = results.some((r) => r.status === 'log_missing');
   const status = allPassed ? 'pass' : anyCallFailed ? 'fail' : 'partial';
   const summary = summaryLines.slice(0, 4).join(' ');
+  if (!allPassed) {
+    await updateProjectLogTestResult(projectId, {
+      status,
+      summary,
+      correlationIds: results.map((result) => result.correlationId).filter(Boolean),
+    });
+    await updateProgressMessage(ctx, progress, {
+      status: 'failed',
+      completedSteps,
+      currentStep: LOG_TEST_SUITE_PROGRESS_STEPS[Math.min(completedSteps, LOG_TEST_SUITE_PROGRESS_STEPS.length - 1)],
+      nextStep: null,
+      reason: summary,
+    });
+    let notice = summaryLines.join('\n');
+    const firstFailure = results.find((result) => result.status !== 'ok');
+    if (firstFailure) {
+      const stepName = firstFailure.status === 'log_missing'
+        ? LOG_TEST_SUITE_PROGRESS_STEPS[3]
+        : LOG_TEST_SUITE_PROGRESS_STEPS[2];
+      const category =
+        firstFailure.status === 'log_missing'
+          ? 'missing_log'
+          : classifyFailureCategory(firstFailure.error, {
+              status: firstFailure.statusCode || undefined,
+            });
+      notice += `\n\nStep: ${stepName}\nCategory: ${category}\nReason: ${firstFailure.error || 'unknown'}`;
+    }
+    if (anyLogMissing && canInspectRepo(project)) {
+      notice += '\n\nNext: Inspect repo or generate Codex task for missing logging hooks.';
+    }
+    if (pingStatus === 'failed') {
+      notice += '\n\n⚠️ PM log ingestion ping failed.';
+    }
+    await renderProjectLogAlerts(ctx, projectId, notice);
+    return;
+  }
+
+  await updateProgressMessage(ctx, progress, {
+    status: 'progressing',
+    completedSteps: 10,
+    currentStep: LOG_TEST_SUITE_PROGRESS_STEPS[10],
+    nextStep: LOG_TEST_SUITE_PROGRESS_STEPS[11],
+  });
+  const validationErrors = receipts
+    .map(({ receipt, correlationId }) => validateLogTestReceipt(receipt.entry, project.id, correlationId))
+    .filter((result) => !result.ok)
+    .map((result) => result.error);
+  if (validationErrors.length) {
+    const reason = validationErrors[0];
+    await updateProjectLogTestResult(projectId, {
+      status: 'fail',
+      summary: reason,
+      correlationIds: receipts.map((entry) => entry.correlationId),
+    });
+    await updateProgressMessage(ctx, progress, {
+      status: 'failed',
+      completedSteps: 10,
+      currentStep: LOG_TEST_SUITE_PROGRESS_STEPS[10],
+      nextStep: LOG_TEST_SUITE_PROGRESS_STEPS[11],
+      reason,
+    });
+    await renderProjectLogAlerts(
+      ctx,
+      projectId,
+      `❌ Log received but invalid.\nStep: Validate payload formatting and project tagging\nCategory: invalid_payload\nReason: ${reason}`,
+    );
+    return;
+  }
+
   await updateProjectLogTestResult(projectId, {
     status,
     summary,
-    correlationIds: results.map((result) => result.correlationId).filter(Boolean),
+    correlationIds: receipts.map((entry) => entry.correlationId).filter(Boolean),
   });
 
-  completedSteps = 6;
+  completedSteps = 12;
   await updateProgressMessage(ctx, progress, {
-    status: 'progressing',
+    status: 'success',
     completedSteps,
-    currentStep: LOG_TEST_PROGRESS_STEPS[5],
-    nextStep: LOG_TEST_PROGRESS_STEPS[6],
-  });
-  completedSteps = 7;
-  await updateProgressMessage(ctx, progress, {
-    status: allPassed ? 'success' : 'failed',
-    completedSteps,
-    currentStep: LOG_TEST_PROGRESS_STEPS[6],
+    currentStep: LOG_TEST_SUITE_PROGRESS_STEPS[11],
     nextStep: null,
-    reason: allPassed ? null : summary,
   });
 
   let notice = summaryLines.join('\n');
-  if (!allPassed) {
-    const firstFailure = results.find((result) => result.status !== 'ok');
-    if (firstFailure) {
-      let stepName = LOG_TEST_PROGRESS_STEPS[3];
-      let category = 'unknown';
-      if (firstFailure.status === 'log_missing') {
-        stepName = LOG_TEST_PROGRESS_STEPS[4];
-        category = 'missing_log';
-      } else if (firstFailure.status === 'invalid_log') {
-        stepName = LOG_TEST_PROGRESS_STEPS[5];
-        category = 'invalid_payload';
-      } else if (firstFailure.status === 'call_failed') {
-        stepName = LOG_TEST_PROGRESS_STEPS[3];
-        category = classifyFailureCategory(firstFailure.error, {
-          status: firstFailure.statusCode || undefined,
-        });
-      }
-      notice += `\n\nStep: ${stepName}\nCategory: ${category}\nReason: ${firstFailure.error || 'unknown'}`;
-    }
-  }
   if (!allPassed && canInspectRepo(project)) {
     notice += '\n\nNext: Inspect repo or generate Codex task for missing logging hooks.';
   }
@@ -15669,11 +16110,129 @@ async function renderLogsProjectList(ctx, notice) {
       const logTest = normalizeLogTestSettings(project);
       const reminder = resolveLogTestReminderState(logTest);
       const reminderBadge = reminder.needsTest && !reminder.isSnoozed ? '⚠️ ' : '';
+      lines.push(`📦 ${project.name || project.id} — ${formatLogTestBadgeLine(logTest)}`);
       const label = `📦 ${reminderBadge}${project.name || project.id}`;
       inline.text(label, `logmenu:open:${project.id}`).row();
     });
   }
   inline.text('⬅️ Back', 'main:back');
+  await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
+}
+
+function formatDeployEventsLine(deploySettings, webhookSettings) {
+  const projectEvents = deploySettings.render?.eventsEnabled;
+  const events =
+    Array.isArray(projectEvents) && projectEvents.length ? projectEvents : webhookSettings.events;
+  return events.length ? events.join(', ') : '-';
+}
+
+function formatDeployLastEventLine(lastEvent) {
+  if (!lastEvent) {
+    return 'Last deploy: -';
+  }
+  const receivedAt = lastEvent.receivedAt ? new Date(lastEvent.receivedAt).toISOString() : '-';
+  const label = lastEvent.outcome || lastEvent.status || lastEvent.eventType || 'event';
+  return `Last deploy: ${label} (${receivedAt})`;
+}
+
+async function renderDeploysProjectList(ctx, notice) {
+  const projects = await loadProjects();
+  const lines = ['🚀 Deploys', notice || null, '', 'Select a project:'].filter(Boolean);
+  const inline = new InlineKeyboard();
+  if (!projects.length) {
+    lines.push('', 'No projects configured yet.');
+    inline.text('➕ Add project', 'proj:add').row();
+  } else {
+    projects.forEach((project) => {
+      const deploySettings = normalizeProjectDeploySettings(project);
+      const enabledBadge = deploySettings.notifications.enabled ? '🔔' : '🔕';
+      const serviceBadge = deploySettings.render.serviceId ? '🟢' : '⚪️';
+      lines.push(`📦 ${project.name || project.id} — ${enabledBadge} alerts · ${serviceBadge} serviceId`);
+      inline.text(`${enabledBadge} ${project.name || project.id}`, `deploy:open:${project.id}`).row();
+    });
+  }
+  inline.text('⚙️ Deploy settings', 'deploy:settings').row();
+  inline.text('⬅️ Back', 'main:back');
+  await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
+}
+
+async function renderDeployProjectPanel(ctx, projectId, notice) {
+  const projects = await loadProjects();
+  const project = findProjectById(projects, projectId);
+  if (!project) {
+    await renderOrEdit(ctx, 'Project not found.');
+    return;
+  }
+  const settings = normalizeProjectDeploySettings(project);
+  const webhookSettings = normalizeRenderWebhookSettings(await getCachedSettings());
+  const lines = [
+    `🚀 Deploy — ${project.name || project.id}`,
+    notice || null,
+    '',
+    `Provider: ${settings.deployProvider || 'render'}`,
+    `Render serviceId: ${settings.render.serviceId || 'missing'}`,
+    `Alerts: ${settings.notifications.enabled ? '🔔 enabled' : '🔕 disabled'}`,
+    `Events: ${formatDeployEventsLine(settings, webhookSettings)}`,
+    `Shared webhook: ${webhookSettings.webhookId ? 'configured' : 'not configured'}`,
+    formatDeployLastEventLine(settings.notifications.lastEvent),
+  ].filter(Boolean);
+  const inline = new InlineKeyboard()
+    .text('🔗 Set serviceId', `deploy:set_service:${project.id}`)
+    .text(settings.notifications.enabled ? '🔕 Disable alerts' : '🔔 Enable alerts', `deploy:toggle:${project.id}`)
+    .row()
+    .text('⚙️ Events selection', `deploy:events:${project.id}`)
+    .text('🧪 Test', `deploy:test:${project.id}`)
+    .row()
+    .text('⬅️ Back', 'deploy:list');
+  await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
+}
+
+async function renderDeploySettingsMenu(ctx, notice) {
+  const settings = normalizeRenderWebhookSettings(await getCachedSettings());
+  const lines = [
+    '⚙️ Deploy settings',
+    notice || null,
+    '',
+    'PM uses a shared workspace webhook; only serviceId binding is needed per project.',
+    '',
+    `Webhook ID: ${settings.webhookId || '-'}`,
+    `Target URL: ${settings.targetUrl || buildRenderWebhookTargetUrl()}`,
+    `Events: ${settings.events.join(', ')}`,
+    `Last verified: ${settings.lastVerifiedAt || '-'}`,
+  ].filter(Boolean);
+  const inline = new InlineKeyboard()
+    .text('🔄 Verify webhook', 'deploy:verify')
+    .row()
+    .text('⬅️ Back', 'deploy:list');
+  await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
+}
+
+async function renderDeployEventsMenu(ctx, projectId, notice) {
+  const projects = await loadProjects();
+  const project = findProjectById(projects, projectId);
+  if (!project) {
+    await renderOrEdit(ctx, 'Project not found.');
+    return;
+  }
+  const settings = normalizeProjectDeploySettings(project);
+  const webhookSettings = normalizeRenderWebhookSettings(await getCachedSettings());
+  const availableEvents = ['deploy_started', 'deploy_ended', 'build_started', 'build_ended'];
+  const selected =
+    Array.isArray(settings.render.eventsEnabled) && settings.render.eventsEnabled.length
+      ? new Set(settings.render.eventsEnabled)
+      : new Set(webhookSettings.events);
+  const lines = [
+    `⚙️ Deploy events — ${project.name || project.id}`,
+    notice || null,
+    '',
+    'Events marked ✅ will trigger notifications.',
+  ].filter(Boolean);
+  const inline = new InlineKeyboard();
+  availableEvents.forEach((eventName) => {
+    const label = `${selected.has(eventName) ? '✅' : '❌'} ${eventName}`;
+    inline.text(label, `deploy:event_toggle:${project.id}:${eventName}`).row();
+  });
+  inline.text('⬅️ Back', `deploy:open:${project.id}`);
   await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
 }
 
@@ -15703,6 +16262,187 @@ async function handleLogsMenuCallback(ctx, data) {
     return;
   }
   await renderLogsProjectList(ctx);
+}
+
+async function handleDeployCallback(ctx, data) {
+  await ensureAnswerCallback(ctx);
+  const [, action, projectId, extra] = data.split(':');
+  if (action === 'list') {
+    await renderDeploysProjectList(ctx);
+    return;
+  }
+  if (action === 'open' && projectId) {
+    await renderDeployProjectPanel(ctx, projectId);
+    return;
+  }
+  if (action === 'settings') {
+    await renderDeploySettingsMenu(ctx);
+    return;
+  }
+  if (action === 'verify') {
+    const progress = createOperationProgress(ctx, '🚀 Verify Render webhook', 3);
+    await updateProgressMessage(ctx, progress, {
+      status: 'progressing',
+      completedSteps: 0,
+      currentStep: 'Validating settings',
+      nextStep: 'Checking Render webhooks',
+    });
+    try {
+      const settings = normalizeRenderWebhookSettings(await getCachedSettings());
+      await ensureRenderWebhookConfigured({ events: settings.events, progress });
+      await updateProgressMessage(ctx, progress, {
+        status: 'success',
+        completedSteps: 3,
+        currentStep: 'Webhook verified',
+        nextStep: null,
+      });
+      await renderDeploySettingsMenu(ctx, '✅ Webhook verified.');
+    } catch (error) {
+      await updateProgressMessage(ctx, progress, {
+        status: 'failed',
+        completedSteps: 1,
+        currentStep: 'Webhook verification failed',
+        nextStep: null,
+        reason: error.message,
+      });
+      await renderDeploySettingsMenu(ctx, `❌ Verification failed.\n${error.message}`);
+    }
+    return;
+  }
+  if (action === 'set_service' && projectId) {
+    setUserState(ctx.from.id, {
+      type: 'deploy_service_id',
+      projectId,
+      backCallback: `deploy:open:${projectId}`,
+      messageContext: getMessageTargetFromCtx(ctx),
+    });
+    await renderOrEdit(ctx, '🔗 Send the Render serviceId.\n(Or press Cancel)', {
+      reply_markup: buildCancelKeyboard(),
+    });
+    return;
+  }
+  if (action === 'toggle' && projectId) {
+    const projects = await loadProjects();
+    const project = findProjectById(projects, projectId);
+    if (!project) {
+      await renderOrEdit(ctx, 'Project not found.');
+      return;
+    }
+    const settings = normalizeProjectDeploySettings(project);
+    const progress = createOperationProgress(ctx, `🚀 Deploy alerts — ${project.name || project.id}`, 3);
+    await updateProgressMessage(ctx, progress, {
+      status: 'progressing',
+      completedSteps: 0,
+      currentStep: 'Validating configuration',
+      nextStep: 'Ensuring Render webhook',
+    });
+    if (!settings.render.serviceId) {
+      await updateProgressMessage(ctx, progress, {
+        status: 'failed',
+        completedSteps: 0,
+        currentStep: 'Missing serviceId',
+        nextStep: null,
+        reason: 'Render serviceId not set',
+      });
+      await renderDeployProjectPanel(ctx, projectId, '⚠️ Set Render serviceId first.');
+      return;
+    }
+    if (settings.notifications.enabled) {
+      await updateProjectDeploySettings(projectId, (current) => ({
+        ...current,
+        notifications: { ...current.notifications, enabled: false },
+      }));
+      await updateProgressMessage(ctx, progress, {
+        status: 'success',
+        completedSteps: 3,
+        currentStep: 'Alerts disabled',
+        nextStep: null,
+      });
+      await renderDeployProjectPanel(ctx, projectId, '🔕 Deploy alerts disabled.');
+      return;
+    }
+    try {
+      await ensureRenderWebhookConfigured({ progress });
+    } catch (error) {
+      await updateProgressMessage(ctx, progress, {
+        status: 'failed',
+        completedSteps: 1,
+        currentStep: 'Webhook setup failed',
+        nextStep: null,
+        reason: error.message,
+      });
+      await renderDeployProjectPanel(ctx, projectId, `❌ Webhook setup failed.\n${error.message}`);
+      return;
+    }
+    await updateProjectDeploySettings(projectId, (current) => ({
+      ...current,
+      deployProvider: 'render',
+      notifications: { ...current.notifications, enabled: true },
+    }));
+    await updateProgressMessage(ctx, progress, {
+      status: 'success',
+      completedSteps: 3,
+      currentStep: 'Alerts enabled',
+      nextStep: null,
+    });
+    await renderDeployProjectPanel(ctx, projectId, '🔔 Deploy alerts enabled.');
+    return;
+  }
+  if (action === 'events' && projectId) {
+    await renderDeployEventsMenu(ctx, projectId);
+    return;
+  }
+  if (action === 'event_toggle' && projectId && extra) {
+    const eventName = extra;
+    const projects = await loadProjects();
+    const project = findProjectById(projects, projectId);
+    if (!project) {
+      await renderOrEdit(ctx, 'Project not found.');
+      return;
+    }
+    const settings = normalizeProjectDeploySettings(project);
+    const webhookSettings = normalizeRenderWebhookSettings(await getCachedSettings());
+    const currentEvents =
+      Array.isArray(settings.render.eventsEnabled) && settings.render.eventsEnabled.length
+        ? settings.render.eventsEnabled
+        : webhookSettings.events;
+    const nextEvents = currentEvents.includes(eventName)
+      ? currentEvents.filter((event) => event !== eventName)
+      : [...currentEvents, eventName];
+    const mergedEvents = Array.from(new Set([...webhookSettings.events, ...nextEvents]));
+    if (mergedEvents.length !== webhookSettings.events.length) {
+      try {
+        await ensureRenderWebhookConfigured({ events: mergedEvents });
+      } catch (error) {
+        await renderDeployEventsMenu(ctx, projectId, `❌ Failed to update webhook.\n${error.message}`);
+        return;
+      }
+    }
+    await updateProjectDeploySettings(projectId, (current) => ({
+      ...current,
+      render: { ...current.render, eventsEnabled: nextEvents },
+    }));
+    await renderDeployEventsMenu(ctx, projectId, '✅ Updated.');
+    return;
+  }
+  if (action === 'test' && projectId) {
+    const projects = await loadProjects();
+    const project = findProjectById(projects, projectId);
+    if (!project) {
+      await renderOrEdit(ctx, 'Project not found.');
+      return;
+    }
+    const deploySettings = normalizeProjectDeploySettings(project);
+    const message = [
+      `🧪 Deploy notification test`,
+      `Project: ${project.name || project.id}`,
+      `ServiceId: ${deploySettings.render.serviceId || '-'}`,
+    ].join('\n');
+    await bot.api.sendMessage(ADMIN_TELEGRAM_ID, message, { disable_web_page_preview: true });
+    await renderDeployProjectPanel(ctx, projectId, '✅ Test notification sent.');
+    return;
+  }
+  await renderDeploysProjectList(ctx);
 }
 
 async function renderDeleteConfirmation(ctx, projectId) {
@@ -17074,6 +17814,7 @@ function getPublicBaseUrl() {
   const override = cachedSettings?.integrations?.baseUrlOverride;
   if (override) return override;
   return (
+    process.env.PM_BASE_URL ||
     process.env.PUBLIC_BASE_URL ||
     process.env.RENDER_EXTERNAL_URL ||
     `http://localhost:${port}`
@@ -17191,6 +17932,71 @@ function parseRenderErrorPayload(body) {
       level: '',
     };
   }
+}
+
+function parseRenderWebhookPayload(rawBody) {
+  if (!rawBody) {
+    return { ok: false, error: 'Empty payload.' };
+  }
+  try {
+    const parsed = JSON.parse(rawBody);
+    if (!parsed || typeof parsed !== 'object') {
+      return { ok: false, error: 'Payload is not an object.' };
+    }
+    return { ok: true, payload: parsed };
+  } catch (error) {
+    return { ok: false, error: 'Invalid JSON payload.' };
+  }
+}
+
+function extractRenderWebhookInfo(payload) {
+  const eventType =
+    payload.eventType || payload.event_type || payload.event || payload.type || payload.trigger;
+  const serviceId =
+    payload.serviceId ||
+    payload.service_id ||
+    payload.service?.id ||
+    payload.service?.serviceId ||
+    payload.data?.service?.id ||
+    payload.data?.serviceId ||
+    null;
+  const deploy = payload.deploy || payload.data?.deploy || payload.payload?.deploy || {};
+  const build = payload.build || payload.data?.build || payload.payload?.build || {};
+  const deployId = deploy.id || payload.deployId || payload.deploy_id || payload.data?.deployId || null;
+  const buildId = build.id || payload.buildId || payload.build_id || null;
+  const eventId = payload.id || payload.eventId || payload.event_id || null;
+  const status =
+    deploy.status ||
+    deploy.state ||
+    payload.status ||
+    payload.state ||
+    payload.result ||
+    null;
+  const branch = deploy.branch || payload.branch || payload.gitBranch || null;
+  const commit = deploy.commit || payload.commit || payload.gitCommit || null;
+  const durationMs = deploy.durationMs || deploy.duration_ms || payload.durationMs || null;
+  const dashboardUrl = deploy.url || payload.url || payload.dashboardUrl || null;
+  return {
+    eventType: eventType ? String(eventType) : null,
+    serviceId: serviceId ? String(serviceId) : null,
+    deployId: deployId ? String(deployId) : null,
+    buildId: buildId ? String(buildId) : null,
+    eventId: eventId ? String(eventId) : null,
+    status: status ? String(status) : null,
+    branch: branch ? String(branch) : null,
+    commit: commit ? String(commit) : null,
+    durationMs: Number.isFinite(Number(durationMs)) ? Number(durationMs) : null,
+    dashboardUrl: dashboardUrl ? String(dashboardUrl) : null,
+  };
+}
+
+function formatDeployOutcome(status) {
+  if (!status) return 'unknown';
+  const normalized = status.toLowerCase();
+  if (['succeeded', 'success', 'live', 'ok'].includes(normalized)) return 'succeeded';
+  if (['failed', 'error', 'errored'].includes(normalized)) return 'failed';
+  if (['canceled', 'cancelled', 'aborted'].includes(normalized)) return 'canceled';
+  return normalized;
 }
 
 function downloadTelegramFile(ctx, fileId) {
@@ -18101,6 +18907,125 @@ function startHttpServer() {
           level || '-'
         }\nMessage: ${message || '-'}`;
         await bot.api.sendMessage(ADMIN_TELEGRAM_ID, text);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
+        return;
+      }
+
+      if (req.method === 'POST' && url.pathname === '/api/render/webhook') {
+        const rawBody = await readRequestBody(req);
+        const parsed = parseRenderWebhookPayload(rawBody);
+        if (!parsed.ok) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: parsed.error }));
+          return;
+        }
+        const info = extractRenderWebhookInfo(parsed.payload);
+        if (!info.serviceId || !info.eventType) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'Missing serviceId or eventType.' }));
+          return;
+        }
+        const rateStatus = checkRateLimit(renderWebhookRateLimits, info.serviceId, RENDER_WEBHOOK_RATE_LIMIT);
+        if (rateStatus.blocked) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, skipped: 'rate_limited' }));
+          return;
+        }
+        const eventKey =
+          info.eventId || (info.deployId ? `${info.serviceId}:${info.deployId}:${info.eventType}` : null);
+        if (eventKey && isDuplicateRenderEvent(eventKey)) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, skipped: 'duplicate' }));
+          return;
+        }
+
+        const projects = await loadProjects();
+        const project = projects.find((candidate) => {
+          const deploySettings = normalizeProjectDeploySettings(candidate);
+          return deploySettings.render.serviceId === info.serviceId;
+        });
+        if (!project) {
+          console.warn('[render-webhook] unknown serviceId', {
+            serviceId: info.serviceId,
+            eventType: info.eventType,
+          });
+          const now = Date.now();
+          const lastNotice = renderWebhookUnknownServiceNotices.get(info.serviceId);
+          if (!lastNotice || now - lastNotice > 60 * 60 * 1000) {
+            renderWebhookUnknownServiceNotices.set(info.serviceId, now);
+            await bot.api.sendMessage(
+              ADMIN_TELEGRAM_ID,
+              `⚠️ Deploy event for unknown serviceId: ${info.serviceId} (bind it in PM)`,
+            );
+          }
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, skipped: 'unknown_service' }));
+          return;
+        }
+
+        const deploySettings = normalizeProjectDeploySettings(project);
+        if (!deploySettings.notifications.enabled) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, skipped: 'notifications_disabled' }));
+          return;
+        }
+        const webhookSettings = normalizeRenderWebhookSettings(await getCachedSettings());
+        if (!isRenderEventEnabled(deploySettings, webhookSettings, info.eventType)) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, skipped: 'event_filtered' }));
+          return;
+        }
+
+        const projectLabel = project.name || project.id;
+        const lines = [];
+        if (info.eventType === 'deploy_started') {
+          lines.push(`🚀 Deploy started — ${projectLabel}`);
+        } else if (info.eventType === 'deploy_ended') {
+          const outcome = formatDeployOutcome(info.status);
+          const emoji = outcome === 'succeeded' ? '✅' : outcome === 'failed' ? '❌' : '⏹️';
+          lines.push(`${emoji} Deploy ${outcome} — ${projectLabel}`);
+        } else if (info.eventType === 'build_started') {
+          lines.push(`🏗️ Build started — ${projectLabel}`);
+        } else if (info.eventType === 'build_ended') {
+          const outcome = formatDeployOutcome(info.status);
+          const emoji = outcome === 'succeeded' ? '✅' : outcome === 'failed' ? '❌' : '⏹️';
+          lines.push(`${emoji} Build ${outcome} — ${projectLabel}`);
+        } else {
+          lines.push(`ℹ️ Render event ${info.eventType} — ${projectLabel}`);
+        }
+        lines.push(`ServiceId: ${info.serviceId}`);
+        if (info.deployId) lines.push(`DeployId: ${info.deployId}`);
+        if (info.branch) lines.push(`Branch: ${info.branch}`);
+        if (info.commit) lines.push(`Commit: ${info.commit}`);
+        if (info.durationMs) lines.push(`Duration: ${Math.round(info.durationMs / 1000)}s`);
+        if (info.dashboardUrl) lines.push(`Dashboard: ${info.dashboardUrl}`);
+
+        await bot.api.sendMessage(ADMIN_TELEGRAM_ID, lines.join('\n'), {
+          disable_web_page_preview: true,
+        });
+
+        await updateProjectDeploySettings(project.id, (current) => ({
+          ...current,
+          deployProvider: 'render',
+          notifications: {
+            ...current.notifications,
+            lastStatus: info.status || info.eventType,
+            lastEvent: {
+              eventType: info.eventType,
+              status: info.status,
+              outcome: formatDeployOutcome(info.status),
+              receivedAt: new Date().toISOString(),
+              deployId: info.deployId,
+              serviceId: info.serviceId,
+              branch: info.branch,
+              commit: info.commit,
+              dashboardUrl: info.dashboardUrl,
+              durationMs: info.durationMs,
+            },
+          },
+        }));
+
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: true }));
         return;

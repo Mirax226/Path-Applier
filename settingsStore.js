@@ -28,6 +28,12 @@ const DEFAULT_GLOBAL_SETTINGS = {
     baseUrlOverride: '',
     healthPingIntervalMinutes: 5,
   },
+  renderWebhook: {
+    webhookId: null,
+    targetUrl: '',
+    events: ['deploy_started', 'deploy_ended'],
+    lastVerifiedAt: null,
+  },
   backups: {
     channelId: '',
     captionTemplate:
@@ -59,6 +65,10 @@ function applySettingsDefaults(settings) {
     integrations: {
       ...DEFAULT_GLOBAL_SETTINGS.integrations,
       ...(payload.integrations || {}),
+    },
+    renderWebhook: {
+      ...DEFAULT_GLOBAL_SETTINGS.renderWebhook,
+      ...(payload.renderWebhook || {}),
     },
     backups: {
       ...DEFAULT_GLOBAL_SETTINGS.backups,

@@ -67,14 +67,18 @@ function normalizeProject(rawProject) {
   const logTest = project.logTest || {};
   const lastTest = logTest.lastTest || {};
   const reminder = logTest.reminder || {};
-  const normalizedLastStatus = ['never', 'pass', 'fail', 'partial'].includes(lastTest.status)
+  const normalizedLastStatus = ['never', 'pass', 'fail', 'partial', 'blocked_missing_diagnostics'].includes(
+    lastTest.status,
+  )
     ? lastTest.status
     : 'never';
   const normalizedLastCorrelationIds = Array.isArray(lastTest.lastCorrelationIds)
     ? lastTest.lastCorrelationIds.filter(Boolean).map(String)
     : [];
   const reminderNeedsTest =
-    typeof reminder.needsTest === 'boolean' ? reminder.needsTest : normalizedLastStatus !== 'pass';
+    typeof reminder.needsTest === 'boolean'
+      ? reminder.needsTest
+      : ['never', 'fail', 'partial', 'blocked_missing_diagnostics'].includes(normalizedLastStatus);
   project.logTest = {
     enabled: typeof logTest.enabled === 'boolean' ? logTest.enabled : Boolean(logTest.testEndpointUrl),
     testEndpointUrl: logTest.testEndpointUrl || null,
@@ -90,6 +94,22 @@ function normalizeProject(rawProject) {
       needsTest: reminderNeedsTest,
       snoozedUntil: reminder.snoozedUntil || null,
     },
+  };
+
+  const render = project.render || {};
+  const resolvedServiceId = render.serviceId || project.renderServiceId || null;
+  project.render = {
+    ...render,
+    serviceId: resolvedServiceId,
+  };
+  if (!project.deployProvider && resolvedServiceId) {
+    project.deployProvider = 'render';
+  }
+  const deployNotifications = project.deployNotifications || {};
+  project.deployNotifications = {
+    enabled: typeof deployNotifications.enabled === 'boolean' ? deployNotifications.enabled : false,
+    lastEvent: deployNotifications.lastEvent || null,
+    lastStatus: deployNotifications.lastStatus || null,
   };
 
   return project;
