@@ -56,6 +56,9 @@ if (typeof keepaliveTimer.unref === 'function') {
 
 const http = require('http');
 const https = require('https');
+const dns = require('dns').promises;
+const net = require('net');
+const tls = require('tls');
 const fs = require('fs/promises');
 const path = require('path');
 const os = require('os');
@@ -188,15 +191,26 @@ const MINI_SITE_EDIT_SESSION_COOKIE = 'pm_db_edit_session';
 const MINI_SITE_SETTINGS_KEY = 'dbMiniSite';
 const MINI_SITE_PAGE_SIZE = 25;
 const MINI_SITE_EDIT_TOKEN_TTL_SEC = 300;
-const MINI_SITE_CONNECTION_TIMEOUT_MS = Number(process.env.MINI_SITE_CONNECTION_TIMEOUT_MS) || 8000;
-const MINI_SITE_QUERY_TIMEOUT_MS = Number(process.env.MINI_SITE_QUERY_TIMEOUT_MS) || 8000;
-const MINI_SITE_STATEMENT_TIMEOUT_MS = Number(process.env.MINI_SITE_STATEMENT_TIMEOUT_MS) || 8000;
+const MINI_SITE_WARMUP_ENABLED = process.env.MINI_SITE_WARMUP_ENABLED !== 'false';
+const MINI_SITE_WARMUP_TTL_MS = Number(process.env.MINI_SITE_WARMUP_TTL_MS) || 60_000;
+const MINI_SITE_WARMUP_QUERY_TIMEOUT_MS = Number(process.env.MINI_SITE_WARMUP_QUERY_TIMEOUT_MS) || 5000;
+const MINI_SITE_WARMUP_DNS_TIMEOUT_MS = Number(process.env.MINI_SITE_WARMUP_DNS_TIMEOUT_MS) || 3000;
+const MINI_SITE_WARMUP_TCP_TIMEOUT_MS = Number(process.env.MINI_SITE_WARMUP_TCP_TIMEOUT_MS) || 5000;
+const MINI_SITE_WARMUP_TLS_TIMEOUT_MS = Number(process.env.MINI_SITE_WARMUP_TLS_TIMEOUT_MS) || 5000;
+const MINI_SITE_RETRY_ENABLED = process.env.MINI_SITE_RETRY_ENABLED !== 'false';
+const MINI_SITE_RETRY_MAX_ATTEMPTS = 2;
+const MINI_SITE_RETRY_BACKOFF_MS = [300, 900];
+const MINI_SITE_POOL_MAX = Number(process.env.MINI_SITE_POOL_MAX) || 3;
+const MINI_SITE_CONNECTION_TIMEOUT_MS = Number(process.env.MINI_SITE_CONNECTION_TIMEOUT_MS) || 15_000;
+const MINI_SITE_QUERY_TIMEOUT_MS = Number(process.env.MINI_SITE_QUERY_TIMEOUT_MS) || 12_000;
+const MINI_SITE_STATEMENT_TIMEOUT_MS = Number(process.env.MINI_SITE_STATEMENT_TIMEOUT_MS) || 12_000;
 const MINI_SITE_SQL_DEFAULT_LIMIT = 100;
 const MINI_SITE_SQL_MAX_LIMIT = 1000;
 const MINI_SITE_SQL_WRITE_WINDOW_MS = 60 * 1000;
 const PROJECT_DB_SSL_DEFAULT_MODE = 'require';
 const PROJECT_DB_SSL_DEFAULT_VERIFY = true;
 const PROJECT_DB_SSL_MODES = new Set(['disable', 'require']);
+const ALLOW_INSECURE_TLS_FOR_TESTS = process.env.ALLOW_INSECURE_TLS_FOR_TESTS === 'true';
 const WEB_DASHBOARD_SETTINGS_KEY = 'webDashboard';
 const WEB_DASHBOARD_SESSION_COOKIE = 'pm_web_session';
 const WEB_DASHBOARD_SESSION_TTL_MINUTES = 20;
@@ -242,6 +256,8 @@ const bot = new Bot(BOT_TOKEN);
 const supabasePools = new Map();
 const envVaultPools = new Map();
 const miniSitePools = new Map();
+const miniSiteWarmupCache = new Map();
+const healthCheckPools = new Map();
 const miniSiteWriteGrants = new Map();
 const supabaseTableAccess = new Map();
 let botStarted = false;
@@ -264,6 +280,10 @@ const webSessions = new Map();
 const webLoginAttempts = new Map();
 const pendingLogTests = new Map();
 let httpServerPromise = null;
+let miniSiteWarmupSummary = {
+  warmUpReady: false,
+  lastWarmUpAt: null,
+};
 let configDbWarmupTimer = null;
 let configDbWarmupInFlight = false;
 let configDbFailureStreak = 0;
@@ -15816,13 +15836,19 @@ function hasRequireSslModeInDsn(dsn) {
 function resolveProjectDbSslSettings(project, connection) {
   const sslMode = normalizeProjectDbSslMode(project?.dbSslMode);
   if (typeof project?.dbSslVerify === 'boolean') {
-    return { sslMode, sslVerify: project.dbSslVerify };
+    const sslVerify = project.dbSslVerify === false && !ALLOW_INSECURE_TLS_FOR_TESTS
+      ? true
+      : project.dbSslVerify;
+    return { sslMode, sslVerify };
   }
   const dsn = connection?.dsn;
-  const shouldDisableVerify =
-    hasRequireSslModeInDsn(dsn) ||
-    isSupabaseMiniSiteConnection(connection);
-  const sslVerify = shouldDisableVerify ? false : PROJECT_DB_SSL_DEFAULT_VERIFY;
+  const sslVerify = PROJECT_DB_SSL_DEFAULT_VERIFY;
+  if (
+    ALLOW_INSECURE_TLS_FOR_TESTS &&
+    (hasRequireSslModeInDsn(dsn) || isSupabaseMiniSiteConnection(connection))
+  ) {
+    return { sslMode, sslVerify: false };
+  }
   return { sslMode, sslVerify };
 }
 
@@ -15833,7 +15859,8 @@ function formatProjectDbSslSummary(settings) {
 
 function buildPgSslOptions(settings) {
   if (!settings || settings.sslMode === 'disable') return null;
-  return { rejectUnauthorized: settings.sslVerify !== false };
+  const allowInsecure = settings.sslVerify === false && ALLOW_INSECURE_TLS_FOR_TESTS;
+  return { rejectUnauthorized: !allowInsecure };
 }
 
 function buildMiniSitePoolKey(dsn, settings) {
@@ -15847,7 +15874,14 @@ function buildMiniSiteRequestId() {
   return crypto.randomBytes(6).toString('hex');
 }
 
-function renderMiniSiteDbErrorPage({ requestId, adminHint }) {
+function buildMiniSiteRetryHref(url) {
+  if (!url) return '/db-mini';
+  const retryUrl = new URL(url.toString());
+  retryUrl.searchParams.set('retry', '1');
+  return `${retryUrl.pathname}${retryUrl.search}`;
+}
+
+function renderMiniSiteDbErrorPage({ requestId, adminHint, stage, errorCode, latencyMs, retryHref }) {
   const safeAdminHint = adminHint ? escapeHtml(adminHint) : null;
   const hintBlock = adminHint
     ? `
@@ -15857,10 +15891,22 @@ function renderMiniSiteDbErrorPage({ requestId, adminHint }) {
       </div>
     `
     : '';
+  const diagnostics = [
+    stage ? `<li><strong>Stage:</strong> ${escapeHtml(stage)}</li>` : null,
+    errorCode ? `<li><strong>Error code:</strong> ${escapeHtml(errorCode)}</li>` : null,
+    Number.isFinite(latencyMs) ? `<li><strong>Latency:</strong> ${escapeHtml(latencyMs)} ms</li>` : null,
+  ]
+    .filter(Boolean)
+    .join('');
   const body = `
     <div class="card">
-      <h3>Database unavailable</h3>
+      <h3>Database unavailable – check network/SSL</h3>
       <p class="muted">Request ID: ${escapeHtml(requestId)}</p>
+      ${diagnostics ? `<ul class="muted">${diagnostics}</ul>` : ''}
+      <div class="row-actions">
+        <a class="button" href="${escapeHtml(retryHref || '/db-mini')}">Retry</a>
+      </div>
+      <p class="muted">Admin hint: Check DB binding and network; do not use insecure TLS workarounds.</p>
     </div>
     ${hintBlock}
   `;
@@ -15894,6 +15940,271 @@ async function resolveMiniSiteDbConnection(project) {
   return { dsn: null, source: 'missing' };
 }
 
+function resolveHealthDbConnection() {
+  const dsn = process.env.DATABASE_URL_PM || process.env.PATH_APPLIER_CONFIG_DSN || process.env.DATABASE_URL || null;
+  return { dsn, source: dsn ? 'env' : 'missing' };
+}
+
+function parsePgDsnInfo(dsn) {
+  if (!dsn) return { host: null, port: null, database: null };
+  try {
+    const parsed = new URL(dsn);
+    return {
+      host: parsed.hostname || null,
+      port: Number(parsed.port) || 5432,
+      database: parsed.pathname ? parsed.pathname.replace(/^\//, '') : null,
+    };
+  } catch (error) {
+    return { host: null, port: null, database: null };
+  }
+}
+
+async function waitMs(durationMs) {
+  if (!durationMs) return;
+  await new Promise((resolve) => setTimeout(resolve, durationMs));
+}
+
+async function withTimeout(promise, timeoutMs, errorCode) {
+  if (!promise || typeof promise.then !== 'function') return promise;
+  let timer;
+  const timeoutPromise = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      const error = new Error(errorCode || 'TIMEOUT');
+      error.code = errorCode || 'TIMEOUT';
+      reject(error);
+    }, timeoutMs);
+  });
+  try {
+    return await Promise.race([promise, timeoutPromise]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function checkTcpConnectivity({ host, port, timeoutMs }) {
+  return new Promise((resolve) => {
+    if (!host || !port) {
+      resolve({ ok: false, error: new Error('MISSING_HOST') });
+      return;
+    }
+    const socket = net.connect({ host, port });
+    const onError = (error) => {
+      socket.destroy();
+      resolve({ ok: false, error });
+    };
+    const onConnect = () => {
+      socket.end();
+      resolve({ ok: true });
+    };
+    socket.setTimeout(timeoutMs, () => onError(Object.assign(new Error('TCP_TIMEOUT'), { code: 'ETIMEDOUT' })));
+    socket.once('error', onError);
+    socket.once('connect', onConnect);
+  });
+}
+
+async function checkTlsHandshake({ host, port, timeoutMs, sslSettings }) {
+  if (!sslSettings || sslSettings.sslMode === 'disable') {
+    return { ok: true };
+  }
+  return new Promise((resolve) => {
+    const options = {
+      host,
+      port,
+      servername: host,
+      rejectUnauthorized: sslSettings.sslVerify !== false || !ALLOW_INSECURE_TLS_FOR_TESTS,
+    };
+    const socket = tls.connect(options, () => {
+      socket.end();
+      resolve({ ok: true });
+    });
+    const onError = (error) => {
+      socket.destroy();
+      resolve({ ok: false, error });
+    };
+    socket.setTimeout(timeoutMs, () => onError(Object.assign(new Error('TLS_TIMEOUT'), { code: 'ETIMEDOUT' })));
+    socket.once('error', onError);
+  });
+}
+
+function classifyMiniSiteDbStage(error) {
+  const code = String(error?.code || '');
+  const message = String(error?.message || '').toLowerCase();
+  if (code === 'ENOTFOUND' || code === 'EAI_AGAIN') return 'dns';
+  if (code === 'ECONNREFUSED' || code === 'ETIMEDOUT' || code === 'ECONNRESET') return 'tcp';
+  if (
+    code === 'SELF_SIGNED_CERT_IN_CHAIN' ||
+    code === 'CERT_HAS_EXPIRED' ||
+    message.includes('ssl') ||
+    message.includes('certificate')
+  ) {
+    return 'tls';
+  }
+  if (code === '28P01' || code === '28000' || message.includes('password authentication failed')) {
+    return 'auth';
+  }
+  return 'query';
+}
+
+function isTransientMiniSiteError(error) {
+  const code = String(error?.code || '');
+  return ['ETIMEDOUT', 'ECONNRESET', 'ENOTFOUND', 'EAI_AGAIN', 'ECONNREFUSED'].includes(code);
+}
+
+function logMiniSiteProbeFailure({ context, dsn, stage, error, latencyMs }) {
+  const info = parsePgDsnInfo(dsn);
+  console.warn('[mini-site] db probe failed', {
+    context,
+    stage,
+    code: error?.code || 'unknown',
+    host: info.host,
+    port: info.port,
+    database: info.database,
+    latencyMs,
+  });
+}
+
+async function runMiniSiteDbPreflight({ dsn, sslSettings, pool, timeoutMs }) {
+  const startedAt = Date.now();
+  const status = {
+    ok: false,
+    stage: null,
+    latencyMs: null,
+    errorCode: null,
+    canResolveDns: false,
+    canTcpConnect: false,
+    canHandshakeTls: false,
+    canAuth: false,
+    canQuery: false,
+  };
+  if (!dsn) {
+    status.stage = 'dns';
+    status.errorCode = 'MISSING_DSN';
+    status.latencyMs = 0;
+    return status;
+  }
+  const info = parsePgDsnInfo(dsn);
+  if (!info.host) {
+    status.stage = 'dns';
+    status.errorCode = 'INVALID_DSN';
+    status.latencyMs = 0;
+    return status;
+  }
+  try {
+    await withTimeout(dns.lookup(info.host), MINI_SITE_WARMUP_DNS_TIMEOUT_MS, 'DNS_TIMEOUT');
+    status.canResolveDns = true;
+  } catch (error) {
+    status.stage = 'dns';
+    status.errorCode = error?.code || 'DNS_ERROR';
+    status.latencyMs = Date.now() - startedAt;
+    logMiniSiteProbeFailure({ context: 'dns', dsn, stage: status.stage, error, latencyMs: status.latencyMs });
+    return status;
+  }
+  const tcpResult = await checkTcpConnectivity({
+    host: info.host,
+    port: info.port,
+    timeoutMs: MINI_SITE_WARMUP_TCP_TIMEOUT_MS,
+  });
+  if (!tcpResult.ok) {
+    status.stage = 'tcp';
+    status.errorCode = tcpResult.error?.code || 'TCP_ERROR';
+    status.latencyMs = Date.now() - startedAt;
+    logMiniSiteProbeFailure({ context: 'tcp', dsn, stage: status.stage, error: tcpResult.error, latencyMs: status.latencyMs });
+    return status;
+  }
+  status.canTcpConnect = true;
+  const tlsResult = await checkTlsHandshake({
+    host: info.host,
+    port: info.port,
+    timeoutMs: MINI_SITE_WARMUP_TLS_TIMEOUT_MS,
+    sslSettings,
+  });
+  if (!tlsResult.ok) {
+    status.stage = 'tls';
+    status.errorCode = tlsResult.error?.code || 'TLS_ERROR';
+    status.latencyMs = Date.now() - startedAt;
+    logMiniSiteProbeFailure({ context: 'tls', dsn, stage: status.stage, error: tlsResult.error, latencyMs: status.latencyMs });
+    return status;
+  }
+  status.canHandshakeTls = true;
+  if (!pool) {
+    status.stage = 'auth';
+    status.errorCode = 'POOL_UNAVAILABLE';
+    status.latencyMs = Date.now() - startedAt;
+    return status;
+  }
+  let client;
+  try {
+    client = await pool.connect();
+    status.canAuth = true;
+    await client.query({
+      text: 'SELECT 1',
+      query_timeout: timeoutMs || MINI_SITE_WARMUP_QUERY_TIMEOUT_MS,
+      statement_timeout: timeoutMs || MINI_SITE_WARMUP_QUERY_TIMEOUT_MS,
+    });
+    status.canQuery = true;
+    status.ok = true;
+  } catch (error) {
+    status.stage = status.canAuth ? 'query' : 'auth';
+    status.errorCode = error?.code || 'QUERY_ERROR';
+    logMiniSiteProbeFailure({ context: 'query', dsn, stage: status.stage, error, latencyMs: Date.now() - startedAt });
+  } finally {
+    if (client) {
+      client.release();
+    }
+  }
+  status.latencyMs = Date.now() - startedAt;
+  return status;
+}
+
+function updateMiniSiteWarmupSummary(status) {
+  miniSiteWarmupSummary = {
+    warmUpReady: Boolean(status?.ok),
+    lastWarmUpAt: new Date().toISOString(),
+  };
+}
+
+function getMiniSiteWarmupCacheEntry(projectId) {
+  if (!projectId) return null;
+  const entry = miniSiteWarmupCache.get(projectId);
+  if (!entry) return null;
+  if (Date.now() > entry.expiresAt) {
+    miniSiteWarmupCache.delete(projectId);
+    return null;
+  }
+  return entry;
+}
+
+function setMiniSiteWarmupCacheEntry(projectId, status) {
+  if (!projectId || !status) return;
+  const expiresAt = Date.now() + MINI_SITE_WARMUP_TTL_MS;
+  miniSiteWarmupCache.set(projectId, { ...status, expiresAt });
+  updateMiniSiteWarmupSummary(status);
+}
+
+async function warmupMiniSiteDb({ projectId, dsn, sslSettings, pool, requestId, url }) {
+  if (!MINI_SITE_WARMUP_ENABLED) {
+    return { ok: true, skipped: true };
+  }
+  const isRetry = url?.searchParams?.get('retry') === '1';
+  const cached = getMiniSiteWarmupCacheEntry(projectId);
+  if (cached && !isRetry) {
+    return { ...cached, cached: true };
+  }
+  const status = await runMiniSiteDbPreflight({
+    dsn,
+    sslSettings,
+    pool,
+    timeoutMs: MINI_SITE_WARMUP_QUERY_TIMEOUT_MS,
+  });
+  const payload = {
+    ...status,
+    requestId,
+    lastWarmUpAt: new Date().toISOString(),
+  };
+  setMiniSiteWarmupCacheEntry(projectId, payload);
+  return payload;
+}
+
 function getMiniSitePool(dsn, sslSettings) {
   if (!dsn) return null;
   const poolKey = buildMiniSitePoolKey(dsn, sslSettings);
@@ -15903,7 +16214,7 @@ function getMiniSitePool(dsn, sslSettings) {
       connectionString: dsn,
       connectionTimeoutMillis: MINI_SITE_CONNECTION_TIMEOUT_MS,
       idleTimeoutMillis: 30_000,
-      max: 4,
+      max: MINI_SITE_POOL_MAX,
       statement_timeout: MINI_SITE_STATEMENT_TIMEOUT_MS,
     };
     const sslOptions = buildPgSslOptions(sslSettings);
@@ -15915,13 +16226,122 @@ function getMiniSitePool(dsn, sslSettings) {
   return miniSitePools.get(poolKey);
 }
 
-async function runMiniSiteQuery(pool, text, values) {
-  return pool.query({
+function getHealthCheckPool(dsn, sslSettings) {
+  if (!dsn) return null;
+  const poolKey = buildMiniSitePoolKey(dsn, sslSettings);
+  if (!poolKey) return null;
+  if (!healthCheckPools.has(poolKey)) {
+    const poolConfig = {
+      connectionString: dsn,
+      connectionTimeoutMillis: MINI_SITE_CONNECTION_TIMEOUT_MS,
+      idleTimeoutMillis: 30_000,
+      max: 1,
+      statement_timeout: MINI_SITE_STATEMENT_TIMEOUT_MS,
+    };
+    const sslOptions = buildPgSslOptions(sslSettings);
+    if (sslOptions) {
+      poolConfig.ssl = sslOptions;
+    }
+    healthCheckPools.set(poolKey, new Pool(poolConfig));
+  }
+  return healthCheckPools.get(poolKey);
+}
+
+async function runMiniSiteQuery(pool, text, values, options = {}) {
+  const queryConfig = {
     text,
     values,
-    query_timeout: MINI_SITE_QUERY_TIMEOUT_MS,
-    statement_timeout: MINI_SITE_STATEMENT_TIMEOUT_MS,
+    query_timeout: options.queryTimeoutMs || MINI_SITE_QUERY_TIMEOUT_MS,
+    statement_timeout: options.statementTimeoutMs || MINI_SITE_STATEMENT_TIMEOUT_MS,
+  };
+  const maxAttempts = options.retry && MINI_SITE_RETRY_ENABLED ? MINI_SITE_RETRY_MAX_ATTEMPTS + 1 : 1;
+  let attempt = 0;
+  while (attempt < maxAttempts) {
+    try {
+      return await pool.query(queryConfig);
+    } catch (error) {
+      attempt += 1;
+      const shouldRetry =
+        options.retry &&
+        MINI_SITE_RETRY_ENABLED &&
+        attempt < maxAttempts &&
+        isTransientMiniSiteError(error);
+      if (!shouldRetry) {
+        throw error;
+      }
+      const backoffMs = MINI_SITE_RETRY_BACKOFF_MS[attempt - 1] || MINI_SITE_RETRY_BACKOFF_MS.at(-1);
+      await waitMs(backoffMs);
+    }
+  }
+  return pool.query(queryConfig);
+}
+
+function resolveBuildVersion() {
+  return process.env.GIT_SHA || process.env.RENDER_GIT_COMMIT || process.env.COMMIT_SHA || null;
+}
+
+async function buildHealthzPayload() {
+  const buildVersion = resolveBuildVersion();
+  const uptimeSeconds = Math.floor(process.uptime());
+  const connection = resolveHealthDbConnection();
+  const sslSettings = resolveProjectDbSslSettings({}, connection);
+  const pool = getHealthCheckPool(connection.dsn, sslSettings);
+  const dbProbe = await runMiniSiteDbPreflight({
+    dsn: connection.dsn,
+    sslSettings,
+    pool,
+    timeoutMs: MINI_SITE_WARMUP_QUERY_TIMEOUT_MS,
   });
+  const dbStatus = {
+    canResolveDns: dbProbe.canResolveDns,
+    canTcpConnect: dbProbe.canTcpConnect,
+    canHandshakeTls: dbProbe.canHandshakeTls,
+    canAuth: dbProbe.canAuth,
+    canQuery: dbProbe.canQuery,
+    latencyMs: dbProbe.latencyMs,
+    lastErrorCode: dbProbe.errorCode || null,
+  };
+  const serviceStatus = dbProbe.ok ? 'ok' : 'degraded';
+  return {
+    serviceStatus,
+    uptimeSeconds,
+    build: {
+      version: buildVersion,
+    },
+    dbStatus,
+    miniSiteStatus: {
+      warmUpReady: miniSiteWarmupSummary.warmUpReady,
+      lastWarmUpAt: miniSiteWarmupSummary.lastWarmUpAt,
+    },
+  };
+}
+
+async function buildHealthzPayloadSafely() {
+  try {
+    return await buildHealthzPayload();
+  } catch (error) {
+    return {
+      serviceStatus: 'fail',
+      uptimeSeconds: Math.floor(process.uptime()),
+      build: {
+        version: resolveBuildVersion(),
+      },
+      dbStatus: {
+        canResolveDns: false,
+        canTcpConnect: false,
+        canHandshakeTls: false,
+        canAuth: false,
+        canQuery: false,
+        latencyMs: null,
+        lastErrorCode: error?.code || 'HEALTHZ_ERROR',
+      },
+      miniSiteStatus: {
+        warmUpReady: miniSiteWarmupSummary.warmUpReady,
+        lastWarmUpAt: miniSiteWarmupSummary.lastWarmUpAt,
+      },
+      errorSummary: error?.message || 'Health check failed.',
+    };
+  }
 }
 
 async function listMiniSiteTables(pool) {
@@ -15934,6 +16354,8 @@ async function listMiniSiteTables(pool) {
         AND table_schema NOT IN ('pg_catalog', 'information_schema')
       ORDER BY table_schema, table_name;
     `,
+    [],
+    { retry: true },
   );
   return rows;
 }
@@ -15948,6 +16370,7 @@ async function fetchMiniSiteTableColumns(pool, schema, table) {
       ORDER BY ordinal_position;
     `,
     [schema, table],
+    { retry: true },
   );
   return rows;
 }
@@ -15963,6 +16386,7 @@ async function fetchMiniSitePrimaryKeys(pool, schema, table) {
       WHERE i.indrelid = $1::regclass AND i.indisprimary;
     `,
     [qualified],
+    { retry: true },
   );
   return rows.map((row) => row.attname);
 }
@@ -20182,7 +20606,36 @@ async function handleMiniSiteRequest(req, res, url) {
     const pool = getMiniSitePool(connection.dsn, sslSettings);
     if (!pool) {
       res.writeHead(502, { 'Content-Type': 'text/html; charset=utf-8' });
-      res.end(renderMiniSiteDbErrorPage({ requestId }));
+      res.end(
+        renderMiniSiteDbErrorPage({
+          requestId,
+          stage: 'auth',
+          errorCode: 'POOL_UNAVAILABLE',
+          retryHref: buildMiniSiteRetryHref(url),
+        }),
+      );
+      return true;
+    }
+
+    const warmupResult = await warmupMiniSiteDb({
+      projectId: project.id,
+      dsn: connection.dsn,
+      sslSettings,
+      pool,
+      requestId,
+      url,
+    });
+    if (!warmupResult.ok) {
+      res.writeHead(502, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(
+        renderMiniSiteDbErrorPage({
+          requestId,
+          stage: warmupResult.stage || 'query',
+          errorCode: warmupResult.errorCode,
+          latencyMs: warmupResult.latencyMs,
+          retryHref: buildMiniSiteRetryHref(url),
+        }),
+      );
       return true;
     }
 
@@ -20344,6 +20797,19 @@ async function handleMiniSiteRequest(req, res, url) {
           columns = Object.keys(rows[0]);
         }
       } catch (error) {
+        const stage = classifyMiniSiteDbStage(error);
+        if (stage !== 'query') {
+          res.writeHead(502, { 'Content-Type': 'text/html; charset=utf-8' });
+          res.end(
+            renderMiniSiteDbErrorPage({
+              requestId,
+              stage,
+              errorCode: error?.code || 'unknown',
+              retryHref: buildMiniSiteRetryHref(url),
+            }),
+          );
+          return true;
+        }
         const errorCode = error?.code || '';
         const lowerMessage = String(error?.message || '').toLowerCase();
         if (errorCode === '57014' || lowerMessage.includes('timeout')) {
@@ -20484,6 +20950,7 @@ async function handleMiniSiteRequest(req, res, url) {
         pool,
         `SELECT ctid, * FROM ${quoteIdentifier(schema)}.${quoteIdentifier(table)} ${orderBy} LIMIT $1 OFFSET $2`,
         [MINI_SITE_PAGE_SIZE + 1, offset],
+        { retry: true },
       );
       const hasNext = rows.length > MINI_SITE_PAGE_SIZE;
       const pageRows = rows.slice(0, MINI_SITE_PAGE_SIZE);
@@ -20549,6 +21016,7 @@ async function handleMiniSiteRequest(req, res, url) {
           pool,
           `SELECT * FROM ${quoteIdentifier(schema)}.${quoteIdentifier(table)} WHERE ${whereParts.join(' AND ')} LIMIT 1`,
           values,
+          { retry: true },
         );
         row = rows[0] || null;
       } else if (keyData.mode === 'ctid') {
@@ -20556,6 +21024,7 @@ async function handleMiniSiteRequest(req, res, url) {
           pool,
           `SELECT ctid, * FROM ${quoteIdentifier(schema)}.${quoteIdentifier(table)} WHERE ctid = $1 LIMIT 1`,
           [keyData.values?.ctid],
+          { retry: true },
         );
         row = rows[0] || null;
       }
@@ -20682,33 +21151,34 @@ async function handleMiniSiteRequest(req, res, url) {
     res.end('Not found');
     return true;
   } catch (error) {
+    const errorCode = error?.code || 'unknown';
+    const stage = classifyMiniSiteDbStage(error);
     console.error('[mini-site] request failed', {
       requestId,
       path: url.pathname,
       projectId: project?.id,
       error: error?.message,
-      code: error?.code,
+      code: errorCode,
+      stage,
       stack: error?.stack,
     });
-    const errorCode = error?.code || 'unknown';
-    const isSelfSigned =
-      errorCode === 'SELF_SIGNED_CERT_IN_CHAIN' ||
-      String(error?.message || '').toLowerCase().includes('self-signed certificate');
-    const isSslError =
-      isSelfSigned ||
-      String(error?.message || '').toLowerCase().includes('ssl') ||
-      String(error?.message || '').toLowerCase().includes('certificate');
     const isTimeout =
       errorCode === 'ETIMEDOUT' ||
       String(error?.message || '').toLowerCase().includes('timeout');
     let adminHint = null;
-    if (isSslError) {
-      adminHint = `SSL error code: ${errorCode}. Suggestion: set dbSslVerify=false or provide CA.`;
-    } else if (isTimeout) {
-      adminHint = `Connection timed out. Check network/SSL settings or increase timeout.`;
+    if (isTimeout) {
+      adminHint = 'Connection timed out. Check network/SSL settings or increase timeout.';
     }
     res.writeHead(502, { 'Content-Type': 'text/html; charset=utf-8' });
-    res.end(renderMiniSiteDbErrorPage({ requestId, adminHint }));
+    res.end(
+      renderMiniSiteDbErrorPage({
+        requestId,
+        adminHint,
+        stage,
+        errorCode,
+        retryHref: buildMiniSiteRetryHref(url),
+      }),
+    );
     return true;
   }
 }
@@ -20748,7 +21218,13 @@ function startHttpServer() {
       if (await handleMiniSiteRequest(req, res, url)) {
         return;
       }
-      if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/healthz')) {
+      if (req.method === 'GET' && url.pathname === '/healthz') {
+        const payload = await buildHealthzPayloadSafely();
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify(payload));
+        return;
+      }
+      if (req.method === 'GET' && url.pathname === '/') {
         const payload = {
           ok: true,
           service: 'Project Manager',

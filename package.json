@@ -4,6 +4,9 @@
   "description": "Telegram bot for applying git patches and opening GitHub PRs",
   "main": "src/bot.js",
   "type": "commonjs",
+  "bin": {
+    "pm": "./pm"
+  },
   "scripts": {
     "start": "node src/bot.js",
     "test": "BOT_TOKEN=TEST ADMIN_TELEGRAM_ID=1 node --test"
