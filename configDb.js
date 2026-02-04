@@ -8,11 +8,12 @@ const DB_IDLE_TIMEOUT_MS = 30_000;
 const DB_CONNECTION_TIMEOUT_MS = 15_000;
 const DB_STATEMENT_TIMEOUT_MS = 5000;
 const DB_OPERATION_TIMEOUT_MS = 5000;
+const ALLOW_INSECURE_TLS_FOR_TESTS = process.env.ALLOW_INSECURE_TLS_FOR_TESTS === 'true';
 
 async function getConfigDbPool() {
-  const dsn = process.env.PATH_APPLIER_CONFIG_DSN;
+  const dsn = process.env.DATABASE_URL_PM || process.env.PATH_APPLIER_CONFIG_DSN;
   if (!dsn) {
-    console.warn('[configDb] PATH_APPLIER_CONFIG_DSN is not set; using in-memory config only.');
+    console.warn('[configDb] DATABASE_URL_PM/PATH_APPLIER_CONFIG_DSN not set; using in-memory config only.');
     return null;
   }
 
@@ -27,10 +28,10 @@ async function getConfigDbPool() {
       }
     }
     const sslMode = `${dsn} ${process.env.DATABASE_URL || ''}`.toLowerCase();
-    const ssl =
-      sslMode.includes('sslmode=require') || sslMode.includes('ssl=true')
-        ? { rejectUnauthorized: false }
-        : undefined;
+    const sslRequired = sslMode.includes('sslmode=require') || sslMode.includes('ssl=true');
+    const ssl = sslRequired
+      ? { rejectUnauthorized: !ALLOW_INSECURE_TLS_FOR_TESTS }
+      : undefined;
     pool = new Pool({
       connectionString: dsn,
       max: DB_POOL_MAX,

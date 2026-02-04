@@ -61,3 +61,45 @@ Content-Type: application/json
 ```
 
 If JSON is not convenient, send a plain text body; it will be treated as an error-level message. No authentication is required for now.
+
+## PM database separation + Render Postgres migration
+
+### Namespace strategy (going forward)
+- Use a dedicated schema (`pm`) for new PM tables (preferred).
+- Current PM tables (from migrations):
+  - `env_var_sets`
+  - `project_env_vars`
+  - `cron_job_links`
+  - `project_telegram_bots`
+  - `project_log_settings`
+  - `project_recent_logs`
+
+### Export (schema + data)
+```
+./pm db:export --source "$PM_DB_SOURCE_URL" --out-dir ./pm-db-export
+```
+- Dry-run (schema only):
+```
+./pm db:export --source "$PM_DB_SOURCE_URL" --out-dir ./pm-db-export --schema-only
+```
+
+### Import (schema + data + indexes/constraints)
+```
+./pm db:import --target "$PM_DB_TARGET_URL" --out-dir ./pm-db-export
+```
+- Includes row-count validation when `PM_DB_SOURCE_URL` is set.
+
+### Safety checks
+- Preflight runs `SELECT 1` on source/target before export/import.
+- Import order:
+  1) `schema.sql` (tables/sequences)
+  2) `data.sql` (COPY data)
+  3) `post-data.sql` (indexes/constraints)
+
+### Cutover (Render deploy)
+1) Provision a new Render Postgres for PM.
+2) Export from the current shared DB.
+3) Import into the new PM DB.
+4) Set `DATABASE_URL_PM` (preferred) or `PATH_APPLIER_CONFIG_DSN` on the PM service.
+5) Deploy PM with the new `DATABASE_URL_PM`.
+6) Verify counts and run a smoke check (mini-site + /healthz).
