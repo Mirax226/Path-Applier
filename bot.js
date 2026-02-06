@@ -134,7 +134,12 @@ const { runCommandInProject } = require('./shellUtils');
 const { LOG_LEVELS, normalizeLogLevel } = require('./logLevels');
 const { configureSelfLogger, forwardSelfLog } = require('./logger');
 const { ensureConfigTable } = require('./configStore');
-const { getConfigDbPool, testConfigDbConnection: probeConfigDbConnection, maskDsn } = require('./configDb');
+const {
+  getConfigDbPool,
+  testConfigDbConnection: probeConfigDbConnection,
+  maskDsn,
+  isDsnAutoFixApplied,
+} = require('./configDb');
 const { listSelfLogs, getSelfLogById } = require('./loggerStore');
 const {
   DEFAULT_SETTINGS: DEFAULT_LOG_ALERT_SETTINGS,
@@ -290,6 +295,8 @@ let configDbFailureStreak = 0;
 let configDbLastLogCategory = null;
 let configDbLastLogAttempt = 0;
 let configDbManualRetryAt = 0;
+let configDbWarmupHaltedForBoot = false;
+let configDbDsnIssueAttempts = 0;
 let cachedSettings = null;
 let cachedSettingsAt = 0;
 const DB_OPERATION_TIMEOUT_MS = 5000;
@@ -1863,7 +1870,7 @@ function computeConfigDbBackoff(attempt) {
 }
 
 async function runConfigDbWarmup(reason = 'scheduled') {
-  if (configDbWarmupInFlight) return;
+  if (configDbWarmupInFlight || configDbWarmupHaltedForBoot) return;
   configDbWarmupInFlight = true;
   recordConfigDbAttempt();
   const attemptCount = getConfigDbSnapshot().attempts;
@@ -1899,6 +1906,7 @@ async function runConfigDbWarmup(reason = 'scheduled') {
       runtimeStatus.configDbOk = true;
       runtimeStatus.configDbError = null;
       configDbFailureStreak = 0;
+      configDbDsnIssueAttempts = 0;
       setConfigDbNextRetry(0);
       return;
     }
@@ -1919,6 +1927,16 @@ async function runConfigDbWarmup(reason = 'scheduled') {
       configDbLastLogCategory = category;
       configDbLastLogAttempt = configDbFailureStreak;
     }
+    const isDsnIssue = category === 'INVALID_URL' || isDsnAutoFixApplied();
+    if (isDsnIssue) {
+      configDbDsnIssueAttempts += 1;
+      if (configDbDsnIssueAttempts >= 2) {
+        configDbWarmupHaltedForBoot = true;
+        setConfigDbNextRetry(0);
+        console.warn('[db] Config DB unavailable after DSN auto-fix attempt; running in-memory config mode for this boot.');
+        return;
+      }
+    }
     const delayMs = computeConfigDbBackoff(configDbFailureStreak);
     scheduleConfigDbWarmup(delayMs, 'retry');
   } catch (error) {
@@ -1938,6 +1956,16 @@ async function runConfigDbWarmup(reason = 'scheduled') {
       configDbLastLogCategory = category;
       configDbLastLogAttempt = configDbFailureStreak;
     }
+    const isDsnIssue = category === 'INVALID_URL' || isDsnAutoFixApplied();
+    if (isDsnIssue) {
+      configDbDsnIssueAttempts += 1;
+      if (configDbDsnIssueAttempts >= 2) {
+        configDbWarmupHaltedForBoot = true;
+        setConfigDbNextRetry(0);
+        console.warn('[db] Config DB unavailable after DSN auto-fix attempt; running in-memory config mode for this boot.');
+        return;
+      }
+    }
     const delayMs = computeConfigDbBackoff(configDbFailureStreak);
     scheduleConfigDbWarmup(delayMs, 'retry');
   } finally {
@@ -1950,6 +1978,9 @@ function startConfigDbWarmup() {
 }
 
 function triggerConfigDbWarmup(reason = 'manual') {
+  if (configDbWarmupHaltedForBoot) {
+    return false;
+  }
   const now = Date.now();
   if (now - configDbManualRetryAt < 3000) {
     return false;
