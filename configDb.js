@@ -3,6 +3,7 @@ const { classifyDbError, sanitizeDbErrorMessage } = require('./configDbErrors');
 
 let pool = null;
 let sslWarningEmitted = false;
+let dsnAutoFixApplied = false;
 const DB_POOL_MAX = 3;
 const DB_IDLE_TIMEOUT_MS = 30_000;
 const DB_CONNECTION_TIMEOUT_MS = 15_000;
@@ -106,19 +107,23 @@ async function getConfigDbPool() {
     return null;
   }
 
-  const fixResult = tryFixPostgresDsn(rawDsn);
-  const dsn = fixResult.dsn;
-  if (fixResult.fixed) {
-    const warningMessage = `[configDb] Auto-fixed malformed Postgres DSN from ${envVar} (detected unescaped special characters in username/password). Please update ENV with encoded credentials.`;
-    const context = {
-      envVar,
-      detected: 'Invalid URL caused by unescaped special characters in username/password',
-      originalMaskedDsn: maskDsn(rawDsn),
-      correctedMaskedDsn: maskDsn(dsn),
-      fixHint: 'Set encoded DSN in ENV (encode username/password only).',
-    };
-    console.warn(warningMessage, context);
-    await forwardConfigDbWarning(warningMessage, context);
+  let dsn = rawDsn;
+  if (!dsnAutoFixApplied) {
+    const fixResult = tryFixPostgresDsn(rawDsn);
+    if (fixResult.fixed) {
+      dsn = fixResult.dsn;
+      dsnAutoFixApplied = true;
+      const warningMessage = `[configDb] Auto-fixed malformed Postgres DSN from ${envVar} (detected unescaped special characters in username/password). Please update ENV with encoded credentials.`;
+      const context = {
+        envVar,
+        detected: 'Invalid URL caused by unescaped special characters in username/password',
+        originalMaskedDsn: maskDsn(rawDsn),
+        correctedMaskedDsn: maskDsn(dsn),
+        fixHint: 'Set encoded DSN in ENV (encode username/password only).',
+      };
+      console.warn(warningMessage, context);
+      await forwardConfigDbWarning(warningMessage, context);
+    }
   }
 
   if (!pool) {
@@ -148,6 +153,10 @@ async function getConfigDbPool() {
   }
 
   return pool;
+}
+
+function isDsnAutoFixApplied() {
+  return dsnAutoFixApplied;
 }
 
 async function withDbTimeout(promise, context) {
@@ -188,4 +197,5 @@ module.exports = {
   testConfigDbConnection,
   maskDsn,
   tryFixPostgresDsn,
+  isDsnAutoFixApplied,
 };
