@@ -134,7 +134,7 @@ const { runCommandInProject } = require('./shellUtils');
 const { LOG_LEVELS, normalizeLogLevel } = require('./logLevels');
 const { configureSelfLogger, forwardSelfLog } = require('./logger');
 const { ensureConfigTable } = require('./configStore');
-const { getConfigDbPool, testConfigDbConnection: probeConfigDbConnection } = require('./configDb');
+const { getConfigDbPool, testConfigDbConnection: probeConfigDbConnection, maskDsn } = require('./configDb');
 const { listSelfLogs, getSelfLogById } = require('./loggerStore');
 const {
   DEFAULT_SETTINGS: DEFAULT_LOG_ALERT_SETTINGS,
@@ -1574,7 +1574,7 @@ function buildDegradedBanner() {
 
 function buildConfigDbStatusLine() {
   const snapshot = getConfigDbSnapshot();
-  if (!process.env.PATH_APPLIER_CONFIG_DSN) {
+  if (!process.env.DATABASE_URL_PM && !process.env.PATH_APPLIER_CONFIG_DSN) {
     return '⚪️ Config DB: Not configured';
   }
   if (snapshot.ready) {
@@ -1616,9 +1616,23 @@ async function renderConfigDbGate(ctx, options = {}) {
   await renderOrEdit(ctx, view.text, { reply_markup: view.keyboard });
 }
 
+function getConfiguredConfigDbDsn() {
+  return process.env.DATABASE_URL_PM || process.env.PATH_APPLIER_CONFIG_DSN || null;
+}
+
 function buildConfigDbStatusView(notice) {
   const snapshot = getConfigDbSnapshot();
-  const configured = Boolean(process.env.PATH_APPLIER_CONFIG_DSN);
+  const configured = Boolean(process.env.DATABASE_URL_PM || process.env.PATH_APPLIER_CONFIG_DSN);
+  const configuredDsn = getConfiguredConfigDbDsn();
+  const invalidUrlNotice = snapshot.lastErrorCategory === 'INVALID_URL'
+    ? [
+        '',
+        '⚠️ Invalid URL detected for Config DB DSN.',
+        'Password special chars must be percent-encoded: ?, #, @, /, +',
+        'Fix: URL-encode the password OR let PM auto-fix temporarily, but update ENV to the corrected DSN.',
+        `Configured DSN (masked): ${maskDsn(configuredDsn) || '-'}`,
+      ].join('\n')
+    : null;
   const lines = [
     '🩺 PM Status',
     '',
@@ -1629,6 +1643,7 @@ function buildConfigDbStatusView(notice) {
     `Attempts: ${snapshot.attempts}`,
     `Next retry: ${snapshot.nextRetryInMs ? formatRetryWindow(snapshot.nextRetryInMs) : '-'}`,
     `Last error category: ${snapshot.lastErrorCategory || '-'}`,
+    invalidUrlNotice,
     notice || null,
   ].filter(Boolean);
   const inline = new InlineKeyboard()
@@ -1796,8 +1811,8 @@ async function testConfigDbConnection() {
   runtimeStatus.configDbOk = false;
   runtimeStatus.configDbError = status.message || 'see logs';
   if (!status.configured) {
-    console.error('Config DB is not configured (PATH_APPLIER_CONFIG_DSN missing).');
-    await forwardSelfLog('error', 'Config DB missing PATH_APPLIER_CONFIG_DSN', {
+    console.error('Config DB is not configured (DATABASE_URL_PM/PATH_APPLIER_CONFIG_DSN missing).');
+    await forwardSelfLog('error', 'Config DB missing DATABASE_URL_PM/PATH_APPLIER_CONFIG_DSN', {
       context: { error: status.message },
     });
     return status;
@@ -4897,7 +4912,7 @@ async function renderEnvVaultMenu(ctx, projectId) {
   const envSetId = await ensureProjectEnvSet(projectId);
   const keys = await listEnvVarKeys(projectId, envSetId);
   const warnings = [];
-  if (!process.env.PATH_APPLIER_CONFIG_DSN) {
+  if (!process.env.DATABASE_URL_PM && !process.env.PATH_APPLIER_CONFIG_DSN) {
     warnings.push('⚠️ Config DB is not configured; Env Vault is in-memory only.');
   }
   if (!appState.dbReady) {

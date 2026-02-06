@@ -13,6 +13,10 @@ function classifyDbError(error) {
   const message = String(error?.message || '');
   const lower = message.toLowerCase();
 
+  if (code === 'ERR_INVALID_URL' || lower.includes('invalid url')) {
+    return 'INVALID_URL';
+  }
+
   if (
     code === 'ETIMEDOUT' ||
     code === 'DB_TIMEOUT' ||
