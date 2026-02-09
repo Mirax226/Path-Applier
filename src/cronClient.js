@@ -1,8 +1,11 @@
 const fetch = require('node-fetch');
+const { createPmLogger, createPmFetch } = require('./pmLogger');
 
 const CRON_API_TOKEN =
   process.env.CRON_API_TOKEN || process.env.CRON_API_KEY || process.env.CRONJOB_API_KEY;
 const CRON_API_BASE = process.env.CRONJOB_API_BASE || 'https://api.cron-job.org';
+const pmLogger = createPmLogger();
+const pmFetch = createPmFetch(fetch, pmLogger);
 
 function assertCronApiKey() {
   if (!CRON_API_TOKEN) {
@@ -39,7 +42,7 @@ async function callCronApi(method, path, body) {
   let response;
   let text = '';
   try {
-    response = await fetch(url, options);
+    response = await pmFetch(url, options);
     text = await response.text();
   } catch (error) {
     console.error('[cronClient] Network error', { method, path, error: error.message });

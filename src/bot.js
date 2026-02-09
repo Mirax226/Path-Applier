@@ -1,11 +1,25 @@
 console.error('[boot] starting app');
 
+const { createPmLogger } = require('./pmLogger');
+const pmLogger = createPmLogger();
+pmLogger.attachProcessHooks();
+
 process.on('uncaughtException', (error) => {
   console.error('[FATAL] uncaughtException', error);
+  pmLogger.error('startup_uncaughtException', {
+    source: 'src/bot.js',
+    error: error?.message,
+    stack: error?.stack,
+  });
 });
 
 process.on('unhandledRejection', (error) => {
   console.error('[FATAL] unhandledRejection', error);
+  pmLogger.error('startup_unhandledRejection', {
+    source: 'src/bot.js',
+    error: error?.message,
+    stack: error?.stack,
+  });
 });
 
 process.on('exit', (code) => {
