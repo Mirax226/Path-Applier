@@ -9,6 +9,7 @@ function createCtx(userId = 10) {
     deleteMessage: async (...args) => calls.deleteMessage.push(args),
     editMessageText: async (...args) => calls.editMessageText.push(args),
     editMessageReplyMarkup: async () => {},
+    getChatMember: async () => ({ status: 'member' }),
   };
   return {
     ctx: {
@@ -33,5 +34,15 @@ test('delete button deletes target message for owner', async () => {
   const result = await __test.handleDeleteMessageCallback(ctx, 'msgdel:10:1:100');
   assert.equal(result.ok, true);
   assert.equal(result.mode, 'deleted');
+  assert.deepEqual(calls.deleteMessage[0], [1, 100]);
+});
+
+
+test('delete button allows group admin', async () => {
+  const { ctx, calls } = createCtx(11);
+  ctx.callbackQuery.message = { chat: { id: 1, type: 'group' } };
+  ctx.api.getChatMember = async () => ({ status: 'administrator' });
+  const result = await __test.handleDeleteMessageCallback(ctx, 'msgdel:10:1:100');
+  assert.equal(result.ok, true);
   assert.deepEqual(calls.deleteMessage[0], [1, 100]);
 });

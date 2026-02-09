@@ -121,6 +121,35 @@ If JSON is not convenient, send a plain text body; it will be treated as an erro
 - **How to verify:** run `npm test`, run Ping Test from Settings (observe progress + DB lines), and boot without `DATABASE_URL_PM` to confirm degraded mode without crash loops.
 
 
+
+## Routine Fixes (Codex Tasks)
+- Open **Settings → Diagnostics → 🧰 Routine Fixes (Codex Tasks)**.
+- Entry points:
+  - `🔎 Analyze last error` (uses internal `ops_event_log` context)
+  - `⚡ Quick detect (keyword / error)`
+  - `🧾 Paste error/log text`
+  - `🆔 Enter RefId`
+  - `📎 Forward message`
+  - `📚 Rule catalog`
+- Output is deterministic and always follows:
+  - `[Diagnosis]`
+  - `[What you do now]`
+  - `[Codex Task (copy)]` code block
+- Routine outputs include inline actions:
+  - `📋 Copy task`
+  - `🗑 Delete`
+  - `◀️ Back`
+
+### Add new routine rule
+- Add one file per rule under `src/routineFixes/rules/`.
+- Export object with: `id`, `title`, `triggers`, `match(ctx)`, `render(fields)`.
+- Register the rule in `src/routineFixes/index.js`.
+
+### Security notes
+- No LLM and no external API calls are used for routine matching.
+- Callback payloads contain no secrets.
+- Secret-like values in diagnostics remain masked; avoid adding raw tokens/DSNs to user-visible messages.
+
 ## Telegram UX updates
 - Main menu panels are tracked per `chatId:userId` with a persistent registry (`menuMessageRegistry`) when Config DB is available; stale old menus are deleted or keyboard-disabled.
 - Secondary confirmation messages now include a `🗑 Delete` action that is owner-scoped.

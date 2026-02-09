@@ -201,6 +201,14 @@ const {
 const { buildCb, resolveCallbackData, sanitizeReplyMarkup } = require('./callbackData');
 const { paginateRepos, mapRepoButton, listAllGithubRepos } = require('./src/repoPicker');
 const { createPmLogger } = require('./src/pmLogger');
+const {
+  ROUTINE_AUTO_THRESHOLD,
+  ROUTINE_BUTTON_THRESHOLD,
+  matchBest: matchRoutineFix,
+  renderMatch: renderRoutineFixMatch,
+  listCatalog: listRoutineCatalog,
+  getRuleById: getRoutineRuleById,
+} = require('./src/routineFixes');
 
 const BOT_TOKEN = process.env.BOT_TOKEN || process.env.TELEGRAM_BOT_TOKEN;
 const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID;
@@ -300,6 +308,8 @@ if (!ADMIN_TELEGRAM_ID) {
 const bot = new Bot(BOT_TOKEN);
 const opsRecoveryMessages = new Map();
 const logDeliveryDiagnosticsRuns = new Map();
+const routineQuickState = new Map();
+const routineOutputsByUser = new Map();
 let opsScannerTimer = null;
 const supabasePools = new Map();
 const envVaultPools = new Map();
@@ -359,8 +369,11 @@ const logIngestService = createLogIngestService({
   },
   resolveProjectLogSettings: async (project) => getProjectLogSettingsWithDefaults(project.id),
   addRecentLog,
-  sendTelegramMessage: async (chatId, text) =>
-    bot.api.sendMessage(chatId, text, { disable_web_page_preview: true }),
+  sendTelegramMessage: async (chatId, text) => {
+    const routineButton = buildRoutineFixButton(text, null, null);
+    const reply_markup = routineButton ? { inline_keyboard: [[routineButton]] } : undefined;
+    return bot.api.sendMessage(chatId, text, { disable_web_page_preview: true, reply_markup });
+  },
   logger: console,
 });
 
@@ -1027,17 +1040,106 @@ async function sendDismissibleMessage(ctx, text, extra = {}) {
   return response;
 }
 
+
+function buildRoutineOutputKeyboard(ctx, payload, backCallback = 'gsettings:routine_menu') {
+  const packed = Buffer.from(JSON.stringify(payload)).toString('base64url');
+  return new InlineKeyboard()
+    .text('📋 Copy task', buildCb('routine', ['copy', packed]))
+    .row()
+    .text('◀️ Back', backCallback);
+}
+
+function trackRoutineOutput(userId, payload) {
+  const key = String(userId || '');
+  if (!key) return;
+  const current = routineOutputsByUser.get(key) || [];
+  current.unshift({ at: Date.now(), payload });
+  routineOutputsByUser.set(key, current.slice(0, 5));
+}
+
+
+function buildRoutineFixButton(text, category = null, refId = null) {
+  const matched = matchRoutineFix({ rawText: text || '', category, refId }, ROUTINE_BUTTON_THRESHOLD);
+  if (!matched.best || matched.best.confidence < ROUTINE_BUTTON_THRESHOLD) return null;
+  if (matched.best.rule.internalOnlyAutoButton) return null;
+  const payload = Buffer.from(JSON.stringify({ ruleId: matched.best.rule.id, refId: refId || null })).toString('base64url');
+  return { text: '🛠 Fix (routine)', callback_data: buildCb('routinefix', [payload]) };
+}
+
+async function maybeSendRoutineFixFromButton(ctx, payloadEncoded) {
+  const payload = decodeRoutinePayload(payloadEncoded);
+  if (!payload?.ruleId) {
+    await ensureAnswerCallback(ctx, { text: 'Expired routine action', show_alert: true });
+    return;
+  }
+  const rule = getRoutineRuleById(payload.ruleId);
+  if (!rule) {
+    await ensureAnswerCallback(ctx, { text: 'Rule not found', show_alert: true });
+    return;
+  }
+  const rendered = renderRoutineFixMatch({ rule, confidence: 1, fields: {} });
+  await renderRoutineOutput(ctx, rendered, { backCallback: 'gsettings:routine_menu' });
+  await ensureAnswerCallback(ctx);
+}
+
+function decodeRoutinePayload(encoded) {
+  try {
+    const text = Buffer.from(String(encoded || ''), 'base64url').toString('utf8');
+    return JSON.parse(text);
+  } catch (_error) {
+    return null;
+  }
+}
+
+function buildRoutineMatchInput({ text = '', refId = null, category = null }) {
+  return {
+    rawText: text || '',
+    refId: refId || null,
+    category: category || null,
+  };
+}
+
+async function renderRoutineOutput(ctx, rendered, options = {}) {
+  const backCallback = options.backCallback || 'gsettings:routine_menu';
+  const payload = {
+    ruleId: rendered.ruleId,
+    task: rendered.task,
+    templateText: rendered.templateText,
+  };
+  trackRoutineOutput(ctx.from?.id, payload);
+  const keyboard = buildRoutineOutputKeyboard(ctx, payload, backCallback);
+  await sendDismissibleMessage(ctx, rendered.templateText, { reply_markup: keyboard });
+}
+
+function summarizeRoutineCandidates(matches) {
+  return (matches || []).slice(0, 3).map((entry) => ({ ruleId: entry.rule.id, title: entry.rule.title, confidence: entry.confidence }));
+}
+
 async function handleDeleteMessageCallback(ctx, data) {
   const [, ownerIdRaw, chatIdRaw, messageIdRaw] = String(data).split(':');
   const ownerId = Number(ownerIdRaw);
   const chatId = Number(chatIdRaw);
   const messageId = Number(messageIdRaw);
-  if (!ownerId || ownerId !== Number(ctx.from?.id)) {
+  const actorId = Number(ctx.from?.id);
+  let allowed = ownerId && ownerId === actorId;
+
+  const api = ctx?.api || bot.api;
+  const chatType = ctx?.callbackQuery?.message?.chat?.type || 'private';
+  if (!allowed && chatType !== 'private' && chatId && actorId) {
+    try {
+      const member = await api.getChatMember(chatId, actorId);
+      const status = member?.status;
+      allowed = status === 'administrator' || status === 'creator';
+    } catch (_error) {
+      allowed = false;
+    }
+  }
+
+  if (!allowed) {
     await ensureAnswerCallback(ctx, { text: 'Not allowed', show_alert: true });
     return { ok: false, reason: 'unauthorized' };
   }
 
-  const api = ctx?.api || bot.api;
   try {
     await api.deleteMessage(chatId, messageId);
     await ensureAnswerCallback(ctx);
@@ -2214,16 +2316,28 @@ function triggerConfigDbWarmup(reason = 'manual') {
 }
 
 
-async function sendOpsAlertByDestinations(destinations, text, extra = {}) {
+async function sendOpsAlertByDestinations(destinations, text, extra = {}, meta = {}) {
   const sends = [];
+  const routineButton = buildRoutineFixButton(text, meta.category || null, meta.refId || null);
+  const composedExtra = routineButton
+    ? {
+        ...extra,
+        reply_markup: {
+          inline_keyboard: [
+            ...((extra.reply_markup && extra.reply_markup.inline_keyboard) || []),
+            [routineButton],
+          ],
+        },
+      }
+    : extra;
   if (destinations.admin_inbox && ADMIN_TELEGRAM_ID) {
-    sends.push(bot.api.sendMessage(ADMIN_TELEGRAM_ID, text, extra));
+    sends.push(bot.api.sendMessage(ADMIN_TELEGRAM_ID, text, composedExtra));
   }
   if (destinations.admin_room && ADMIN_ROOM_CHAT_ID) {
-    sends.push(bot.api.sendMessage(ADMIN_ROOM_CHAT_ID, text, extra));
+    sends.push(bot.api.sendMessage(ADMIN_ROOM_CHAT_ID, text, composedExtra));
   }
   if (destinations.admin_rob && ADMIN_ROB_CHAT_ID) {
-    sends.push(bot.api.sendMessage(ADMIN_ROB_CHAT_ID, text, extra));
+    sends.push(bot.api.sendMessage(ADMIN_ROB_CHAT_ID, text, composedExtra));
   }
   if (!sends.length) return [];
   return Promise.allSettled(sends);
@@ -2234,7 +2348,7 @@ async function routeOpsAlert(event) {
   if (!shouldRouteEvent(prefs, event)) return;
   const destinations = computeDestinations(prefs, event.level);
   const text = `⚠️ [${String(event.level || 'warn').toUpperCase()}] ${event.category}\n${event.message_short}`;
-  await sendOpsAlertByDestinations(destinations, text, { disable_web_page_preview: true });
+  await sendOpsAlertByDestinations(destinations, text, { disable_web_page_preview: true }, { category: event.category, refId: event?.meta_json?.refId || null });
 }
 
 async function emitOpsEvent(level, category, message, meta) {
@@ -2528,6 +2642,29 @@ bot.on('message:document', async (ctx, next) => {
   await safeDeleteMessage(ctx, ctx.message?.chat?.id, ctx.message?.message_id, 'patch_document');
 });
 
+
+bot.on('message:text', async (ctx, next) => {
+  const quick = routineQuickState.get(String(ctx.from.id));
+  if (!quick) return next();
+  routineQuickState.delete(String(ctx.from.id));
+  const text = String(ctx.message?.text || '');
+  const last = await getLastOpsErrorContext();
+  await runRoutineDetection(
+    ctx,
+    buildMatchContextInputFallback({ text, last }),
+    { backCallback: 'gsettings:routine_menu' },
+  );
+  return;
+});
+
+function buildMatchContextInputFallback({ text, last }) {
+  return {
+    rawText: text,
+    refId: last?.refId || null,
+    category: last?.category || null,
+  };
+}
+
 bot.on('message:text', async (ctx, next) => {
   const state = userState.get(ctx.from.id);
   if (!state || state.mode !== 'create-project') {
@@ -2734,6 +2871,21 @@ bot.callbackQuery(/ops:recover:(.+)/, wrapCallbackHandler(async (ctx) => {
   opsRecoveryMessages.delete(`${outageId}:${chatId}`);
 }, 'ops_recover_ack'));
 
+
+async function handleRoutineCallback(ctx, data) {
+  const parts = String(data || '').split(':');
+  const action = parts[1];
+  if (action === 'copy') {
+    const payload = decodeRoutinePayload(parts[2]);
+    if (!payload?.task) {
+      await ensureAnswerCallback(ctx, { text: 'Expired routine payload', show_alert: true });
+      return;
+    }
+    await sendDismissibleMessage(ctx, `\`\`\`text\n${payload.task}\n\`\`\``);
+    await ensureAnswerCallback(ctx);
+  }
+}
+
 bot.on('callback_query:data', wrapCallbackHandler(async (ctx) => {
   const resolved = await resolveCallbackData(ctx.callbackQuery.data);
   if (resolved.expired || !resolved.data) {
@@ -2743,6 +2895,15 @@ bot.on('callback_query:data', wrapCallbackHandler(async (ctx) => {
   const data = resolved.data;
   if (data.startsWith('msgdel:')) {
     await handleDeleteMessageCallback(ctx, data);
+    return;
+  }
+  if (data.startsWith('routine:')) {
+    await handleRoutineCallback(ctx, data);
+    return;
+  }
+  if (data.startsWith('routinefix:')) {
+    const parts = data.split(':');
+    await maybeSendRoutineFixFromButton(ctx, parts[1]);
     return;
   }
   if (data.startsWith('main:')) {
@@ -2946,6 +3107,12 @@ async function handleStatefulMessage(ctx, state) {
       break;
     case 'env_scan_fix_key':
       await handleEnvScanFixKeyInput(ctx, state);
+      break;
+    case 'routine_refid':
+      await handleRoutineRefIdInput(ctx, state);
+      break;
+    case 'routine_forward':
+      await handleRoutineForwardInput(ctx, state);
       break;
     default:
       clearUserState(ctx.from.id);
@@ -3916,6 +4083,66 @@ async function handleGlobalSettingsCallback(ctx, data) {
     case 'diagnostics_menu':
       await renderLogDeliveryDiagnosticsMenu(ctx);
       break;
+    case 'routine_menu':
+      await renderRoutineFixesMenu(ctx);
+      break;
+    case 'routine_analyze_last': {
+      const context = await getLastOpsErrorContext();
+      if (!context) {
+        await renderRoutineFixesMenu(ctx, 'No recent error in event_log.');
+        break;
+      }
+      await runRoutineDetection(ctx, context, { backCallback: 'gsettings:routine_menu' });
+      break;
+    }
+    case 'routine_quick_detect':
+    case 'routine_paste': {
+      routineQuickState.set(String(ctx.from.id), { mode: action === 'routine_quick_detect' ? 'quick' : 'paste' });
+      await renderOrEdit(ctx, 'Send a keyword OR paste the error/log text', {
+        reply_markup: buildBackKeyboard('gsettings:routine_menu'),
+      });
+      break;
+    }
+    case 'routine_refid': {
+      setUserState(ctx.from.id, {
+        type: 'routine_refid',
+        backCallback: 'gsettings:routine_menu',
+      });
+      await renderOrEdit(ctx, 'Send RefId (e.g. CRON-123).', { reply_markup: buildCancelKeyboard() });
+      break;
+    }
+    case 'routine_forward': {
+      setUserState(ctx.from.id, {
+        type: 'routine_forward',
+        backCallback: 'gsettings:routine_menu',
+      });
+      await renderOrEdit(ctx, 'Forward an error message now.', { reply_markup: buildCancelKeyboard() });
+      break;
+    }
+    case 'routine_catalog': {
+      const lines = ['📚 Rule catalog', ''];
+      for (const rule of listRoutineCatalog()) {
+        lines.push(`• ${rule.id} — ${rule.title}`);
+      }
+      await renderOrEdit(ctx, lines.join('\n'), { reply_markup: buildBackKeyboard('gsettings:routine_menu') });
+      break;
+    }
+    case 'routine_help':
+      await renderOrEdit(ctx, 'Use Analyze last error, Quick detect, RefId lookup, or Forwarded message. Output is deterministic and copy-ready.', {
+        reply_markup: buildBackKeyboard('gsettings:routine_menu'),
+      });
+      break;
+    case 'routine_pick': {
+      const ruleId = parts[2];
+      const rule = getRoutineRuleById(ruleId);
+      if (!rule) {
+        await renderRoutineFixesMenu(ctx, 'Rule not found.');
+        break;
+      }
+      const rendered = renderRoutineFixMatch({ rule, confidence: 1, fields: {} });
+      await renderRoutineOutput(ctx, rendered, { backCallback: 'gsettings:routine_menu' });
+      break;
+    }
     case 'diag_test_log_delivery':
       await runLogDeliveryDiagnostics(ctx);
       break;
@@ -19732,11 +19959,128 @@ function createLogDeliveryCounters() {
   };
 }
 
+
+function buildRoutineFixesMenu() {
+  return new InlineKeyboard()
+    .text('🔎 Analyze last error', 'gsettings:routine_analyze_last')
+    .row()
+    .text('⚡ Quick detect (keyword / error)', 'gsettings:routine_quick_detect')
+    .row()
+    .text('🧾 Paste error/log text', 'gsettings:routine_paste')
+    .row()
+    .text('🆔 Enter RefId', 'gsettings:routine_refid')
+    .row()
+    .text('📎 Forward message', 'gsettings:routine_forward')
+    .row()
+    .text('📚 Rule catalog', 'gsettings:routine_catalog')
+    .row()
+    .text('❓ Help (how to use)', 'gsettings:routine_help')
+    .row()
+    .text('⬅️ Back', 'gsettings:diagnostics_menu');
+}
+
+async function renderRoutineFixesMenu(ctx, notice = null) {
+  const text = [
+    '🧰 Routine Fixes (Codex Tasks)',
+    notice || null,
+    'Deterministic rule-based task generator (no LLM).',
+  ].filter(Boolean).join('\n\n');
+  await renderOrEdit(ctx, text, { reply_markup: buildRoutineFixesMenu() });
+}
+
+async function runRoutineDetection(ctx, input, options = {}) {
+  const match = matchRoutineFix(input, ROUTINE_AUTO_THRESHOLD);
+  if (match.accepted) {
+    await renderRoutineOutput(ctx, match.accepted, { backCallback: options.backCallback || 'gsettings:routine_menu' });
+    return;
+  }
+  const top = summarizeRoutineCandidates(match.matches);
+  if (top.length) {
+    const inline = new InlineKeyboard();
+    for (const candidate of top) {
+      inline.text(`🧩 ${candidate.title}`, `gsettings:routine_pick:${candidate.ruleId}`).row();
+    }
+    inline.text('⬅️ Back', 'gsettings:routine_menu');
+    await sendDismissibleMessage(
+      ctx,
+      'No rule matched with high confidence. Pick the nearest candidate:',
+      { reply_markup: inline },
+    );
+    return;
+  }
+  await sendDismissibleMessage(ctx, 'No routine fix found. Open full Diagnostics or export debug details.', {
+    reply_markup: buildBackKeyboard('gsettings:routine_menu'),
+  });
+}
+
+
+async function handleRoutineRefIdInput(ctx, _state) {
+  const refId = String(ctx.message?.text || '').trim();
+  const eventLog = (await loadConfigJson('ops_event_log')) || [];
+  const found = eventLog.find((entry) => String(entry?.meta_json?.refId || '').toUpperCase() === refId.toUpperCase());
+  if (!found) {
+    await sendDismissibleMessage(ctx, `No event found for RefId: ${refId}`, {
+      reply_markup: buildBackKeyboard('gsettings:routine_menu'),
+    });
+    clearUserState(ctx.from.id);
+    return;
+  }
+  await runRoutineDetection(ctx, {
+    rawText: found.message_short || '',
+    refId: found.meta_json?.refId || refId,
+    category: found.category || null,
+  }, { backCallback: 'gsettings:routine_menu' });
+  clearUserState(ctx.from.id);
+}
+
+async function handleRoutineForwardInput(ctx, state) {
+  const forwarded = ctx.message?.forward_origin || ctx.message?.forward_from || ctx.message?.forward_from_chat;
+  const text = String(ctx.message?.text || ctx.message?.caption || '').trim();
+  if (!forwarded && !state?.attachmentFileId) {
+    await sendDismissibleMessage(ctx, 'Please forward a message first.', { reply_markup: buildBackKeyboard('gsettings:routine_menu') });
+    return;
+  }
+  if (!text) {
+    const fileId = ctx.message?.document?.file_id || ctx.message?.photo?.[0]?.file_id || null;
+    if (fileId) {
+      setUserState(ctx.from.id, {
+        type: 'routine_forward',
+        backCallback: 'gsettings:routine_menu',
+        attachmentFileId: fileId,
+      });
+      await sendDismissibleMessage(ctx, 'Attachment received. Paste error/log text to analyze (OCR disabled by default).', {
+        reply_markup: buildBackKeyboard('gsettings:routine_menu'),
+      });
+      return;
+    }
+  }
+  await runRoutineDetection(ctx, { rawText: text }, { backCallback: 'gsettings:routine_menu' });
+  clearUserState(ctx.from.id);
+}
+
+async function getLastOpsErrorContext() {
+  const eventLog = (await loadConfigJson('ops_event_log')) || [];
+  const event = eventLog.find((entry) => ['warn', 'error', 'critical'].includes(String(entry.level || '').toLowerCase())) || null;
+  if (!event) return null;
+  const refId = event.meta_json?.refId || null;
+  return {
+    rawText: event.message_short || '',
+    refId,
+    category: event.category || null,
+  };
+}
+
 async function renderLogDeliveryDiagnosticsMenu(ctx) {
-  const text = '🧪 Diagnostics\nRun end-to-end synthetic log delivery checks.';
-  const keyboard = new InlineKeyboard().text('🧪 Test Log Delivery', 'gsettings:diag_test_log_delivery').row().text('⬅️ Back', 'gsettings:menu');
+  const text = '🧪 Diagnostics\nRun end-to-end synthetic log delivery checks and routine codex task generation.';
+  const keyboard = new InlineKeyboard()
+    .text('🧪 Test Log Delivery', 'gsettings:diag_test_log_delivery')
+    .row()
+    .text('🧰 Routine Fixes (Codex Tasks)', 'gsettings:routine_menu')
+    .row()
+    .text('⬅️ Back', 'gsettings:menu');
   await renderOrEdit(ctx, text, { reply_markup: keyboard });
 }
+
 
 async function runLogDeliveryDiagnostics(ctx) {
   const chatId = getChatIdFromCtx(ctx);
@@ -23202,6 +23546,7 @@ module.exports = {
     getPmDiagnosticsForTests: () => pmLogger.diagnostics(),
     isPmTestAllowedForTests: (token) => pmLogger.isTestRequestAllowed(token),
     configDbMaxRetriesPerBoot: CONFIG_DB_MAX_RETRIES_PER_BOOT,
+    buildRoutineFixButton,
   },
 };
 
