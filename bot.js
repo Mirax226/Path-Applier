@@ -37,6 +37,11 @@ process.on('unhandledRejection', (reason) => {
     stack: error.stack,
     timestamp: new Date().toISOString(),
   };
+  pmLogger.error('unhandledRejection', {
+    source: 'process',
+    error: error.message,
+    stack: error.stack,
+  });
   console.error('[FATAL] Unhandled promise rejection', runtimeStatus.fatalError);
 });
 
@@ -48,6 +53,11 @@ process.on('uncaughtException', (error) => {
     stack: fatalError.stack,
     timestamp: new Date().toISOString(),
   };
+  pmLogger.error('uncaughtException', {
+    source: 'process',
+    error: fatalError.message,
+    stack: fatalError.stack,
+  });
   console.error('[FATAL] Uncaught exception', runtimeStatus.fatalError);
 });
 
@@ -184,6 +194,7 @@ const {
 } = require('./src/cronClient');
 const { buildCb, resolveCallbackData, sanitizeReplyMarkup } = require('./callbackData');
 const { paginateRepos, mapRepoButton, listAllGithubRepos } = require('./src/repoPicker');
+const { createPmLogger } = require('./src/pmLogger');
 
 const BOT_TOKEN = process.env.BOT_TOKEN || process.env.TELEGRAM_BOT_TOKEN;
 const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID;
@@ -252,6 +263,9 @@ const LOG_API_ENABLED = Boolean(LOG_API_TOKEN);
 const LOG_API_ALLOWED_PROJECTS = parseAllowedProjects(process.env.ALLOWED_PROJECTS);
 const LOG_API_ALLOWED_PROJECTS_MODE = LOG_API_ALLOWED_PROJECTS.size ? 'whitelist' : 'allow-all';
 const LOG_API_STATUS_LABEL = LOG_API_ENABLED ? 'ENABLED' : 'DISABLED';
+const PM_LOGGER_ENABLED = process.env.PM_LOGGER_ENABLED !== 'false';
+const pmLogger = createPmLogger({ enabled: PM_LOGGER_ENABLED });
+pmLogger.attachProcessHooks();
 const NOTE_CATEGORIES = ['Bug', 'Feature', 'Deploy', 'DB', 'Idea', 'Security', 'Custom'];
 const NOTE_STATUS = { OPEN: 'OPEN', DONE: 'DONE' };
 const ENV_VALUE_PREVIEW_LIMIT = 160;
@@ -21118,6 +21132,18 @@ function getPublicBaseUrl() {
   );
 }
 
+function getBearerToken(req) {
+  const header = req?.headers?.authorization;
+  if (!header) return '';
+  const match = String(header).match(/^Bearer\s+(.+)$/i);
+  return match ? match[1].trim() : '';
+}
+
+function sendJson(res, statusCode, payload) {
+  res.writeHead(statusCode, { 'Content-Type': 'application/json; charset=utf-8' });
+  res.end(JSON.stringify(payload));
+}
+
 function readRequestBody(req) {
   return new Promise((resolve, reject) => {
     let data = '';
@@ -22584,6 +22610,63 @@ function startHttpServer() {
         res.end(JSON.stringify(payload));
         return;
       }
+      if (req.method === 'GET' && (url.pathname === '/pm/diagnostics' || url.pathname === '/__pm/diagnostics')) {
+        const diagnostics = pmLogger.diagnostics();
+        sendJson(res, 200, {
+          ok: true,
+          enabled: diagnostics.flags.enabled,
+          hasPmUrl: diagnostics.flags.hasPmUrl,
+          hasIngestToken: diagnostics.flags.hasIngestToken,
+          testEnabled: diagnostics.flags.testEnabled,
+          hasTestToken: diagnostics.flags.hasTestToken,
+          hooksInstalled: diagnostics.flags.hooksInstalled,
+          lastSend: diagnostics.lastSend
+            ? {
+                at: diagnostics.lastSend.at || null,
+                level: diagnostics.lastSend.level || null,
+                ok: diagnostics.lastSend.ok === true,
+                statusCode: Number.isFinite(diagnostics.lastSend.statusCode)
+                  ? diagnostics.lastSend.statusCode
+                  : null,
+                correlationId: diagnostics.lastSend.correlationId || null,
+                skipped: diagnostics.lastSend.skipped === true,
+              }
+            : null,
+        });
+        return;
+      }
+
+      if (req.method === 'POST' && (url.pathname === '/pm/test-log' || url.pathname === '/__pm/test-log')) {
+        const token = getBearerToken(req);
+        if (!pmLogger.isTestRequestAllowed(token)) {
+          sendJson(res, 403, { ok: false, error: 'forbidden' });
+          return;
+        }
+
+        let payload = {};
+        try {
+          const rawBody = await readRequestBody(req);
+          payload = rawBody ? JSON.parse(rawBody) : {};
+        } catch (error) {
+          sendJson(res, 400, { ok: false, error: 'invalid_json' });
+          return;
+        }
+
+        const level = normalizeLogLevel(payload.level) || 'info';
+        const result = await pmLogger.send(level, payload.message || 'pm test log', {
+          source: 'pm-test-log',
+          correlationId: payload.correlationId,
+          route: url.pathname,
+        });
+
+        sendJson(res, result.ok ? 200 : 502, {
+          ok: result.ok === true,
+          accepted: true,
+          correlationId: result.correlationId || null,
+        });
+        return;
+      }
+
       if (req.method === 'GET' && url.pathname === '/') {
         const payload = {
           ok: true,
@@ -23073,6 +23156,10 @@ module.exports = {
     verifyTelegramWebAppInitData,
     authenticateMiniApiRequest,
     handleMiniApiRequest,
+    getBearerToken,
+    sendJson,
+    getPmDiagnosticsForTests: () => pmLogger.diagnostics(),
+    isPmTestAllowedForTests: (token) => pmLogger.isTestRequestAllowed(token),
     configDbMaxRetriesPerBoot: CONFIG_DB_MAX_RETRIES_PER_BOOT,
   },
 };
