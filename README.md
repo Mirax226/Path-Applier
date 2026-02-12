@@ -152,7 +152,8 @@ If JSON is not convenient, send a plain text body; it will be treated as an erro
 
 ## Telegram UX updates
 - Main menu panels are tracked per `chatId:userId` with a persistent registry (`menuMessageRegistry`) when Config DB is available; stale old menus are deleted or keyboard-disabled.
-- Secondary confirmation messages now include a `🗑 Delete` action that is owner-scoped.
+- Secondary transient messages include owner-scoped `🗑 Delete` and auto-delete after 10 seconds.
+- Main menu/submenu panels do not append delete actions.
 - Project creation confirmation format now uses:
   - `✅ Project created.`
   - `🏷️ Name: ...`
@@ -174,10 +175,10 @@ If JSON is not convenient, send a plain text body; it will be treated as an erro
 ## Ops Suite v1
 
 PM now includes an operations-first suite with:
-- Normalized main menu: Projects, Logs, Ops, Diagnostics, Templates, Help, Settings.
+- Normalized main menu: Projects, Database, Cron Jobs, Deployments, Logs, Settings, Help.
 - Ops Timeline with bounded retention and filters (severity/type/scope).
 - Automatic Safe Mode for restart loops, DB outages, error spikes, and memory pressure.
-- Actionable alerts (Routine Fix, Copy debug, Timeline, Delete).
+- Actionable alerts (Routine Fix, Copy debug, Timeline, Delete), with cron API failures routed as `CRON_ERROR` ops events.
 - Drift detector snapshots and compare reports.
 - Rule-generated runbooks and quick routine detection.
 - Shadow-run plans for dangerous operations before execute.

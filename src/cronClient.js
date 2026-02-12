@@ -127,13 +127,26 @@ async function getJob(jobId) {
 }
 
 async function createJob(payload) {
-  try {
-    const data = await callCronApi('PUT', '/jobs', payload);
-    const id = data?.jobId || data?.job?.jobId || data?.job?.id || data?.id;
-    return { id: id != null ? String(id) : null };
-  } catch (error) {
-    throw error;
+  const attempts = [
+    { method: 'POST', path: '/jobs' },
+    { method: 'PUT', path: '/jobs' },
+  ];
+  let lastError = null;
+  for (let index = 0; index < attempts.length; index += 1) {
+    const attempt = attempts[index];
+    try {
+      const data = await callCronApi(attempt.method, attempt.path, payload);
+      const id = data?.jobId || data?.job?.jobId || data?.job?.id || data?.id;
+      return { id: id != null ? String(id) : null };
+    } catch (error) {
+      lastError = error;
+      const canFallback = index < attempts.length - 1 && (error?.status === 404 || error?.status === 405);
+      if (!canFallback) {
+        throw error;
+      }
+    }
   }
+  throw lastError;
 }
 
 async function updateJob(jobId, patch) {
