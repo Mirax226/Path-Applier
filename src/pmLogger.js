@@ -60,11 +60,12 @@ function getCorrelationId(meta) {
 function createPmLogger(options = {}) {
   const env = options.env || process.env;
   const fetchImpl = options.fetch || global.fetch || require('node-fetch');
-  const baseUrl = (options.pmUrl || env.PM_URL || env.PATH_APPLIER_URL || '').trim().replace(/\/$/, '');
-  const ingestToken = (options.ingestToken || env.PM_INGEST_TOKEN || env.PM_TOKEN || '').trim();
+  const baseUrl = (options.pmUrl || env.PM_URL || '').trim().replace(/\/$/, '');
+  const ingestToken = (options.ingestToken || env.PM_INGEST_TOKEN || '').trim();
   const testEnabled = parseBoolean(options.testEnabled ?? env.PM_TEST_ENABLED, false);
   const testToken = (options.testToken || env.PM_TEST_TOKEN || '').trim();
-  const enabled = Boolean(baseUrl && ingestToken);
+  const featureEnabled = parseBoolean(options.enabled ?? env.PM_LOGGER_ENABLED, true);
+  const enabled = Boolean(featureEnabled && baseUrl && ingestToken);
   const state = {
     lastSend: null,
     hooksInstalled: false,
@@ -98,24 +99,14 @@ function createPmLogger(options = {}) {
         message: truncateString(message == null ? '' : String(message)),
         meta: normalizedMeta,
       };
-      const ingestPaths = ['/api/logs', '/api/pm/logs'];
-      let response = null;
-      for (const ingestPath of ingestPaths) {
-        response = await fetchImpl(`${baseUrl}${ingestPath}`, {
-          method: 'POST',
-          headers: {
-            Authorization: `Bearer ${ingestToken}`,
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify(payload),
-        });
-        if (response.ok) {
-          break;
-        }
-        if (response.status !== 404) {
-          break;
-        }
-      }
+      const response = await fetchImpl(`${baseUrl}/api/logs`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${ingestToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(payload),
+      });
       requestMeta.statusCode = response ? response.status : null;
       requestMeta.ok = response ? response.ok : false;
       if (!requestMeta.ok) requestMeta.error = `status_${requestMeta.statusCode || 'unknown'}`;

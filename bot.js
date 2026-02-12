@@ -23842,50 +23842,28 @@ function startHttpServer() {
       }
       if (req.method === 'GET' && (url.pathname === '/pm/diagnostics' || url.pathname === '/__pm/diagnostics')) {
         const diagnostics = pmLogger.diagnostics();
-        const memory = process.memoryUsage();
-        const dbHealth = getDbHealthSnapshot();
         sendJson(res, 200, {
           ok: true,
-          version: resolveBuildVersion(),
-          uptimeSeconds: Math.floor(process.uptime()),
-          memory: {
-            rssMb: Number((memory.rss / (1024 * 1024)).toFixed(2)),
-            heapUsedMb: Number((memory.heapUsed / (1024 * 1024)).toFixed(2)),
-            heapTotalMb: Number((memory.heapTotal / (1024 * 1024)).toFixed(2)),
-            externalMb: Number((memory.external / (1024 * 1024)).toFixed(2)),
+          flags: {
+            enabled: diagnostics.flags.enabled === true,
+            hasPmUrl: diagnostics.flags.hasPmUrl === true,
+            hasIngestToken: diagnostics.flags.hasIngestToken === true,
+            testEnabled: diagnostics.flags.testEnabled === true,
+            hasTestToken: diagnostics.flags.hasTestToken === true,
+            hooksInstalled: diagnostics.flags.hooksInstalled === true,
           },
-          dbHealthSnapshot: dbHealth
+          lastSend: diagnostics.lastSend
             ? {
-                status: dbHealth.status || null,
-                updatedAt: dbHealth.updatedAt || null,
-                failureStreak: Number.isFinite(dbHealth.failureStreak) ? dbHealth.failureStreak : null,
-                lastErrorCategory: dbHealth.lastErrorCategory || null,
+                at: diagnostics.lastSend.at || null,
+                level: diagnostics.lastSend.level || null,
+                ok: diagnostics.lastSend.ok === true,
+                statusCode: Number.isFinite(diagnostics.lastSend.statusCode)
+                  ? diagnostics.lastSend.statusCode
+                  : null,
+                correlationId: diagnostics.lastSend.correlationId || null,
+                skipped: diagnostics.lastSend.skipped === true,
               }
             : null,
-          envScanSummary: {
-            scannedAt: miniLatestEnvScan?.scannedAt || null,
-            summary: miniLatestEnvScan?.summary || 'No scan yet.',
-          },
-          pm: {
-            enabled: diagnostics.flags.enabled,
-            hasPmUrl: diagnostics.flags.hasPmUrl,
-            hasIngestToken: diagnostics.flags.hasIngestToken,
-            testEnabled: diagnostics.flags.testEnabled,
-            hasTestToken: diagnostics.flags.hasTestToken,
-            hooksInstalled: diagnostics.flags.hooksInstalled,
-            lastSend: diagnostics.lastSend
-              ? {
-                  at: diagnostics.lastSend.at || null,
-                  level: diagnostics.lastSend.level || null,
-                  ok: diagnostics.lastSend.ok === true,
-                  statusCode: Number.isFinite(diagnostics.lastSend.statusCode)
-                    ? diagnostics.lastSend.statusCode
-                    : null,
-                  correlationId: diagnostics.lastSend.correlationId || null,
-                  skipped: diagnostics.lastSend.skipped === true,
-                }
-              : null,
-          },
         });
         return;
       }
