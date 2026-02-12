@@ -334,6 +334,7 @@ const structuredPatchSessions = new Map();
 const envScanCache = new Map();
 const cronCreateRetryCache = new Map();
 const cronErrorDetailsCache = new Map();
+const cronErrorDedupeCache = new Map();
 const panelMessageHistoryByChat = new Map();
 const activePanelMessageIdByChat = new Map();
 const menuMessageRegistryMemory = new Map();
@@ -1017,37 +1018,60 @@ async function sendEphemeralMessage(ctx, text, extra) {
   return response;
 }
 
-async function sendDismissibleMessage(ctx, text, extra = {}) {
-  const ownerId = ctx?.from?.id;
+async function sendTransientNotice(ctx, text, options = {}) {
+  const ownerId = Number(options.ownerId || ctx?.from?.id || 0);
+  const ttlSec = Number.isFinite(options.ttlSec) ? Number(options.ttlSec) : 10;
+  const deleteButton = options.deleteButton !== false;
+  const extraMarkup = sanitizeReplyMarkup(options.extraMarkup || options.reply_markup);
+  const extra = { ...(options.extra || {}) };
+  if (options.disable_web_page_preview != null) {
+    extra.disable_web_page_preview = options.disable_web_page_preview;
+  }
   const chatId = getChatIdFromCtx(ctx);
-  const existingMarkup = sanitizeReplyMarkup(extra.reply_markup);
-  const withPendingDelete = {
-    inline_keyboard: [
-      ...(Array.isArray(existingMarkup?.inline_keyboard) ? existingMarkup.inline_keyboard : []),
-      [{ text: '🗑 Delete', callback_data: 'msgdel:pending' }],
-    ],
-  };
+  const rows = Array.isArray(extraMarkup?.inline_keyboard) ? extraMarkup.inline_keyboard.slice() : [];
+  if (deleteButton) {
+    rows.push([{ text: '🗑 Delete', callback_data: 'msgdel:pending' }]);
+  }
   const response = await replySafely(ctx, text, {
     ...extra,
-    reply_markup: withPendingDelete,
+    reply_markup: rows.length ? { inline_keyboard: rows } : undefined,
   });
-  if (response?.message_id && chatId && ownerId) {
-    const callback = buildCb('msgdel', [ownerId, chatId, response.message_id]);
-    const finalMarkup = {
-      inline_keyboard: [
-        ...(Array.isArray(existingMarkup?.inline_keyboard) ? existingMarkup.inline_keyboard : []),
-        [{ text: '🗑 Delete', callback_data: callback }],
-      ],
-    };
-    try {
-      await bot.api.editMessageReplyMarkup(chatId, response.message_id, {
-        reply_markup: finalMarkup,
-      });
-    } catch (error) {
-      console.warn('[msgdel] failed to attach final delete callback', error?.message);
+  if (response?.chat?.id && response?.message_id) {
+    trackEphemeralMessage(response.chat.id, response.message_id);
+    if (ttlSec > 0) {
+      if (!ephemeralTimersByChat.has(response.chat.id)) {
+        ephemeralTimersByChat.set(response.chat.id, new Map());
+      }
+      const timer = setTimeout(() => {
+        safeDeleteMessage(ctx, response.chat.id, response.message_id, 'transient_ttl');
+        const set = ephemeralMessageIdsByChat.get(response.chat.id);
+        if (set) set.delete(response.message_id);
+        clearEphemeralTimer(response.chat.id, response.message_id);
+      }, ttlSec * 1000);
+      ephemeralTimersByChat.get(response.chat.id).set(response.message_id, timer);
+    }
+    if (deleteButton && chatId && ownerId) {
+      const callback = buildCb('msgdel', [ownerId, chatId, response.message_id]);
+      const finalMarkup = {
+        inline_keyboard: [
+          ...(Array.isArray(extraMarkup?.inline_keyboard) ? extraMarkup.inline_keyboard : []),
+          [{ text: '🗑 Delete', callback_data: callback }],
+        ],
+      };
+      try {
+        await bot.api.editMessageReplyMarkup(chatId, response.message_id, {
+          reply_markup: finalMarkup,
+        });
+      } catch (error) {
+        console.warn('[msgdel] failed to attach final delete callback', error?.message);
+      }
     }
   }
   return response;
+}
+
+async function sendDismissibleMessage(ctx, text, extra = {}) {
+  return sendTransientNotice(ctx, text, { ttlSec: 10, deleteButton: true, extraMarkup: extra.reply_markup, extra });
 }
 
 
@@ -1169,9 +1193,6 @@ async function handleDeleteMessageCallback(ctx, data) {
 
 async function renderPanel(ctx, text, extra) {
   const safeExtra = normalizeTelegramExtra(extra);
-  if (safeExtra?.reply_markup?.inline_keyboard) {
-    safeExtra.reply_markup = withDeleteButton(safeExtra.reply_markup, extra || {});
-  }
   const settings = await getCachedSettings();
   const cleanup = normalizeUiCleanupSettings(settings);
   let response = null;
@@ -1374,8 +1395,24 @@ function extractCronApiErrorReason(error) {
   return truncateText(raw, 200);
 }
 
-function logCronApiError({ operation, error, userId, projectId, correlationId }) {
+function normalizeCronErrorMessage(error) {
+  const reason = extractCronApiErrorReason(error);
+  return truncateText(reason || error?.message || 'request failed', 300);
+}
+
+function shouldEmitCronErrorSignature(signature, windowMs = 5 * 60 * 1000) {
+  const now = Date.now();
+  const existing = cronErrorDedupeCache.get(signature);
+  if (existing && now - existing < windowMs) {
+    return false;
+  }
+  cronErrorDedupeCache.set(signature, now);
+  return true;
+}
+
+function logCronApiError({ operation, error, userId, projectId, correlationId, jobId = null }) {
   const responseBody = truncateText(error?.body ?? '', 500);
+  const message = normalizeCronErrorMessage(error);
   console.error('[cron] API error', {
     correlationId,
     operation,
@@ -1385,6 +1422,27 @@ function logCronApiError({ operation, error, userId, projectId, correlationId })
     responseBody,
     userId,
     projectId,
+    jobId,
+  });
+  if (!['create', 'update', 'delete', 'toggle'].includes(String(operation || '').toLowerCase())) {
+    return;
+  }
+  const signature = [operation, error?.method || '-', error?.path || '-', error?.status || '-', message].join('|');
+  if (!shouldEmitCronErrorSignature(signature)) {
+    return;
+  }
+  emitOpsEvent('error', 'CRON_ERROR', 'Cron API request failed.', {
+    refId: correlationId,
+    operation,
+    endpoint: error?.path || null,
+    method: error?.method || null,
+    status: error?.status || null,
+    message,
+    projectId: projectId || null,
+    jobId: jobId || null,
+    userId: userId || null,
+  }).catch((emitError) => {
+    console.warn('[cron] failed to emit CRON_ERROR event', emitError?.message);
   });
 }
 
@@ -1742,9 +1800,6 @@ async function renderCronWizardMessage(ctx, state, text, extra) {
   }
   const messageContext = state?.messageContext;
   const safeExtra = normalizeTelegramExtra(extra);
-  if (safeExtra?.reply_markup?.inline_keyboard) {
-    safeExtra.reply_markup = withDeleteButton(safeExtra.reply_markup, extra || {});
-  }
   if (messageContext?.chatId && messageContext?.messageId) {
     try {
       await ctx.telegram.editMessageText(
@@ -1771,9 +1826,6 @@ async function renderCronWizardMessage(ctx, state, text, extra) {
 
 async function renderStateMessage(ctx, state, text, extra) {
   const safeExtra = normalizeTelegramExtra(extra);
-  if (safeExtra?.reply_markup?.inline_keyboard) {
-    safeExtra.reply_markup = withDeleteButton(safeExtra.reply_markup, extra || {});
-  }
   const messageContext = state?.messageContext;
   if (messageContext?.chatId && messageContext?.messageId) {
     try {
@@ -2563,8 +2615,8 @@ async function handleGlobalCommand(ctx, command, payload) {
     const miniUrl = getMiniAppUrl();
     await sendDismissibleMessage(
       ctx,
-      'Open DB Console Mini App for health and diagnostics.',
-      { reply_markup: new InlineKeyboard().webApp('🗄️ Open DB Console', miniUrl) },
+      'Health is a web endpoint. Open Mini App or use Ping test.',
+      { reply_markup: new InlineKeyboard().webApp('🩺 Open Mini App Health', miniUrl) },
     );
     return true;
   }
@@ -3248,10 +3300,14 @@ async function handleMainCallback(ctx, data) {
   const [, action] = data.split(':');
   switch (action) {
     case 'defaults':
-      await renderOrEdit(ctx, `${buildScopedHeader('GLOBAL', 'Main → Settings → Defaults')}⚙️ Defaults\n\n- Global DB defaults\n- Global Cron defaults\n- Global Deploy defaults`, { reply_markup: buildBackKeyboard('gsettings:menu') });
+      await renderOrEdit(ctx, `${buildScopedHeader('GLOBAL', 'Main → Settings → Default project settings')}⚙️ Default project settings\n\n- Global DB defaults\n- Global Cron defaults\n- Global Deploy defaults`, {
+        reply_markup: new InlineKeyboard().text('🧹 Clear default project', 'gsettings:clear_default_project').row().text('⬅️ Back', 'gsettings:menu'),
+      });
       break;
     case 'defaults':
-      await renderOrEdit(ctx, `${buildScopedHeader('GLOBAL', 'Main → Settings → Defaults')}⚙️ Defaults\n\n- Global DB defaults\n- Global Cron defaults\n- Global Deploy defaults`, { reply_markup: buildBackKeyboard('gsettings:menu') });
+      await renderOrEdit(ctx, `${buildScopedHeader('GLOBAL', 'Main → Settings → Default project settings')}⚙️ Default project settings\n\n- Global DB defaults\n- Global Cron defaults\n- Global Deploy defaults`, {
+        reply_markup: new InlineKeyboard().text('🧹 Clear default project', 'gsettings:clear_default_project').row().text('⬅️ Back', 'gsettings:menu'),
+      });
       break;
     case 'back':
       await navigateTo(getChatIdFromCtx(ctx), ctx.from?.id, 'main', { ctx });
@@ -3996,7 +4052,14 @@ async function handleGlobalSettingsCallback(ctx, data) {
   }
   switch (action) {
     case 'defaults':
-      await renderOrEdit(ctx, `${buildScopedHeader('GLOBAL', 'Main → Settings → Defaults')}⚙️ Defaults\n\n- Global DB defaults\n- Global Cron defaults\n- Global Deploy defaults`, { reply_markup: buildBackKeyboard('gsettings:menu') });
+      await renderOrEdit(ctx, `${buildScopedHeader('GLOBAL', 'Main → Settings → Default project settings')}⚙️ Default project settings\n\n- Global DB defaults\n- Global Cron defaults\n- Global Deploy defaults`, {
+        reply_markup: new InlineKeyboard().text('🧹 Clear default project', 'gsettings:clear_default_project').row().text('⬅️ Back', 'gsettings:menu'),
+      });
+      break;
+    case 'ops_templates':
+      await renderOrEdit(ctx, '🧩 Ops & Templates\n\nOpen operational tools and templates from here.', {
+        reply_markup: new InlineKeyboard().text('🧩 Ops', 'main:ops').row().text('🧱 Templates', 'main:templates').row().text('⬅️ Back', 'gsettings:menu'),
+      });
       break;
     case 'ui': {
       const settings = await getCachedSettings();
@@ -4561,6 +4624,7 @@ async function handleCronCallback(ctx, data) {
           userId: ctx.from?.id,
           projectId: null,
           correlationId,
+          jobId,
         });
         if (
           await renderCronRateLimitIfNeeded(ctx, error, {
@@ -4591,6 +4655,28 @@ async function handleCronCallback(ctx, data) {
     case 'edit_timezone':
       await promptCronTimezoneInput(ctx, jobId, 'cron:job:' + jobId);
       break;
+    case 'test': {
+      try {
+        const job = await fetchCronJob(jobId);
+        if (!job?.url) {
+          await sendTransientNotice(ctx, 'Cron job target URL is missing.', { ttlSec: 10, deleteButton: true, extraMarkup: buildBackKeyboard(`cron:job:${jobId}`) });
+          break;
+        }
+        await renderCronTargetTestResult(ctx, jobId, job.url, 'cron:list');
+      } catch (error) {
+        const correlationId = buildCronCorrelationId();
+        logCronApiError({
+          operation: 'get',
+          error,
+          userId: ctx.from?.id,
+          projectId: null,
+          correlationId,
+          jobId,
+        });
+        await renderOrEdit(ctx, formatCronApiErrorNotice('Failed to load cron job', error, correlationId), { reply_markup: buildBackKeyboard('cron:list') });
+      }
+      break;
+    }
     case 'delete': {
       const inline = new InlineKeyboard()
         .text('✅ Yes, delete', `cron:delete_confirm:${jobId}`)
@@ -4613,6 +4699,7 @@ async function handleCronCallback(ctx, data) {
           userId: ctx.from?.id,
           projectId: null,
           correlationId,
+          jobId,
         });
         if (
           await renderCronRateLimitIfNeeded(ctx, error, {
@@ -7924,7 +8011,7 @@ async function renderCronJobList(ctx, options = {}) {
   grouped.forEach((group) => {
     group.jobs.forEach((job) => {
       const label = buildCronJobButtonLabel(job);
-      inline.text(label, `cron:job:${job.id}`).row();
+      inline.text(label, `cron:job:${job.id}`).text('🧪 Test cron', `cron:test:${job.id}`).row();
     });
   });
   inline.text('⬅️ Back', 'cron:menu');
@@ -8144,6 +8231,64 @@ async function handleCronLinkLabelInput(ctx, state) {
   await renderCronLinkProjectPicker(ctx, state.jobId, state.messageContext);
 }
 
+
+function sanitizeCronTargetSnippet(text, maxLen = 200) {
+  const compact = String(text || '').replace(/\s+/g, ' ').trim();
+  return truncateText(compact, maxLen);
+}
+
+async function runCronTargetReachabilityTest(url) {
+  const startedAt = Date.now();
+  try {
+    const response = await fetch(url, { method: 'GET', timeout: 5000, redirect: 'follow' });
+    const body = await response.text();
+    return {
+      ok: response.ok,
+      category: 'http',
+      status: response.status,
+      latencyMs: Date.now() - startedAt,
+      snippet: sanitizeCronTargetSnippet(body),
+    };
+  } catch (error) {
+    const latencyMs = Date.now() - startedAt;
+    const code = String(error?.code || '').toUpperCase();
+    const message = String(error?.message || 'request failed');
+    let category = 'network';
+    if (code.includes('TIMEOUT') || message.toLowerCase().includes('timeout')) {
+      category = 'timeout';
+    } else if (code.includes('ENOTFOUND') || code.includes('EAI_AGAIN')) {
+      category = 'dns';
+    } else if (code.includes('CERT') || code.includes('TLS')) {
+      category = 'tls';
+    }
+    return {
+      ok: false,
+      category,
+      status: null,
+      latencyMs,
+      snippet: sanitizeCronTargetSnippet(message),
+    };
+  }
+}
+
+async function renderCronTargetTestResult(ctx, jobId, url, backCallback = `cron:job:${jobId}`) {
+  const result = await runCronTargetReachabilityTest(url);
+  const lines = [
+    '🧪 Cron target reachability test',
+    `Job: #${jobId}`,
+    `URL: ${url}`,
+    `Category: ${result.category}`,
+    `HTTP status: ${result.status != null ? result.status : '-'}`,
+    `Latency: ${result.latencyMs}ms`,
+    `Body (first 200 chars): ${result.snippet || '-'}`,
+  ];
+  await sendTransientNotice(ctx, lines.join('\n'), {
+    ttlSec: 10,
+    deleteButton: true,
+    extraMarkup: buildBackKeyboard(backCallback),
+  });
+}
+
 async function renderCronJobDetails(ctx, jobId, options = {}) {
   let job;
   try {
@@ -8218,6 +8363,8 @@ async function renderCronJobDetails(ctx, jobId, options = {}) {
     .text('🌍 Edit timezone', `cron:edit_timezone:${jobId}`)
     .row()
     .text('🗑 Delete', `cron:delete:${jobId}`)
+    .row()
+    .text('🧪 Test cron', `cron:test:${jobId}`)
     .row()
     .text('⬅️ Back', options.backCallback || 'cron:list');
 
@@ -16263,23 +16410,34 @@ async function renderProjectMenu(ctx, projectId) {
   if (!project) return;
 
   const inline = new InlineKeyboard()
-    .text('🧩 Apply patch', `proj:apply_patch:${projectId}`)
+    .text('📋 Overview', `proj:open:${projectId}`)
     .row()
-    .text('✏️ Edit project', `proj:rename:${projectId}`)
+    .text('⚙️ Settings: rename', `proj:rename:${projectId}`)
+    .text('⚙️ Settings: base branch', `proj:change_base:${projectId}`)
     .row()
-    .text('🆔 Edit project ID', `proj:edit_id:${projectId}`)
+    .text('⚙️ Settings: edit project ID', `proj:edit_id:${projectId}`)
     .row()
-    .text('🌿 Change base branch', `proj:change_base:${projectId}`)
+    .text('🌿 Env', `envvault:menu:${projectId}`)
     .row()
-    .text('🧰 Edit commands', `proj:commands:${projectId}`)
+    .text('🔐 Repo/GitHub', `proj:edit_repo:${projectId}`)
     .row()
-    .text('📡 Edit Render URLs', `proj:render_menu:${projectId}`)
+    .text('⏱ Cron Jobs', `projcron:menu:${projectId}`)
+    .row()
+    .text('🗄 Database', `dbmenu:open:${projectId}`)
+    .row()
+    .text('🚀 Deployments', `deploy:open:${projectId}`)
+    .row()
+    .text('📜 Logs', `logmenu:open:${projectId}`)
     .row()
     .text('🧪 Diagnostics', `proj:diagnostics_menu:${projectId}`)
     .row()
+    .text('🧩 Apply patch', `proj:apply_patch:${projectId}`)
+    .row()
     .text('⬅️ Back', `proj:open:${projectId}`);
 
-  await renderOrEdit(ctx, `${buildScopedHeader(`PROJECT: ${project.name || project.id}`, `Main → Projects → ${project.name || project.id} → Menu`)}📂 Project menu: ${project.name || project.id}`, {
+  await renderOrEdit(ctx, `${buildScopedHeader(`PROJECT: ${project.name || project.id}`, `Main → Projects → ${project.name || project.id} → Menu`)}📂 Project menu: ${project.name || project.id}
+
+Sections: Overview · Settings · Env · Repo/GitHub · Cron Jobs · Database · Deployments · Logs`, {
     reply_markup: inline,
   });
 }
@@ -19026,6 +19184,7 @@ async function renderLogsProjectList(ctx, notice) {
   const inline = new InlineKeyboard();
   inline.text('🧾 Projects needing log test', 'logtest:reminders').row();
   inline.text('⚙️ Global log policies', 'gsettings:logs').row();
+  inline.text('🤖 PM self logs & alerts', 'gsettings:bot_log_alerts').row();
   if (!projects.length) {
     lines.push('', 'No projects configured yet.');
     inline.text('➕ Add project', 'proj:add').row();
@@ -20462,25 +20621,19 @@ async function renderGlobalSettingsForMessage(messageContext, notice) {
 
 function buildSettingsKeyboard() {
   return new InlineKeyboard()
-    .text('🧩 Ops', 'main:ops')
-    .row()
-    .text('🧱 Templates', 'main:templates')
+    .text('🧩 Ops & Templates', 'gsettings:ops_templates')
     .row()
     .text('🧰 Routine Fixes', 'gsettings:routine_menu')
     .row()
     .text('🔐 Access Control', 'gsettings:security')
     .row()
-    .text('⚙️ Defaults', 'gsettings:defaults')
+    .text('⚙️ Default project settings', 'gsettings:defaults')
     .row()
     .text('🧹 UI & Cleanup', 'gsettings:ui')
-    .row()
-    .text('📣 Logs', 'gsettings:logs')
     .row()
     .text('🌐 Integrations', 'gsettings:integrations')
     .row()
     .text('📦 Backups', 'gsettings:backups')
-    .row()
-    .text('📣 Bot log alerts', 'gsettings:bot_log_alerts')
     .row()
     .text('🧪 Diagnostics', 'gsettings:diagnostics_menu')
     .row()
@@ -20489,8 +20642,6 @@ function buildSettingsKeyboard() {
     .text('📶 Ping test', 'gsettings:ping_test')
     .row()
     .webApp('🗄️ Open DB Console', getMiniAppUrl())
-    .row()
-    .text('🧹 Clear default project', 'gsettings:clear_default_project')
     .row()
     .text('⬅️ Back', 'gsettings:back');
 }
@@ -20876,7 +21027,7 @@ async function runPingTest(ctx) {
         .text('🔑 Fix token', `proj:edit_github_token:${defaultProject.id}`);
     }
     inline.row().text('⬅️ Back', 'gsettings:menu');
-    await renderOrEdit(ctx, lines.join('\\n'), { reply_markup: inline });
+    await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
   } finally {
     await progress.done();
   }
