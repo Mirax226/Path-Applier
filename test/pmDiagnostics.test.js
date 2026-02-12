@@ -18,6 +18,16 @@ test('pm diagnostics returns boolean feature flags', () => {
   assert.equal(typeof payload.flags.hooksInstalled, 'boolean');
 });
 
+test('pm diagnostics lastSend metadata shape', () => {
+  const payload = __test.getPmDiagnosticsForTests();
+  if (payload.lastSend) {
+    assert.equal(typeof payload.lastSend.ok, 'boolean');
+    assert.equal(typeof payload.lastSend.skipped, 'boolean');
+  } else {
+    assert.equal(payload.lastSend, null);
+  }
+});
+
 test('pm test token validation helper', () => {
   assert.equal(__test.isPmTestAllowedForTests('pm-test-token'), true);
   assert.equal(__test.isPmTestAllowedForTests('wrong-token'), false);
