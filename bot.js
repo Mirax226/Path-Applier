@@ -128,6 +128,7 @@ const {
 const {
   listCronJobLinks,
   getCronJobLink,
+  getCronJobLinkByJobKey,
   upsertCronJobLink,
   renameCronJobLinkProjectId,
 } = require('./cronJobLinksStore');
@@ -5082,6 +5083,15 @@ async function handleCronCallback(ctx, data) {
       await renderOrEdit(ctx, `Delete cron job #${jobId}?`, { reply_markup: inline });
       break;
     }
+    case 'cleanup_duplicates': {
+      const summary = await cleanupCronDuplicateJobs();
+      await sendTransientMessage(
+        ctx,
+        `🧹 Cleanup complete\nkept: ${summary.kept}\ndisabled: ${summary.disabled}\ndeleted: ${summary.deleted}`,
+      );
+      await renderCronJobList(ctx);
+      break;
+    }
     case 'delete_confirm':
       try {
         await deleteJob(jobId);
@@ -7726,6 +7736,53 @@ async function fetchCronJobs() {
   return lastCronJobsCache;
 }
 
+
+
+async function cleanupCronDuplicateJobs() {
+  const response = await fetchCronJobs();
+  const jobs = response.jobs || [];
+  const links = await listCronJobLinks();
+  const linkMap = new Map(links.map((link) => [String(link.cronJobId), link]));
+  const projects = await loadProjects();
+
+  const grouped = new Map();
+  for (const job of jobs) {
+    const link = linkMap.get(String(job.id));
+    const projectId = resolveCronProjectId(job, link, projects);
+    const inferredType = (job.name || '').includes(':deploy') ? 'deploy' : 'keepalive';
+    const jobKey = link?.jobKey
+      || parseJobKeyFromTitle(job.name)
+      || buildCronJobKey({ projectId, type: inferredType, targetUrl: job.url, schedule: normalizeCronJobSchedule(job) });
+    if (!jobKey) continue;
+    if (!grouped.has(jobKey)) grouped.set(jobKey, []);
+    grouped.get(jobKey).push({ ...job, jobKey });
+  }
+
+  const summary = { kept: 0, disabled: 0, deleted: 0 };
+  for (const [jobKey, items] of grouped.entries()) {
+    if (items.length < 2) continue;
+    const best = chooseBestCronJob(items);
+    if (!best) continue;
+    summary.kept += 1;
+    for (const job of items) {
+      if (String(job.id) === String(best.id)) continue;
+      if (job.enabled !== false) {
+        await toggleJob(String(job.id), false);
+      }
+      summary.disabled += 1;
+      await upsertCronJobLink(String(job.id), resolveCronProjectId(job, linkMap.get(String(job.id)), projects), null, {
+        providerJobId: String(job.id),
+        jobKey,
+        enabled: false,
+        scheduleNormalized: normalizeCronJobSchedule(job),
+        targetNormalized: normalizeCronJobTarget(job.url),
+        lastUpdatedAt: new Date().toISOString(),
+      });
+    }
+  }
+  clearCronJobsCache();
+  return summary;
+}
 async function fetchCronJob(jobId) {
   const job = await getJob(jobId);
   return normalizeCronJob(job);
@@ -7757,6 +7814,124 @@ function buildCronJobPayload({ name, url, schedule, timezone, enabled }) {
     schedule: schedulePayload,
   };
 }
+
+function normalizeCronJobSchedule(job) {
+  const summary = describeCronSchedule(job, { includeAllHours: true });
+  return String(summary || '').trim().toLowerCase();
+}
+
+function normalizeCronJobTarget(url) {
+  try {
+    const parsed = new URL(String(url || '').trim());
+    const pathname = parsed.pathname.replace(/\/+$/, '') || '/';
+    return `${parsed.protocol}//${parsed.host}${pathname}`.toLowerCase();
+  } catch (error) {
+    return String(url || '').trim().toLowerCase();
+  }
+}
+
+function buildCronJobKey({ projectId, type, targetUrl, schedule }) {
+  if (!projectId || !type) return null;
+  if (type === 'keepalive') {
+    return `${projectId}:keepalive`;
+  }
+  const normalizedTarget = normalizeCronJobTarget(targetUrl);
+  const normalizedSchedule = String(schedule || '').trim().toLowerCase();
+  return `${projectId}:${type}:${normalizedTarget}:${normalizedSchedule}`;
+}
+
+function parseJobKeyFromTitle(title) {
+  const text = String(title || '');
+  const match = text.match(/PM:([^\s]+)/);
+  return match ? match[1] : null;
+}
+
+function scoreCronJobForDedup(job) {
+  const enabledScore = job?.enabled !== false ? 1 : 0;
+  const updatedAt = Date.parse(job?.lastUpdatedAt || '') || 0;
+  return { enabledScore, updatedAt };
+}
+
+function chooseBestCronJob(entries) {
+  const sorted = [...entries].sort((a, b) => {
+    const left = scoreCronJobForDedup(a);
+    const right = scoreCronJobForDedup(b);
+    if (left.enabledScore !== right.enabledScore) return right.enabledScore - left.enabledScore;
+    if (left.updatedAt !== right.updatedAt) return right.updatedAt - left.updatedAt;
+    return String(a.id || '').localeCompare(String(b.id || ''));
+  });
+  return sorted[0] || null;
+}
+
+function dedupeCronJobsByJobKey(jobs, linksMap, projects) {
+  const grouped = new Map();
+  for (const job of jobs) {
+    const link = linksMap.get(String(job.id));
+    const projectId = resolveCronProjectId(job, link, projects);
+    const inferredType = (job.name || '').includes(':deploy') ? 'deploy' : 'keepalive';
+    const jobKey = link?.jobKey
+      || parseJobKeyFromTitle(job.name)
+      || buildCronJobKey({
+        projectId,
+        type: inferredType,
+        targetUrl: job.url,
+        schedule: normalizeCronJobSchedule(job),
+      });
+    const enriched = {
+      ...job,
+      jobKey,
+      duplicatesDetected: false,
+      lastUpdatedAt: link?.lastUpdatedAt || null,
+    };
+    const key = jobKey || `__id__:${job.id}`;
+    if (!grouped.has(key)) grouped.set(key, []);
+    grouped.get(key).push(enriched);
+  }
+  const deduped = [];
+  for (const items of grouped.values()) {
+    const best = chooseBestCronJob(items);
+    if (!best) continue;
+    if (items.length > 1) {
+      best.duplicatesDetected = true;
+      best.duplicateCount = items.length;
+    }
+    deduped.push(best);
+  }
+  return deduped;
+}
+
+function cronJobLooksLikeType(job, type) {
+  const lower = String(job?.name || '').toLowerCase();
+  if (type === 'keepalive') return lower.includes('keep-alive') || lower.includes('keepalive');
+  if (type === 'deploy') return lower.includes('deploy');
+  return true;
+}
+
+async function findProviderJobForProjectCron({ projectId, type, jobKey, targetUrl, scheduleNormalized }) {
+  const links = await listCronJobLinks();
+  const linkByKey = links.find((entry) => entry.jobKey === jobKey);
+  if (linkByKey?.providerJobId) {
+    return { id: String(linkByKey.providerJobId), source: 'configdb:jobKey' };
+  }
+  const linkByProject = links.find((entry) => entry.projectId === projectId && cronJobLooksLikeType({ name: entry.label || '' }, type));
+  if (linkByProject?.providerJobId) {
+    return { id: String(linkByProject.providerJobId), source: 'configdb:project' };
+  }
+  const response = await fetchCronJobs();
+  const targetNormalized = normalizeCronJobTarget(targetUrl);
+  for (const job of response.jobs) {
+    const parsedJobKey = parseJobKeyFromTitle(job.name);
+    if (parsedJobKey && parsedJobKey === jobKey) {
+      return { id: String(job.id), source: 'provider:title' };
+    }
+    if (!cronJobLooksLikeType(job, type)) continue;
+    if (normalizeCronJobTarget(job.url) !== targetNormalized) continue;
+    if (normalizeCronJobSchedule(job) !== scheduleNormalized) continue;
+    return { id: String(job.id), source: 'provider:url+schedule' };
+  }
+  return null;
+}
+
 
 const CRON_WEEKDAYS = [
   { label: 'Mo', value: 1 },
@@ -8461,7 +8636,8 @@ async function renderCronJobList(ctx, options = {}) {
   const linkMap = new Map(links.map((link) => [String(link.cronJobId), link]));
   await autoLinkCronJobs(jobs, projects, linkMap);
 
-  const filtered = filterCronJobsByProject(jobs, projects, linkMap, options);
+  const deduped = dedupeCronJobsByJobKey(jobs, linkMap, projects);
+  const filtered = filterCronJobsByProject(deduped, projects, linkMap, options);
   const grouped = groupCronJobs(filtered, projects, linkMap);
 
   const lines = ['Cron jobs:'];
@@ -8471,8 +8647,9 @@ async function renderCronJobList(ctx, options = {}) {
   grouped.forEach((group) => {
     group.jobs.forEach((job) => {
       const schedule = describeCronSchedule(job);
+      const duplicateNote = job.duplicatesDetected ? ` (deduped${job.duplicateCount ? `, ${job.duplicateCount}x` : ''})` : '';
       lines.push(
-        `[${group.label}] — ${getCronJobDisplayName(job)} — ${job.enabled ? 'Enabled' : 'Disabled'} — ${schedule}`,
+        `[${group.label}] — ${getCronJobDisplayName(job)} — ${job.enabled ? 'Enabled' : 'Disabled'} — ${schedule}${duplicateNote}`,
       );
     });
   });
@@ -8487,6 +8664,7 @@ async function renderCronJobList(ctx, options = {}) {
       inline.text(label, `cron:job:${job.id}`).text('🧪 Test cron', `cron:test:${job.id}`).row();
     });
   });
+  inline.text('🧹 Cleanup duplicates', 'cron:cleanup_duplicates').row();
   inline.text('⬅️ Back', 'cron:menu');
 
   await renderOrEdit(ctx, lines.join('\n'), { reply_markup: inline });
@@ -9154,9 +9332,7 @@ async function createProjectCronJobWithSchedule(ctx, projectId, type, scheduleIn
 
   const cronSettings = await getEffectiveCronSettings();
   const isKeepAlive = type === 'keepalive';
-  const jobName = isKeepAlive
-    ? `path-applier:${project.id}:keep-alive`
-    : `path-applier:${project.id}:deploy`;
+  const scheduleNormalized = String(schedule?.cron || '').trim().toLowerCase();
 
   let targetUrl = '';
   if (isKeepAlive) {
@@ -9179,6 +9355,12 @@ async function createProjectCronJobWithSchedule(ctx, projectId, type, scheduleIn
     }
     targetUrl = project.renderDeployHookUrl;
   }
+  const targetNormalized = normalizeCronJobTarget(targetUrl);
+  const jobKey = buildCronJobKey({ projectId: project.id, type, targetUrl, schedule: scheduleNormalized });
+  const jobName = isKeepAlive
+    ? `PM:${jobKey} path-applier:${project.id}:keep-alive`
+    : `PM:${jobKey} path-applier:${project.id}:deploy`;
+
   const urlValidation = validateCronUrlInput(targetUrl);
   if (!urlValidation.valid) {
     await ctx.reply(`Invalid URL: ${urlValidation.message}`);
@@ -9194,40 +9376,52 @@ async function createProjectCronJobWithSchedule(ctx, projectId, type, scheduleIn
   });
 
   try {
-    if (recreate) {
-      const oldJobId = isKeepAlive ? project.cronKeepAliveJobId : project.cronDeployHookJobId;
-      if (oldJobId) {
-        try {
-          await deleteJob(oldJobId);
-          clearCronJobsCache();
-        } catch (error) {
-          const correlationId = buildCronCorrelationId();
-          logCronApiError({
-            operation: 'delete',
-            error,
-            userId: ctx.from?.id,
-            projectId: project.id,
-            correlationId,
-          });
-          if (await replyCronRateLimitIfNeeded(ctx, error, correlationId)) {
-            return;
-          }
-          await ctx.reply(
-            formatCronApiErrorNotice('Failed to delete existing cron job', error, correlationId),
-          );
-        }
-      }
+    let providerJobId = null;
+    const existingByKey = await getCronJobLinkByJobKey(jobKey);
+    if (existingByKey?.providerJobId) {
+      providerJobId = String(existingByKey.providerJobId);
     }
-    const created = await createJob(payload);
+
+    if (!providerJobId && recreate) {
+      const oldJobId = isKeepAlive ? project.cronKeepAliveJobId : project.cronDeployHookJobId;
+      providerJobId = oldJobId ? String(oldJobId) : null;
+    }
+
+    if (!providerJobId) {
+      const found = await findProviderJobForProjectCron({
+        projectId: project.id,
+        type,
+        jobKey,
+        targetUrl: urlValidation.url,
+        scheduleNormalized,
+      });
+      providerJobId = found?.id || null;
+    }
+
+    if (providerJobId) {
+      await updateJob(providerJobId, payload);
+    } else {
+      const created = await createJob(payload);
+      providerJobId = created.id;
+    }
+
     clearCronJobsCache();
     if (isKeepAlive) {
-      project.cronKeepAliveJobId = created.id;
+      project.cronKeepAliveJobId = providerJobId;
     } else {
-      project.cronDeployHookJobId = created.id;
+      project.cronDeployHookJobId = providerJobId;
     }
     await saveProjects(projects);
+    await upsertCronJobLink(providerJobId, project.id, type, {
+      providerJobId,
+      jobKey,
+      enabled: true,
+      scheduleNormalized,
+      targetNormalized,
+      lastUpdatedAt: new Date().toISOString(),
+    });
     clearUserState(ctx.from.id);
-    await sendTransientMessage(ctx, `Cron job created. ID: ${created.id}`);
+    await sendTransientMessage(ctx, `Cron job saved. ID: ${providerJobId}`);
     await renderProjectCronBindings(ctx, project.id);
   } catch (error) {
     const correlationId = buildCronCorrelationId();
@@ -18948,17 +19142,23 @@ async function buildWebCronJobsPayload() {
   if (!CRON_API_TOKEN) {
     return { ok: false, error: 'Cron integration not configured.' };
   }
-  const { jobs, someFailed } = await listJobs();
+  const { jobs, someFailed } = await fetchCronJobs();
+  const links = await listCronJobLinks();
+  const linkMap = new Map(links.map((link) => [String(link.cronJobId), link]));
+  const projects = await loadProjects();
+  const deduped = dedupeCronJobsByJobKey(jobs, linkMap, projects);
   return {
     ok: true,
     someFailed,
-    jobs: jobs.map((job) => ({
-      id: String(job.jobId || job.id || job.job_id || job.jobid || ''),
-      title: job.title || job.name || 'Cron job',
+    jobs: deduped.map((job) => ({
+      id: String(job.id || ''),
+      title: job.name || 'Cron job',
       enabled: job.enabled !== false,
-      schedule: job.schedule?.description || job.schedule || '',
-      url: maskSensitiveValue(job.url || job.url_to_call || ''),
-      lastStatus: job.lastStatus || job.last_status || null,
+      schedule: describeCronSchedule(job),
+      url: maskSensitiveValue(job.url || ''),
+      lastStatus: job.raw?.lastStatus || job.raw?.last_status || null,
+      jobKey: job.jobKey || null,
+      duplicatesDetected: job.duplicatesDetected === true,
     })),
   };
 }
@@ -24978,6 +25178,8 @@ module.exports = {
     goHome,
     renderScreen,
     dispatchCallbackData,
+    buildCronJobKey,
+    dedupeCronJobsByJobKey,
   },
 };
 
