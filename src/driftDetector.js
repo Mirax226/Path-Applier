@@ -63,4 +63,43 @@ function calculateDrift(baseline, current) {
   return { changed: summary.length > 0, summary, impact, nextSteps };
 }
 
-module.exports = { buildProjectSnapshot, calculateDrift };
+function normalizeTableStatRow(row = {}) {
+  return {
+    schema: String(row.schema || row.table_schema || 'public'),
+    table: String(row.table || row.table_name || ''),
+    rowCount: Number(row.rowCount ?? row.row_count ?? 0),
+    updatedAtMax: row.updatedAtMax || row.updated_at_max || null,
+  };
+}
+
+function calculateDbDrift(primaryStats = [], secondaryStats = []) {
+  const primaryMap = new Map(primaryStats.map((row) => {
+    const normalized = normalizeTableStatRow(row);
+    return [`${normalized.schema}.${normalized.table}`, normalized];
+  }));
+  const secondaryMap = new Map(secondaryStats.map((row) => {
+    const normalized = normalizeTableStatRow(row);
+    return [`${normalized.schema}.${normalized.table}`, normalized];
+  }));
+
+  const keys = new Set([...primaryMap.keys(), ...secondaryMap.keys()]);
+  const diffs = [];
+  for (const key of keys) {
+    const p = primaryMap.get(key);
+    const s = secondaryMap.get(key);
+    if (!p || !s) {
+      diffs.push({ table: key, status: 'missing', primary: p || null, secondary: s || null });
+      continue;
+    }
+    if (p.rowCount !== s.rowCount || String(p.updatedAtMax || '') !== String(s.updatedAtMax || '')) {
+      diffs.push({ table: key, status: 'mismatch', primary: p, secondary: s });
+    }
+  }
+  return {
+    hasDrift: diffs.length > 0,
+    diffs,
+    summary: diffs.length ? `${diffs.length} table(s) drifted` : 'No drift detected',
+  };
+}
+
+module.exports = { buildProjectSnapshot, calculateDrift, calculateDbDrift };
